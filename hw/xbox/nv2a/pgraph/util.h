@@ -66,21 +66,4 @@ void convert_yuy2_to_rgb(const uint8_t *line, unsigned int ix,
     *b = cliptobyte((298 * c + 516 * d + 128) >> 8);
 }
 
-static inline 
-void convert_uyvy_to_rgb(const uint8_t *line, unsigned int ix,
-                                uint8_t *r, uint8_t *g, uint8_t* b) {
-    int c, d, e;
-    c = (int)line[ix * 2 + 1] - 16;
-    if (ix % 2) {
-        d = (int)line[ix * 2 - 2] - 128;
-        e = (int)line[ix * 2 + 0] - 128;
-    } else {
-        d = (int)line[ix * 2 + 0] - 128;
-        e = (int)line[ix * 2 + 2] - 128;
-    }
-    *r = cliptobyte((298 * c + 409 * e + 128) >> 8);
-    *g = cliptobyte((298 * c - 100 * d - 208 * e + 128) >> 8);
-    *b = cliptobyte((298 * c + 516 * d + 128) >> 8);
-}
-
 #endif

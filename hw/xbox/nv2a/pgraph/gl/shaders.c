@@ -1747,7 +1747,7 @@ static UwpVarField uwp_var_fields[] = {
     UWP_VF(geom), UWP_VF(psh.combiner_control), UWP_VF(psh.shader_stage_program), UWP_VF(psh.other_stage_input),
     UWP_VF(psh.final_inputs_0), UWP_VF(psh.final_inputs_1), UWP_VF(psh.rgb_inputs), UWP_VF(psh.rgb_outputs),
     UWP_VF(psh.alpha_inputs), UWP_VF(psh.alpha_outputs), UWP_VF(psh.point_sprite), UWP_VF(psh.rect_tex),
-    UWP_VF(psh.snorm_tex), UWP_VF(psh.compare_mode), UWP_VF(psh.alphakill), UWP_VF(psh.colorkey_mode),
+    UWP_VF(psh.tex_kind_signs), UWP_VF(psh.compare_mode), UWP_VF(psh.alphakill), UWP_VF(psh.colorkey_mode),
     UWP_VF(psh.conv_tex), UWP_VF(psh.tex_x8y24), UWP_VF(psh.dim_tex), UWP_VF(psh.tex_cubemap),
     UWP_VF(psh.border_logical_size), UWP_VF(psh.border_inv_real_size), UWP_VF(psh.shadow_map),
     UWP_VF(psh.shadow_depth_func), UWP_VF(psh.alpha_test), UWP_VF(psh.alpha_func),

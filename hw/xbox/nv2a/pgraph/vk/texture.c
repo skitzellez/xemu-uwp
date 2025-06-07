@@ -26,6 +26,7 @@
 #include "qemu/osdep.h"
 #include "hw/xbox/nv2a/pgraph/s3tc.h"
 #include "hw/xbox/nv2a/pgraph/swizzle.h"
+#include "hw/xbox/nv2a/pgraph/texsigns.h"
 #include "qemu/fast-hash.h"
 #include "qemu/lru.h"
 #include "renderer.h"
@@ -144,7 +145,7 @@ static TextureLayout *get_texture_layout(PGRAPHState *pg, int texture_idx)
     TextureShape s = pgraph_get_texture_shape(pg, texture_idx);
     BasicColorFormatInfo f = kelvin_color_format_info_map[s.color_format];
 
-    NV2A_VK_DGROUP_BEGIN("Texture %d: cubemap=%d, dimensionality=%d, color_format=0x%x, levels=%d, width=%d, height=%d, depth=%d border=%d, min_mipmap_level=%d, max_mipmap_level=%d, pitch=%d",
+    NV2A_VK_DGROUP_BEGIN("Texture %d: cubemap=%d, dimensionality=%d, color_format=0x%x, levels=%d, width=%d, height=%d, depth=%d border=%d, min_mipmap_level=%d, max_mipmap_level=%d, pitch=%d, channel_signs=0x%08x",
         texture_idx,
         s.cubemap,
         s.dimensionality,
@@ -156,7 +157,8 @@ static TextureLayout *get_texture_layout(PGRAPHState *pg, int texture_idx)
         s.border,
         s.min_mipmap_level,
         s.max_mipmap_level,
-        s.pitch
+        s.pitch,
+        s.channel_signs
         );
 
     // Sanity checks on below assumptions
@@ -252,6 +254,8 @@ static TextureLayout *get_texture_layout(PGRAPHState *pg, int texture_idx)
                         kelvin_format_to_s3tc_format(s.color_format),
                         texture_data_ptr, width, height);
                     assert(converted);
+                    texsigns_inplace_to_unsigned_rgba(converted,
+                        width * height * 4, s.channel_signs);
 
                     if (s.cubemap && adjusted_width != s.width) {
                         // FIXME: Consider preserving the border.
@@ -343,6 +347,8 @@ static TextureLayout *get_texture_layout(PGRAPHState *pg, int texture_idx)
                     kelvin_format_to_s3tc_format(s.color_format),
                     texture_data_ptr, width, height, depth);
                 assert(converted);
+                texsigns_inplace_to_unsigned_rgba(converted,
+                    width * height * depth * 4, s.channel_signs);
 
                 layout->layers[0].levels[level] = (TextureLevel){
                     .width = width,
@@ -1089,6 +1095,20 @@ static bool is_linear_filter_supported_for_format(PGRAPHVkState *r,
            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
 }
 
+static VkFormat get_converted_vk_format(const TextureShape *s,
+                                        const VkColorFormatInfo *vkf)
+{
+    unsigned int bit_depth = pgraph_get_converted_bit_depth(s);
+
+    if (bit_depth == 8) {
+        return VK_FORMAT_R8G8B8A8_UNORM;
+    } else if (bit_depth == 16) {
+        return VK_FORMAT_R16G16B16A16_UNORM;
+    } else {
+        return vkf->vk_format;
+    }
+}
+
 static void create_texture(PGRAPHState *pg, int texture_idx)
 {
     NV2A_VK_DGROUP_BEGIN("Creating texture %d", texture_idx);
@@ -1284,6 +1304,8 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
     assert(state.dimensionality <
            ARRAY_SIZE(dimensionality_to_vk_image_view_type));
 
+    VkFormat converted_vk_format = get_converted_vk_format(&state, &vkf);
+
     VkImageCreateInfo image_create_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType = dimensionality_to_vk_image_type[state.dimensionality],
@@ -1292,7 +1314,7 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
         .extent.depth = state.depth,
         .mipLevels = f_basic.linear ? 1 : state.levels,
         .arrayLayers = state.cubemap ? 6 : 1,
-        .format = vkf.vk_format,
+        .format = converted_vk_format,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -1320,14 +1342,18 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
         .viewType = state.cubemap ?
             VK_IMAGE_VIEW_TYPE_CUBE :
             dimensionality_to_vk_image_view_type[state.dimensionality],
-        .format = vkf.vk_format,
+        .format = converted_vk_format,
         .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
         .subresourceRange.baseMipLevel = 0,
         .subresourceRange.levelCount = image_create_info.mipLevels,
         .subresourceRange.baseArrayLayer = 0,
         .subresourceRange.layerCount = image_create_info.arrayLayers,
-        .components = vkf.component_map,
+//        .components = vkf.component_map,
     };
+
+    if (!state.channel_signs) {
+        image_view_create_info.components = vkf.component_map;
+    }
 
     VK_CHECK(vkCreateImageView(r->device, &image_view_create_info, NULL,
                                &snode->image_view));
@@ -1375,15 +1401,6 @@ static void create_texture(PGRAPHState *pg, int texture_idx)
             vk_border_color = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
         }
     }
-
-    if (filter & NV_PGRAPH_TEXFILTER0_ASIGNED)
-        NV2A_UNIMPLEMENTED("NV_PGRAPH_TEXFILTER0_ASIGNED");
-    if (filter & NV_PGRAPH_TEXFILTER0_RSIGNED)
-        NV2A_UNIMPLEMENTED("NV_PGRAPH_TEXFILTER0_RSIGNED");
-    if (filter & NV_PGRAPH_TEXFILTER0_GSIGNED)
-        NV2A_UNIMPLEMENTED("NV_PGRAPH_TEXFILTER0_GSIGNED");
-    if (filter & NV_PGRAPH_TEXFILTER0_BSIGNED)
-        NV2A_UNIMPLEMENTED("NV_PGRAPH_TEXFILTER0_BSIGNED");
 
     VkFilter vk_min_filter, vk_mag_filter;
     unsigned int mag_filter = GET_MASK(filter, NV_PGRAPH_TEXFILTER0_MAG);

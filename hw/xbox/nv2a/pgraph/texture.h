@@ -42,6 +42,7 @@ typedef struct TextureShape {
 
     unsigned int min_mipmap_level, max_mipmap_level;
     unsigned int pitch;
+    uint8_t channel_signs;
 } TextureShape;
 
 typedef struct BasicColorFormatInfo {
@@ -52,6 +53,7 @@ typedef struct BasicColorFormatInfo {
 
 extern const BasicColorFormatInfo kelvin_color_format_info_map[66];
 
+unsigned int pgraph_get_converted_bit_depth(const TextureShape *s);
 uint8_t *pgraph_convert_texture_data(const TextureShape s, const uint8_t *data,
                                      const uint8_t *palette_data,
                                      unsigned int width, unsigned int height,

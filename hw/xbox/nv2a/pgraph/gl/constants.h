@@ -222,7 +222,7 @@ static const ColorFormatInfo kelvin_color_format_gl_map[66] = {
          {GL_RED, GL_RED, GL_RED, GL_GREEN}},
 
     [NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R6G5B5] =
-        {2, false, GL_RGB8_SNORM, GL_RGB, GL_BYTE}, /* FIXME: This might be signed */
+        {2, false, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE},
     [NV097_SET_TEXTURE_FORMAT_COLOR_SZ_G8B8] =
         {2, false, GL_RG8, GL_RG, GL_UNSIGNED_BYTE,
          {GL_RED, GL_GREEN, GL_RED, GL_GREEN}},
@@ -257,9 +257,18 @@ static const ColorFormatInfo kelvin_color_format_gl_map[66] = {
         {2, true, GL_DEPTH_COMPONENT16, GL_DEPTH_COMPONENT, GL_HALF_FLOAT,
           {GL_RED, GL_ZERO, GL_ONE, GL_ZERO}, true},
 
+    [NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y16] =
+        {2, false, GL_R16, GL_RED, GL_UNSIGNED_SHORT,
+         {GL_ONE, GL_RED, GL_RED, GL_ONE}},
+    [NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R16B16] =
+        {4, false, GL_RG16, GL_RG, GL_UNSIGNED_SHORT,
+         {GL_GREEN, GL_RED, GL_RED, GL_GREEN}},
     [NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y16] =
         {2, true, GL_R16, GL_RED, GL_UNSIGNED_SHORT,
          {GL_ONE, GL_RED, GL_RED, GL_ONE}},
+    [NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R16B16] =
+        {4, true, GL_RG16, GL_RG, GL_UNSIGNED_SHORT,
+         {GL_GREEN, GL_RED, GL_RED, GL_GREEN}},
     [NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8B8G8R8] =
         {4, false, GL_RGBA8, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8_REV},
     [NV097_SET_TEXTURE_FORMAT_COLOR_SZ_B8G8R8A8] =

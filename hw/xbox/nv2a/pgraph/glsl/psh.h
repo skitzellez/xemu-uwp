@@ -34,6 +34,20 @@ enum PshDepthFormat {
     DEPTH_FORMAT_F16,
 };
 
+/* These are the most significant nibble of NV097_SET_TEXTURE_FILTER
+ * i.e. NV097_SET_TEXTURE_FILTER_ASIGNED, NV097_SET_TEXTURE_FILTER_RSIGNED,
+ * NV097_SET_TEXTURE_FILTER_GSIGNED and NV097_SET_TEXTURE_FILTER_BSIGNED.
+ */
+#define TEX_CHANNEL_ASIGNED 1
+#define TEX_CHANNEL_RSIGNED 2
+#define TEX_CHANNEL_GSIGNED 4
+#define TEX_CHANNEL_BSIGNED 8
+#define TEX_CHANNEL_SIGNED_MASK 0xF
+/* texture formats the pixel shader treats specially */
+#define TEX_KIND_16BIT 0x10 /* Y16, R16B16 */
+#define TEX_KIND_YUV 0x20   /* CR8YB8CB8YA8, YB8CR8YA8CB8: converted to RGB in the shader */
+#define TEX_KIND_MASK 0x30
+
 typedef struct PshState {
     uint32_t combiner_control;
     uint32_t shader_stage_program;
@@ -46,7 +60,10 @@ typedef struct PshState {
 
     bool point_sprite;
     bool rect_tex[4];
-    bool snorm_tex[4];
+    /* TEX_CHANNEL_* signs in the low nibble, TEX_KIND_* above. One byte per unit, in the place of
+     * the former (always false) snorm_tex: plain unsigned textures stay 0, so the shader state of
+     * other games is unchanged and recorded warm-up lists stay valid */
+    uint8_t tex_kind_signs[4];
     bool compare_mode[4][4];
     bool alphakill[4];
     int colorkey_mode[4];

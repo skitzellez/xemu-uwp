@@ -27,6 +27,7 @@
 #include "util.h"
 #include "swizzle.h"
 #include "nv2a_vsh_emulator.h"
+#include "texsigns.h"
 #include "qemu/xemu-uwp.h"
 
 #ifdef XEMU_UWP
@@ -453,6 +454,8 @@ void pgraph_init(NV2AState *d)
     }
 
     pgraph_clear_dirty_reg_map(pg);
+
+    texsigns_init_conversion();
 }
 
 void pgraph_clear_dirty_reg_map(PGRAPHState *pg)
