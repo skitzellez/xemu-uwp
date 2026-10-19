@@ -117,6 +117,7 @@ static void pgraph_gl_flip_stall(NV2AState *d)
      * renderer thread every frame. The display path waits on a fence before
      * it reads the frame, so submitting the work is enough here. */
     glFlush();
+    pgraph_gl_uwp_wb_frame(d);
 #else
     glFinish();
 #endif

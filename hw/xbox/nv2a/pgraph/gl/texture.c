@@ -412,6 +412,9 @@ void pgraph_gl_bind_textures(NV2AState *d)
 #endif
         }
 
+#ifdef XEMU_UWP
+        pgraph_gl_uwp_wb_flush_range(d, texture_vram_offset, length);
+#endif
         if (!surf_to_tex) {
             // FIXME: Restructure to support rendering surfaces to cubemap faces
 

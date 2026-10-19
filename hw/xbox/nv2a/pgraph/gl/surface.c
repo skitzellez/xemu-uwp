@@ -32,6 +32,15 @@ static void surface_download_to_buffer(NV2AState *d, SurfaceBinding *surface,
                                        bool swizzle, bool flip, bool downscale,
                                        uint8_t *pixels);
 static void surface_get_dimensions(PGRAPHState *pg, unsigned int *width, unsigned int *height);
+#ifdef XEMU_UWP
+static bool uwp_wb_start(NV2AState *d, SurfaceBinding *surface);
+static bool uwp_wb_flush_range(NV2AState *d, hwaddr addr, hwaddr len);
+static void uwp_wb_flush_all(NV2AState *d);
+static bool uwp_wb_overlaps(hwaddr addr, hwaddr len);
+static void uwp_prefetch_color(NV2AState *d, SurfaceBinding *surface);
+static bool uwp_zeta_wb_off(void);
+static bool uwp_zeta_readpixels(void);
+#endif
 
 void pgraph_gl_set_surface_scale_factor(NV2AState *d, unsigned int scale)
 {
@@ -665,6 +674,12 @@ static void surface_access_callback(void *opaque, MemoryRegion *mr, hwaddr addr,
             surface->upload_pending = true;
         }
     }
+#ifdef XEMU_UWP
+    /* bytes still on their way there: a read would see old ones, a write would be overwritten */
+    if (uwp_wb_overlaps(addr, len)) {
+        wait_for_downloads = true;
+    }
+#endif
 
     qemu_mutex_unlock(&d->pgraph.lock);
 
@@ -743,7 +758,9 @@ static bool uwp_evict_without_download(const SurfaceBinding *old,
  * graphics thread (title screen 10 fps instead of 30). The big depth image is
  * parked on the GPU instead and taken back when that same shape is bound again
  * within two frames. Anything else, or after two frames, writes it to guest
- * memory as before. Off unless the test file zeta-park.txt exists.
+ * memory as before. Parking also starts the big one's bytes on their way to
+ * guest memory in the background (uwp_wb_start), since other draws (Conker's
+ * shiny cups and candles) read that memory. Test file zeta-park-off.txt: off.
  */
 static SurfaceBinding uwp_parked;
 static bool uwp_parked_valid;
@@ -754,11 +771,12 @@ static bool uwp_zeta_park_off(void)
     static int off = -1;
     if (off < 0) {
         extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
-        /* off by default: shiny objects in Conker (cups, candles) take their reflection from that memory and
-         * came out white or rainbow-coloured while the big buffer was parked; test file zeta-park.txt: on */
-        off = !xemu_uwp_test_file_exists("zeta-park.txt");
-        if (!off) {
-            uwp_log("depth park test: on (zeta-park.txt)");
+        /* shiny objects in Conker (cups, candles) read the parked buffer's memory: it is written back in the
+         * background when parking (uwp_wb_start); without that write-back there is no park.
+         * Test file zeta-park-off.txt: no parking */
+        off = xemu_uwp_test_file_exists("zeta-park-off.txt") || uwp_zeta_wb_off() || uwp_zeta_readpixels();
+        if (off) {
+            uwp_log("depth park: off");
         }
     }
     return off;
@@ -771,7 +789,8 @@ static void uwp_unpark(NV2AState *d, bool keep_data)
         return;
     }
     uwp_parked_valid = false;
-    if (keep_data && d->pgraph.surface_scale_factor == uwp_parked_scale) {
+    if (keep_data && d->pgraph.surface_scale_factor == uwp_parked_scale &&
+        (uwp_zeta_wb_off() || uwp_zeta_readpixels())) {
         uwp_parked.download_pending = true;
         surface_download(d, &uwp_parked, true);
     }
@@ -787,6 +806,7 @@ static bool uwp_park_zeta(NV2AState *d, SurfaceBinding *old, const SurfaceBindin
         return false;
     }
     uwp_unpark(d, true);
+    uwp_wb_start(d, old);      /* the memory under the parked buffer gets its bytes, without a wait */
     uwp_parked = *old;
     uwp_parked_valid = true;
     uwp_parked_scale = d->pgraph.surface_scale_factor;
@@ -1098,18 +1118,18 @@ static bool uwp_zeta_readpixels(void)
     return on;
 }
 
-/* see zeta_dl_fs in pgraph_gl_init_surfaces */
-static void uwp_zeta_download_via_color(NV2AState *d, SurfaceBinding *surface, bool flip, uint8_t *out)
+/* see zeta_dl_fs in pgraph_gl_init_surfaces: draws the depth surface as the colour image of its words into
+ * zeta_dl_tex and leaves that image bound for reading; uwp_zeta_color_done puts the GL state back */
+static void uwp_zeta_draw_as_color(NV2AState *d, SurfaceBinding *surface, GLint *prev_active, GLint *prev_tex)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHGLState *r = pg->gl_renderer_state;
     unsigned int w = pg->surface_scale_factor * surface->width;
     unsigned int h = pg->surface_scale_factor * surface->height;
 
-    GLint prev_active, prev_tex;
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, prev_active);
     glActiveTexture(GL_TEXTURE0);
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, prev_tex);
 
     glBindTexture(GL_TEXTURE_2D, r->s2t_rndr.zeta_dl_tex);
     if (r->s2t_rndr.zeta_dl_w != w || r->s2t_rndr.zeta_dl_h != h) {
@@ -1141,6 +1161,25 @@ static void uwp_zeta_download_via_color(NV2AState *d, SurfaceBinding *surface, b
     glDisable(GL_DEPTH_TEST);
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+static void uwp_zeta_color_done(NV2AState *d, GLint prev_active, GLint prev_tex)
+{
+    PGRAPHGLState *r = d->pgraph.gl_renderer_state;
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, r->gl_framebuffer);
+    glBindTexture(GL_TEXTURE_2D, prev_tex);
+    glActiveTexture(prev_active);
+    glUseProgram(r->shader_binding ? r->shader_binding->gl_program : 0);
+}
+
+static void uwp_zeta_download_via_color(NV2AState *d, SurfaceBinding *surface, bool flip, uint8_t *out)
+{
+    PGRAPHState *pg = &d->pgraph;
+    unsigned int w = pg->surface_scale_factor * surface->width;
+    unsigned int h = pg->surface_scale_factor * surface->height;
+    GLint prev_active, prev_tex;
+    uwp_zeta_draw_as_color(d, surface, &prev_active, &prev_tex);
 
     glo_readpixels(GL_RGBA, GL_UNSIGNED_BYTE, 4, pg->surface_scale_factor * surface->pitch, w, h, flip, out);
 
@@ -1158,12 +1197,281 @@ static void uwp_zeta_download_via_color(NV2AState *d, SurfaceBinding *surface, b
         uwp_log("depth read-back through a colour image %ux%u at %x: depth %06x..%06x",
                 surface->width, surface->height, (unsigned)surface->vram_addr, lo, hi);
     }
+    uwp_zeta_color_done(d, prev_active, prev_tex);
+}
+
+/*
+ * Depth written back to guest memory in the background. A depth buffer that is
+ * thrown out (or parked) is drawn into the colour image and copied into a pixel
+ * buffer; the GPU does that while emulation goes on, and the bytes reach guest
+ * memory when something needs that memory (a texture, an upload, another
+ * read-back, all oldest first) or at the next frames' ends. Before, each of
+ * these was a read-back with a full GPU wait (Conker: Live & Reloaded, about 60
+ * a second in its menus). Test file zeta-wb-off.txt: wait as before.
+ */
+#define UWP_WB_MAX 32
+typedef struct UwpWb {
+    GLuint pbo;
+    GLsync fence;
+    hwaddr addr;
+    size_t size, pbo_size;
+    unsigned int width, height, pitch, scale;
+    bool swizzle;
+    uint64_t frame;
+} UwpWb;
+static UwpWb uwp_wb[UWP_WB_MAX];
+static int uwp_wb_head, uwp_wb_count;
+
+static bool uwp_zeta_wb_off(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        off = xemu_uwp_test_file_exists("zeta-wb-off.txt");
+        if (off) {
+            uwp_log("depth write-back test: waits for the GPU as before (zeta-wb-off.txt)");
+        }
+    }
+    return off;
+}
+
+/* the oldest write-back: into guest memory (waits for the GPU when not done and wait is set) */
+static bool uwp_wb_finish_oldest(NV2AState *d, bool wait)
+{
+    if (!uwp_wb_count) {
+        return false;
+    }
+    UwpWb *e = &uwp_wb[uwp_wb_head];
+    if (!wait && glClientWaitSync(e->fence, 0, 0) == GL_TIMEOUT_EXPIRED) {
+        return false;
+    }
+    glClientWaitSync(e->fence, GL_SYNC_FLUSH_COMMANDS_BIT, 2000000000ull);
+    glDeleteSync(e->fence);
+    e->fence = 0;
+
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, e->pbo);
+    const uint8_t *src = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)e->width * e->scale *
+                                          e->height * e->scale * 4, GL_MAP_READ_BIT);
+    if (src) {
+        /* the linear image at the surface's pitch, scaled down when drawn larger */
+        uint8_t *lin = g_malloc0(e->size);
+        unsigned int sw = e->width * e->scale;
+        for (unsigned int y = 0; y < e->height; y++) {
+            const uint8_t *in = src + (size_t)y * e->scale * sw * 4;
+            uint8_t *out = lin + (size_t)y * e->pitch;
+            if (e->scale == 1) {
+                memcpy(out, in, (size_t)e->width * 4);
+            } else {
+                for (unsigned int x = 0; x < e->width; x++) {
+                    memcpy(out + x * 4, in + (size_t)x * e->scale * 4, 4);
+                }
+            }
+        }
+        if (e->swizzle) {
+            swizzle_rect(lin, e->width, e->height, d->vram_ptr + e->addr, e->pitch, 4);
+        } else {
+            for (unsigned int y = 0; y < e->height; y++) {
+                memcpy(d->vram_ptr + e->addr + (size_t)y * e->pitch, lin + (size_t)y * e->pitch,
+                       (size_t)e->width * 4);
+            }
+        }
+        g_free(lin);
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        memory_region_set_client_dirty(d->vram, e->addr, (hwaddr)e->pitch * e->height, DIRTY_MEMORY_VGA);
+        memory_region_set_client_dirty(d->vram, e->addr, (hwaddr)e->pitch * e->height, DIRTY_MEMORY_NV2A_TEX);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    uwp_wb_head = (uwp_wb_head + 1) % UWP_WB_MAX;
+    uwp_wb_count--;
+    return true;
+}
+
+/* a write-back still on its way to guest memory in [addr, addr+len)? (pgraph lock held) */
+static bool uwp_wb_overlaps(hwaddr addr, hwaddr len)
+{
+    for (int i = 0; i < uwp_wb_count; i++) {
+        UwpWb *e = &uwp_wb[(uwp_wb_head + i) % UWP_WB_MAX];
+        if (addr < e->addr + e->size && e->addr < addr + len) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* everything that reads guest memory in [addr, addr+len) calls this first; true when one landed there */
+static bool uwp_wb_flush_range(NV2AState *d, hwaddr addr, hwaddr len)
+{
+    int last = -1;
+    for (int i = 0; i < uwp_wb_count; i++) {
+        UwpWb *e = &uwp_wb[(uwp_wb_head + i) % UWP_WB_MAX];
+        if (addr < e->addr + e->size && e->addr < addr + len) {
+            last = i;
+        }
+    }
+    for (int i = 0; i <= last; i++) {
+        uwp_wb_finish_oldest(d, true);
+    }
+    return last >= 0;
+}
+
+void pgraph_gl_uwp_wb_flush_range(NV2AState *d, hwaddr addr, hwaddr len)
+{
+    uwp_wb_flush_range(d, addr, len);
+}
+
+/* at a frame's end: the finished ones, and any older than two frames */
+void pgraph_gl_uwp_wb_frame(NV2AState *d)
+{
+    while (uwp_wb_count) {
+        UwpWb *e = &uwp_wb[uwp_wb_head];
+        bool old = d->pgraph.frame_time - e->frame > 2;
+        if (!uwp_wb_finish_oldest(d, old)) {
+            break;
+        }
+    }
+}
+
+static void uwp_wb_flush_all(NV2AState *d)
+{
+    while (uwp_wb_finish_oldest(d, true)) {
+    }
+}
+
+/* starts the write-back of a Z24S8 surface; false when it is not one (or the test switch is on) */
+static bool uwp_wb_start(NV2AState *d, SurfaceBinding *surface)
+{
+    PGRAPHState *pg = &d->pgraph;
+    if (surface->color || surface->fmt.gl_internal_format != GL_DEPTH24_STENCIL8 || uwp_zeta_wb_off() ||
+        uwp_zeta_readpixels() || !surface->width || !surface->height) {
+        return false;
+    }
+    /* no wait for older write-backs to the same memory: they land first anyway (oldest first) */
+    if (uwp_wb_count == UWP_WB_MAX) {
+        uwp_wb_finish_oldest(d, true);
+    }
+    UwpWb *e = &uwp_wb[(uwp_wb_head + uwp_wb_count) % UWP_WB_MAX];
+    unsigned int w = pg->surface_scale_factor * surface->width;
+    unsigned int h = pg->surface_scale_factor * surface->height;
+    size_t bytes = (size_t)w * h * 4;
+
+    GLint prev_active, prev_tex;
+    uwp_zeta_draw_as_color(d, surface, &prev_active, &prev_tex);
+    if (!e->pbo) {
+        glGenBuffers(1, &e->pbo);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, e->pbo);
+    if (e->pbo_size < bytes) {
+        glBufferData(GL_PIXEL_PACK_BUFFER, bytes, NULL, GL_STREAM_READ);
+        e->pbo_size = bytes;
+    }
+    GLint rl, pa;
+    glGetIntegerv(GL_PACK_ROW_LENGTH, &rl);
+    glGetIntegerv(GL_PACK_ALIGNMENT, &pa);
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glPixelStorei(GL_PACK_ROW_LENGTH, rl);
+    glPixelStorei(GL_PACK_ALIGNMENT, pa);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    e->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+    uwp_zeta_color_done(d, prev_active, prev_tex);
+
+    e->addr = surface->vram_addr;
+    e->size = surface->size;
+    e->width = surface->width;
+    e->height = surface->height;
+    e->pitch = surface->pitch;
+    e->scale = pg->surface_scale_factor;
+    e->swizzle = surface->swizzle;
+    e->frame = pg->frame_time;
+    uwp_wb_count++;
+
+    static unsigned logged;
+    if (!logged++) {
+        uwp_log("depth write-back in the background: %ux%u at %x", surface->width, surface->height,
+                (unsigned)surface->vram_addr);
+    }
+    return true;
+}
+
+static bool uwp_color_prefetch_off(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        off = xemu_uwp_test_file_exists("color-prefetch-off.txt");
+        if (off) {
+            uwp_log("colour read-ahead test: off (color-prefetch-off.txt)");
+        }
+    }
+    return off;
+}
+
+/*
+ * Small swizzled colour targets that the game reads with the CPU (Conker: Live
+ * & Reloaded draws 32x32 ones, about 25 a second in its talking scenes, and
+ * reads each back). The read waited for the whole GPU queue, about 7 ms of
+ * the emulated CPU's time each. When the target is unbound its bytes start on
+ * their way to guest memory in the background; the CPU's read then only waits
+ * when they have not landed yet (surface_access_callback).
+ * Test file color-prefetch-off.txt: read when the CPU asks, as before.
+ */
+static void uwp_prefetch_color(NV2AState *d, SurfaceBinding *surface)
+{
+    PGRAPHState *pg = &d->pgraph;
+    if (!surface || !surface->color || !surface->draw_dirty || !surface->swizzle ||
+        surface->size > 16384 || surface->fmt.bytes_per_pixel != 4 || pg->surface_scale_factor != 1 ||
+        !surface->width || !surface->height || uwp_color_prefetch_off()) {
+        return;
+    }
+    if (uwp_wb_count == UWP_WB_MAX) {
+        uwp_wb_finish_oldest(d, true);
+    }
+    UwpWb *e = &uwp_wb[(uwp_wb_head + uwp_wb_count) % UWP_WB_MAX];
+    size_t bytes = (size_t)surface->width * surface->height * 4;
 
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
-    glBindFramebuffer(GL_FRAMEBUFFER, r->gl_framebuffer);
-    glBindTexture(GL_TEXTURE_2D, prev_tex);
-    glActiveTexture(prev_active);
-    glUseProgram(r->shader_binding ? r->shader_binding->gl_program : 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, surface->fmt.gl_attachment, GL_TEXTURE_2D, surface->gl_buffer, 0);
+    if (!e->pbo) {
+        glGenBuffers(1, &e->pbo);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, e->pbo);
+    if (e->pbo_size < bytes) {
+        glBufferData(GL_PIXEL_PACK_BUFFER, bytes, NULL, GL_STREAM_READ);
+        e->pbo_size = bytes;
+    }
+    GLint rl, pa;
+    glGetIntegerv(GL_PACK_ROW_LENGTH, &rl);
+    glGetIntegerv(GL_PACK_ALIGNMENT, &pa);
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, surface->width, surface->height, surface->fmt.gl_format, surface->fmt.gl_type, NULL);
+    glPixelStorei(GL_PACK_ROW_LENGTH, rl);
+    glPixelStorei(GL_PACK_ALIGNMENT, pa);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    e->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+    glFramebufferTexture2D(GL_FRAMEBUFFER, surface->fmt.gl_attachment, GL_TEXTURE_2D, 0, 0);
+    bind_current_surface(d);
+
+    e->addr = surface->vram_addr;
+    e->size = surface->size;
+    e->width = surface->width;
+    e->height = surface->height;
+    e->pitch = surface->pitch;
+    e->scale = 1;
+    e->swizzle = surface->swizzle;
+    e->frame = pg->frame_time;
+    uwp_wb_count++;
+    surface->draw_dirty = false;
+
+    static unsigned logged;
+    if (!logged++) {
+        uwp_log("colour read-ahead: %ux%u at %x", surface->width, surface->height, (unsigned)surface->vram_addr);
+    }
 }
 #endif
 
@@ -1263,6 +1571,13 @@ static void surface_download(NV2AState *d, SurfaceBinding *surface, bool force)
         !surface->height) {
         return;
     }
+#ifdef XEMU_UWP
+    uwp_wb_flush_range(d, surface->vram_addr, surface->size);
+    if (!force && !surface->draw_dirty) {
+        surface->download_pending = false;   /* its bytes came with a write-back */
+        return;
+    }
+#endif
 
     /* FIXME: Respect write enable at last TOU? */
 
@@ -1300,6 +1615,9 @@ void pgraph_gl_process_pending_downloads(NV2AState *d)
     PGRAPHState *pg = &d->pgraph;
     PGRAPHGLState *r = pg->gl_renderer_state;
 
+#ifdef XEMU_UWP
+    uwp_wb_flush_all(d);
+#endif
     SurfaceBinding *surface;
     QTAILQ_FOREACH(surface, &r->surfaces, entry) {
         UWP_DL_SITE(CPU_ACCESS);
@@ -1379,6 +1697,11 @@ static void surface_copy_expand(uint8_t *out, uint8_t *in, unsigned int width,
 void pgraph_gl_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
                                 bool force)
 {
+#ifdef XEMU_UWP
+    if (surface->upload_pending || force) {
+        uwp_wb_flush_range(d, surface->vram_addr, surface->size);
+    }
+#endif
     if (!(surface->upload_pending || force)) {
         return;
     }
@@ -1793,8 +2116,8 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
 #ifdef XEMU_UWP
                 if (uwp_evict_without_download(found, &entry)) {
                     found->draw_dirty = false;
-                } else {
-                    uwp_park_zeta(d, found, &entry);
+                } else if (!uwp_park_zeta(d, found, &entry) && uwp_wb_start(d, found)) {
+                    found->draw_dirty = false;   /* its bytes reach guest memory in the background */
                 }
 #endif
                 pgraph_gl_surface_download_if_dirty(d, found);
@@ -1906,6 +2229,9 @@ void pgraph_gl_unbind_surface(NV2AState *d, bool color)
 
     if (color) {
         if (r->color_binding) {
+#ifdef XEMU_UWP
+            uwp_prefetch_color(d, r->color_binding);
+#endif
             glFramebufferTexture2D(GL_FRAMEBUFFER,
                                    GL_COLOR_ATTACHMENT0,
                                    GL_TEXTURE_2D, 0, 0);
@@ -2061,6 +2387,7 @@ static void flush_surfaces(NV2AState *d)
 
 #ifdef XEMU_UWP
     uwp_unpark(d, false);
+    uwp_wb_flush_all(d);
 #endif
     SurfaceBinding *s, *next;
     QTAILQ_FOREACH_SAFE(s, &r->surfaces, entry, next) {

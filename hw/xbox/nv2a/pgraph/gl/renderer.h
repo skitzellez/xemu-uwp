@@ -315,6 +315,10 @@ SurfaceBinding *pgraph_gl_surface_get_within(NV2AState *d, hwaddr addr);
 void pgraph_gl_surface_invalidate(NV2AState *d, SurfaceBinding *e);
 void pgraph_gl_unbind_surface(NV2AState *d, bool color);
 void pgraph_gl_upload_surface_data(NV2AState *d, SurfaceBinding *surface, bool force);
+#ifdef XEMU_UWP
+void pgraph_gl_uwp_wb_flush_range(NV2AState *d, hwaddr addr, hwaddr len);
+void pgraph_gl_uwp_wb_frame(NV2AState *d);
+#endif
 void pgraph_gl_shader_cache_to_disk(ShaderBinding *snode);
 bool pgraph_gl_shader_load_from_memory(ShaderBinding *snode);
 void pgraph_gl_shader_write_cache_reload_list(PGRAPHState *pg);
