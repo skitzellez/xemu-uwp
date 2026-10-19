@@ -974,6 +974,22 @@ void dsp56k_write_memory(dsp_core_t* dsp, int space, uint32_t address, uint32_t 
 
 static void write_memory_raw(dsp_core_t* dsp, int space, uint32_t address, uint32_t value)
 {
+#ifdef XEMU_UWP
+    /* a value wider than the chip's 24 bits stopped xemu here (Official Xbox Magazine demo disc 25): the chip
+     * keeps 24 bits, so does this; first time logged */
+    if (value & 0xFF000000) {
+        static bool seen;
+        if (!seen) {
+            seen = true;
+            uwp_log("sound chip: a %06x-wide write at %x kept to 24 bits (first time only)", value, address);
+        }
+        value &= 0x00FFFFFF;
+    }
+    if (address & 0xFF000000) {
+        dsp_uwp_out_of_range("X write", address);
+        return;
+    }
+#endif
     assert((value & 0xFF000000) == 0);
     assert((address & 0xFF000000) == 0);
 
