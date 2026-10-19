@@ -32,6 +32,7 @@
 #include "qemu/sockets.h"
 #include "qemu/iov.h"
 #include "qemu/main-loop.h"
+#include "qemu/timer.h"
 
 typedef struct NetSocketState {
     NetClientState nc;
@@ -43,7 +44,20 @@ typedef struct NetSocketState {
     IOHandler *send_fn;           /* differs between SOCK_STREAM/SOCK_DGRAM */
     bool read_poll;               /* waiting to receive data? */
     bool write_poll;              /* waiting to transmit data? */
+#ifdef XEMU_UWP
+    QEMUTimer *hello_timer;       /* UDP tunnel: "I'm here" to the System Link hub */
+#endif
 } NetSocketState;
+
+#ifdef XEMU_UWP
+/* Game Vault System Link: in a UDP tunnel, a short hello goes to the remote end every 5 s. A System Link hub
+ * learns from it that this console is in the room (a game host sends nothing until someone searches), and it
+ * keeps the home router's way back open. Packets shorter than an Ethernet header are hellos, never frames:
+ * they are not handed to the emulated network card. */
+#define UWP_LINK_HELLO "GVLINK1"
+#define UWP_LINK_HELLO_MS 5000
+static void uwp_link_hello(void *opaque);
+#endif
 
 static void net_socket_accept(void *opaque);
 static void net_socket_writable(void *opaque);
@@ -198,6 +212,11 @@ static void net_socket_send_dgram(void *opaque)
     size = recv(s->fd, s->rs.buf, sizeof(s->rs.buf), 0);
     if (size < 0)
         return;
+#ifdef XEMU_UWP
+    if (size > 0 && size < 14) {
+        return;   /* a hello (see UWP_LINK_HELLO), not an Ethernet frame */
+    }
+#endif
     if (size == 0) {
         /* end of connection */
         net_socket_read_poll(s, false);
@@ -309,6 +328,12 @@ fail:
 static void net_socket_cleanup(NetClientState *nc)
 {
     NetSocketState *s = DO_UPCAST(NetSocketState, nc, nc);
+#ifdef XEMU_UWP
+    if (s->hello_timer) {
+        timer_free(s->hello_timer);
+        s->hello_timer = NULL;
+    }
+#endif
     if (s->fd != -1) {
         net_socket_read_poll(s, false);
         net_socket_write_poll(s, false);
@@ -694,8 +719,26 @@ static int net_socket_udp_init(NetClientState *peer,
 
     qemu_set_info_str(&s->nc, "socket: udp=%s:%d", inet_ntoa(raddr.sin_addr),
                       ntohs(raddr.sin_port));
+#ifdef XEMU_UWP
+    s->hello_timer = timer_new_ms(QEMU_CLOCK_REALTIME, uwp_link_hello, s);
+    uwp_link_hello(s);
+    fprintf(stderr, "System Link: UDP tunnel to %s:%d, hello every %d s\n", inet_ntoa(raddr.sin_addr),
+            ntohs(raddr.sin_port), UWP_LINK_HELLO_MS / 1000);
+#endif
     return 0;
 }
+
+#ifdef XEMU_UWP
+static void uwp_link_hello(void *opaque)
+{
+    NetSocketState *s = opaque;
+    if (s->fd != -1) {
+        sendto(s->fd, UWP_LINK_HELLO, sizeof(UWP_LINK_HELLO) - 1, 0, (struct sockaddr *)&s->dgram_dst,
+               sizeof(s->dgram_dst));
+    }
+    timer_mod(s->hello_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + UWP_LINK_HELLO_MS);
+}
+#endif
 
 int net_init_socket(const Netdev *netdev, const char *name,
                     NetClientState *peer, Error **errp)
