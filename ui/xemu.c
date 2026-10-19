@@ -672,7 +672,7 @@ static void mouse_define(DisplayChangeListener *dcl,
     }
 }
 
-static void xb_surface_gl_create_texture(DisplaySurface *surface)
+static void xb_surface_gl_create_texture_format(DisplaySurface *surface)
 {
     assert(QEMU_IS_ALIGNED(surface_stride(surface), surface_bytes_per_pixel(surface)));
 
@@ -694,7 +694,11 @@ static void xb_surface_gl_create_texture(DisplaySurface *surface)
     default:
         g_assert_not_reached();
     }
+}
 
+static G_GNUC_UNUSED void xb_surface_gl_create_texture(DisplaySurface *surface)
+{
+    xb_surface_gl_create_texture_format(surface);
     if (!surface->texture) {
         glGenTextures(1, &surface->texture);
     }
@@ -711,6 +715,43 @@ static void xb_surface_gl_create_texture(DisplaySurface *surface)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 }
+
+#ifdef XEMU_UWP
+/*
+ * The picture when the GPU shows no surface (a game drawing its screen with the CPU, the free BIOS's boot
+ * screens, a game stuck before its first frame): one texture, kept, and refilled in place. Upstream makes a
+ * new texture every frame and deletes it after; on the console's GL-on-D3D12 driver that leaked about 7 MB a
+ * second at 4K (players' "never drew a frame" sessions climbed to the 5 GB limit and crashed in the driver).
+ */
+static GLuint uwp_fallback_texture(DisplaySurface *surface)
+{
+    static GLuint tex;
+    static int tex_w, tex_h;
+    static GLenum tex_format, tex_type;
+
+    xb_surface_gl_create_texture_format(surface);
+    int w =surface_width(surface), h = surface_height(surface);
+    bool same = tex && w == tex_w && h == tex_h && surface->glformat == tex_format && surface->gltype == tex_type;
+    if (!tex) {
+        glGenTextures(1, &tex);
+    }
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, surface_stride(surface) / surface_bytes_per_pixel(surface));
+    if (same) {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, surface->glformat, surface->gltype, surface_data(surface));
+    } else {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, surface->glformat, surface->gltype, surface_data(surface));
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        tex_w = w;
+        tex_h = h;
+        tex_format = surface->glformat;
+        tex_type = surface->gltype;
+    }
+    glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, 0);
+    return tex;
+}
+#endif
 
 static void xb_surface_gl_destroy_texture(DisplaySurface *surface)
 {
@@ -868,16 +909,23 @@ static void gl_render_frame(struct xemu_console *scon)
     UWP_PROF_BEGIN(t_getfb);
     GLuint tex = nv2a_get_framebuffer_surface();
     UWP_PROF_END(UI_GETFB, t_getfb);
+    if (tex) {
+        nv2a_uwp_wait_display();   /* the picture is drawn on the GPU before this context reads it */
+    }
 
     assert(glGetError() == GL_NO_ERROR);
 
     if (tex == 0) {
         xemu_main_loop_lock();
         // FIXME: Don't upload if notdirty
+#ifdef XEMU_UWP
+        tex = uwp_fallback_texture(scon->surface);   /* kept: not released after the frame */
+#else
         xb_surface_gl_create_texture(scon->surface);
         tex = scon->surface->texture;
-        flip_required = true;
         release_surface_texture = true;
+#endif
+        flip_required = true;
         xemu_main_loop_unlock();
     }
 
@@ -4859,6 +4907,15 @@ static void uwp_fill_system_files(void)
             xemu_uwp_display_upstream = uwp_file_exists(marker);
             if (xemu_uwp_display_upstream) {
                 uwp_log("display test: upstream's surface choice, no stale-surface rule (display-upstream.txt)");
+            }
+        }
+        g_free(marker);
+        marker = g_build_filename(dir, "display-cpu-wait.txt", NULL);
+        {
+            extern bool xemu_uwp_display_cpu_wait; /* pgraph/gl/display.c */
+            xemu_uwp_display_cpu_wait = uwp_file_exists(marker);
+            if (xemu_uwp_display_cpu_wait) {
+                uwp_log("display test: upstream's CPU waits for each shown frame (display-cpu-wait.txt)");
             }
         }
         g_free(marker);

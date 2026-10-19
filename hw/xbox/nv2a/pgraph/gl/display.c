@@ -405,6 +405,20 @@ static void gl_fence(void)
 static uint64_t uwp_stale_surface_addr; /* vram address + 1 of a surface to drop, 0 = none */
 /* test switch display-upstream.txt (ui/xemu.c): upstream's choice, no stale-surface rule */
 bool xemu_uwp_display_upstream;
+/* test switch display-cpu-wait.txt (ui/xemu.c): upstream's CPU waits in pgraph_gl_sync */
+bool xemu_uwp_display_cpu_wait;
+/* the display picture's fence, for the UI thread's GPU-side wait (NULL: none waiting) */
+static GLsync uwp_display_fence;
+
+/* On the UI thread, after nv2a_get_framebuffer_surface: its GL context waits for the picture on the GPU. */
+void nv2a_uwp_wait_display(void)
+{
+    GLsync fence = qatomic_xchg(&uwp_display_fence, NULL);
+    if (fence) {
+        glWaitSync(fence, 0, GL_TIMEOUT_IGNORED);
+        glDeleteSync(fence);
+    }
+}
 
 static SurfaceBinding *uwp_display_surface(NV2AState *d, hwaddr line_offset)
 {
@@ -480,6 +494,36 @@ void pgraph_gl_sync(NV2AState *d)
     /* Wait for queued commands to complete */
     UWP_PROF_BEGIN(t0);
     pgraph_gl_upload_surface_data(d, surface, !tcg_enabled());
+#ifdef XEMU_UWP
+    if (!xemu_uwp_display_cpu_wait) {
+        /*
+         * The GPU waits, not this thread. Upstream waits here twice for the
+         * real GPU to finish everything queued (game drawing included): in a
+         * busy scene ~40 ms per shown frame, during which no Xbox GPU command
+         * is taken (Ninja Gaiden Black fights: half of this thread's time,
+         * 1-15 fps). Now the display context waits for the drawing on the GPU,
+         * and the UI thread for the display picture (nv2a_uwp_wait_display).
+         */
+        GLsync drawn = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        glFlush();
+        glo_set_current(g_nv2a_context_display);
+        glWaitSync(drawn, 0, GL_TIMEOUT_IGNORED);
+        glDeleteSync(drawn);
+        render_display(d, surface);
+        GLsync shown = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        glFlush();
+        GLsync old = qatomic_xchg(&uwp_display_fence, shown);
+        if (old) {
+            glDeleteSync(old);   /* the UI did not take the last one */
+        }
+        assert(glGetError() == GL_NO_ERROR);
+        glo_set_current(g_nv2a_context_render);
+        UWP_PROF_END(PF_SYNC, t0);
+        qatomic_set(&d->pgraph.sync_pending, false);
+        qemu_event_set(&d->pgraph.sync_complete);
+        return;
+    }
+#endif
     gl_fence();
     assert(glGetError() == GL_NO_ERROR);
 
