@@ -332,6 +332,8 @@ int xemu_input_get_controller_default_bind_port(ControllerState *state, int star
         SDL_GUIDToString(state->sdl_joystick_guid, guid, sizeof(guid));
     } else if (state->type == INPUT_DEVICE_SDL_KEYBOARD) {
         snprintf(guid, sizeof(guid), "keyboard");
+    } else if (state->type == INPUT_DEVICE_UWP_WHEEL) {
+        snprintf(guid, sizeof(guid), "racing-wheel-%d", state->uwp_wheel + 1);
     }
 
     for (int i = start; i < 4; i++) {
@@ -556,6 +558,16 @@ void xemu_input_update_controller(ControllerState *state)
         xemu_input_update_sdl_controller_state(state);
     }
 #ifdef XEMU_UWP
+    else if (state->type == INPUT_DEVICE_UWP_WHEEL) {
+        if (!xemu_uwp_wheel_read(state->uwp_wheel, &state->buttons, state->axis)) {
+            state->buttons = 0;
+            memset(state->axis, 0, sizeof(state->axis));
+        }
+        if (xemu_uwp_game_input_held(state)) {   /* the menu: as for a gamepad */
+            state->buttons = 0;
+            memset(state->axis, 0, sizeof(state->axis));
+        }
+    }
     /* buttons pressed from outside, through a launch link (see uwp_press in ui/xemu.c) */
     state->buttons |= xemu_uwp_injected_buttons;
     if (SDL_GetTicks() < xemu_uwp_held_until) {
@@ -588,9 +600,80 @@ void xemu_input_update_controller(ControllerState *state)
     state->last_input_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 }
 
+#ifdef XEMU_UWP
+/* Racing wheels are not SDL gamepads: each one plugged in gets a controller of its own here, bound like a newly
+ * plugged-in gamepad (its last port, else the first free one), and goes again when it is unplugged. */
+static void xemu_input_sync_uwp_wheels(void)
+{
+    int want = xemu_uwp_wheel_count(), have = 0;
+    ControllerState *iter, *next;
+    QTAILQ_FOREACH(iter, &available_controllers, entry) {
+        have += iter->type == INPUT_DEVICE_UWP_WHEEL;
+    }
+    QTAILQ_FOREACH_SAFE(iter, &available_controllers, entry, next) {
+        if (iter->type != INPUT_DEVICE_UWP_WHEEL || iter->uwp_wheel < want) {
+            continue;
+        }
+        if (iter->bound >= 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "Port %d disconnected", iter->bound + 1);
+            xemu_queue_notification(buf);
+            xemu_input_bind(iter->bound, NULL, 0);
+        }
+        uwp_log("input: racing wheel %d removed", iter->uwp_wheel + 1);
+        QTAILQ_REMOVE(&available_controllers, iter, entry);
+        for (int i = 0; i < 2; i++) {
+            if (iter->peripherals[i]) {
+                g_free(iter->peripherals[i]);
+            }
+        }
+        free(iter);
+        have--;
+    }
+    for (int w = have; w < want; w++) {
+        ControllerState *new_con = malloc(sizeof(ControllerState));
+        memset(new_con, 0, sizeof(ControllerState));
+        new_con->type = INPUT_DEVICE_UWP_WHEEL;
+        new_con->name = "Racing wheel";
+        new_con->uwp_wheel = w;
+        new_con->bound = -1;
+        new_con->peripheral_types[0] = PERIPHERAL_NONE;
+        new_con->peripheral_types[1] = PERIPHERAL_NONE;
+        QTAILQ_INSERT_TAIL(&available_controllers, new_con, entry);
+        int port = xemu_input_get_controller_default_bind_port(new_con, 0);
+        bool did_bind = port >= 0 && !xemu_input_get_bound(port);
+        if (did_bind) {
+            xemu_input_bind(port, new_con, 0);
+        } else if (g_config.input.auto_bind) {
+            for (port = 0; port < 4 && !did_bind; port++) {
+                if (!xemu_input_get_bound(port)) {
+                    xemu_input_bind(port, new_con, 1);
+                    did_bind = true;
+                    break;
+                }
+            }
+        }
+        if (did_bind) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "Connected '%s' to port %d", new_con->name, port + 1);
+            xemu_queue_notification(buf);
+            xemu_input_rebind_xmu(port);
+        }
+        if (did_bind) {
+            uwp_log("input: racing wheel %d connected to port %d", w + 1, port + 1);
+        } else {
+            uwp_log("input: racing wheel %d connected, no free port (choose it in Input settings)", w + 1);
+        }
+    }
+}
+#endif
+
 void xemu_input_update_controllers(void)
 {
     ControllerState *iter;
+#ifdef XEMU_UWP
+    xemu_input_sync_uwp_wheels();
+#endif
     QTAILQ_FOREACH(iter, &available_controllers, entry) {
         xemu_input_update_controller(iter);
     }

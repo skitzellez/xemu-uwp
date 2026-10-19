@@ -71,6 +71,7 @@ enum controller_state_axis_index {
 enum controller_input_device_type {
     INPUT_DEVICE_SDL_KEYBOARD,
     INPUT_DEVICE_SDL_GAMEPAD,
+    INPUT_DEVICE_UWP_WHEEL,   // XEMU_UWP: a racing wheel (ui/xemu-uwp-wheel.c), not seen by SDL
 };
 
 enum peripheral_type { PERIPHERAL_NONE, PERIPHERAL_XMU, PERIPHERAL_TYPE_COUNT };
@@ -109,6 +110,8 @@ typedef struct ControllerState {
 
     GamepadMappings *controller_map;
 
+    int   uwp_wheel;  // if type == INPUT_DEVICE_UWP_WHEEL: which wheel (0 = the first)
+
     int   bound;  // Which port this input device is bound to
     void *device; // DeviceState opaque
 } ControllerState;
@@ -123,6 +126,12 @@ extern "C" {
 #endif
 
 extern int *g_keyboard_scancode_map[25];
+
+#ifdef XEMU_UWP
+/* ui/xemu-uwp-wheel.c: Xbox racing wheels (Windows.Gaming.Input.RacingWheel) */
+int xemu_uwp_wheel_count(void);
+bool xemu_uwp_wheel_read(int index, uint16_t *buttons, int16_t *axis);
+#endif
 
 void xemu_input_init(void);
 void xemu_input_process_sdl_events(const SDL_Event *event);

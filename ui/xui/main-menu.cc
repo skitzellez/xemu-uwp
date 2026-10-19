@@ -524,7 +524,9 @@ void MainMenuInputView::Draw()
         tc.w = 0.0f;
         ImGui::PushStyleColor(ImGuiCol_Header, tc);
 
-        if (ImGui::CollapsingHeader("Input Mapping")) {
+        // a racing wheel (XEMU_UWP) has a fixed layout and no button map to edit
+        if (bound_state->type != INPUT_DEVICE_UWP_WHEEL &&
+            ImGui::CollapsingHeader("Input Mapping")) {
             float p = ImGui::GetFrameHeight() * 0.3;
             ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(p, p));
             if (ImGui::BeginTable("input_remap_tbl", 2,
