@@ -4609,14 +4609,14 @@ static bool uwp_new_hdd(const char *folder, const char *own, const char *name)
 
 /*
  * The free SpiritBoot BIOS shipped in the package (GPL-2.0, github.com/Mainkill1/SpiritBoot,
- * release v1.0.0, see spiritboot\README.txt next to xemu.exe). It boots without the MCPX boot
+ * release v1.1.0, see spiritboot\README.txt next to xemu.exe). It boots without the MCPX boot
  * ROM. It cannot do Xbox Live / Insignia (no Microsoft keys), and its saves do not work with a
  * Microsoft BIOS and the other way round, which is why it gets a hard disk of its own.
  */
 static bool uwp_use_free_bios(void)
 {
     bool big = g_config.sys.mem_limit == CONFIG_SYS_MEM_LIMIT_128;
-    char *path = g_strdup_printf("%sspiritboot\\SpiritBoot-v1.0.0-%s.bin",
+    char *path = g_strdup_printf("%sspiritboot\\SpiritBoot-v1.1.0-%s.bin",
                                  SDL_GetBasePath(), big ? "128MB" : "64MB");
     bool ok = uwp_file_exists(path);
     if (ok) {
