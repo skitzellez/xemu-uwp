@@ -776,8 +776,8 @@ void pgraph_gl_shader_cache_to_disk(ShaderBinding *binding)
  * Every draw handed every uniform to GL again, the 192 vertex shader constants (3 KB) included: the GL
  * driver compared or re-uploaded them each time, a large part of its work in scenes with thousands of
  * draws a frame (Project Gotham Racing: 3,300). The values last given to this program are kept (last);
- * unchanged uniforms are skipped, and of a changed array only the changed elements are sent (array
- * elements have consecutive locations in Mesa). Test file uniform-all.txt: everything every draw.
+ * unchanged uniforms are skipped, and of a changed array only the part up to the last changed element is
+ * sent. Test file uniform-all.txt: everything every draw.
  */
 static bool uwp_uniform_all(void)
 {
@@ -815,17 +815,16 @@ static void apply_uniform_updates(const UniformInfo *info, int *locs,
             if (!memcmp(prev, value, es * n)) {
                 continue;
             }
-            size_t first = 0, end = n;
-            while (first < n && !memcmp((char *)prev + first * es, (char *)value + first * es, es)) {
-                first++;
-            }
-            while (end > first && !memcmp((char *)prev + (end - 1) * es, (char *)value + (end - 1) * es, es)) {
+            /* sent from the array's first element up to the last changed one: Mesa trims an array to the
+             * elements the shader uses, so "location + k" past them is another uniform (0.9.249-0.9.250 did
+             * that: GL_INVALID_OPERATION ~150 times a second, or a wrong value where the types matched).
+             * Counts past the used part are ignored by GL. */
+            size_t end = n;
+            while (end > 0 && !memcmp((char *)prev + (end - 1) * es, (char *)value + (end - 1) * es, es)) {
                 end--;
             }
-            memcpy((char *)prev + first * es, (char *)value + first * es, (end - first) * es);
-            loc += first;
-            value = (char *)value + first * es;
-            n = end - first;
+            memcpy(prev, value, end * es);
+            n = end;
         }
 #define UWP_LOC loc
 #define UWP_N n
