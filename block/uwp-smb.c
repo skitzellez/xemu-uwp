@@ -11,7 +11,7 @@
  *
  * Read-only. Reads run on QEMU's worker threads (the emulated Xbox never waits on the network in its own thread)
  * through a read-ahead cache of 1 MB pieces, so a disc read of a few KB does not cost a network round trip each;
- * a dropped connection (a PC that slept, Wi-Fi that blinked) is opened again once by itself.
+ * a dropped connection (a PC that slept, Wi-Fi that blinked) is opened again by itself, for up to ~10 s.
  *
  * Copyright (c) 2026 Skitzelles - part of Game Vault. Licensed like the rest of xemu (GPL-2.0-or-later).
  */
@@ -227,17 +227,32 @@ static int smb_open_file(BDRVSmbState *s, Error **errp)
     return 0;
 }
 
-/* one piece into a slot, from the network (lock held) */
+/* one piece into a slot, from the network (lock held). A failed read is tried again, with the connection opened
+ * afresh, for about 10 s (a PC busy for a moment, Wi-Fi that blinked) before the game is told the disc can't be
+ * read - after 2 quick tries the game showed its "clean the disc" screen while the share was fine again. */
+#define SMB_RETRY_US (10 * G_USEC_PER_SEC)
 static int smb_fetch(BDRVSmbState *s, SmbSlot *slot, int64_t chunk)
 {
     uint64_t off = (uint64_t)chunk * SMB_CHUNK;
     uint32_t want = off + SMB_CHUNK <= s->length ? SMB_CHUNK : (uint32_t)(s->length - off);
-    for (int attempt = 0; attempt < 2; attempt++) {
+    int64_t start = 0;
+    int64_t wait_us = 250 * 1000;
+    for (int attempt = 0;; attempt++) {
+        if (attempt >= 2) {   /* the first retry at once, then waits of 0.25, 0.5, 1, 2, 2 ... s */
+            if (g_get_monotonic_time() - start + wait_us > SMB_RETRY_US) {
+                break;
+            }
+            g_usleep(wait_us);
+            wait_us = MIN(wait_us * 2, 2 * G_USEC_PER_SEC);
+        }
         if (!s->ctx) {
             Error *err = NULL;
             if (smb_open_file(s, &err) < 0) {
                 uwp_log("%s", error_get_pretty(err));
                 error_free(err);
+                if (!start) {
+                    start = g_get_monotonic_time();
+                }
                 continue;
             }
             uwp_log("network: connection opened again (%s)", s->server);
@@ -256,12 +271,22 @@ static int smb_fetch(BDRVSmbState *s, SmbSlot *slot, int64_t chunk)
             slot->len = want;
             s->net_bytes += want;
             s->net_reads++;
+            if (start) {
+                uwp_log("network: read at %llu MB recovered after %lld ms (%d tries)",
+                        (unsigned long long)(off >> 20), (long long)((g_get_monotonic_time() - start) / 1000),
+                        attempt + 1);
+            }
             return 0;
         }
-        uwp_log("network: read at %llu MB failed (%s), once more", (unsigned long long)(off >> 20),
+        if (!start) {
+            start = g_get_monotonic_time();
+        }
+        uwp_log("network: read at %llu MB failed (%s), trying again", (unsigned long long)(off >> 20),
                 s->ctx ? smb2_get_error(s->ctx) : "no connection");
         smb_drop(s);
     }
+    uwp_log("network: read at %llu MB gave up after %lld ms - the game is told the disc can't be read",
+            (unsigned long long)(off >> 20), (long long)((g_get_monotonic_time() - start) / 1000));
     slot->chunk = -1;
     return -EIO;
 }
