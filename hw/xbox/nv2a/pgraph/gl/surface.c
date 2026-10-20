@@ -684,9 +684,45 @@ void pgraph_gl_render_surface_to_texture(NV2AState *d, SurfaceBinding *surface,
         r->shader_binding ? r->shader_binding->gl_program : 0);
 }
 
+#ifdef XEMU_UWP
+static bool uwp_s2t_compat(const SurfaceBinding *surface, const TextureShape *shape);
+
+/*
+ * Each surface/texture format pair a game samples, once, with the way it is taken (GPU copy or through
+ * memory): a wrong picture in one game can then be matched to the path that drew it.
+ */
 bool pgraph_gl_check_surface_to_texture_compatibility(
     const SurfaceBinding *surface,
     const TextureShape *shape)
+{
+    bool ok = uwp_s2t_compat(surface, shape);
+    static uint32_t seen[64];
+    static unsigned n_seen;
+    uint32_t key = (surface->color ? 0x80000000u : 0) | (ok ? 0x40000000u : 0) |
+                   ((uint32_t)(surface->color ? surface->shape.color_format : surface->fmt.gl_internal_format) << 8) |
+                   (uint32_t)shape->color_format;
+    for (unsigned i = 0; i < n_seen; i++) {
+        if (seen[i] == key) {
+            return ok;
+        }
+    }
+    if (n_seen < ARRAY_SIZE(seen)) {
+        seen[n_seen++] = key;
+        uwp_log("surface as texture: %s surface %s 0x%x %ux%u%s -> texture format 0x%x %ux%u levels %u: %s",
+                surface->color ? "colour" : "depth", surface->color ? "format" : "GL format",
+                surface->color ? surface->shape.color_format : surface->fmt.gl_internal_format,
+                surface->width, surface->height, surface->swizzle ? " swizzled" : "", shape->color_format,
+                shape->width, shape->height, shape->levels, ok ? "copied on the GPU" : "through memory");
+    }
+    return ok;
+}
+
+static bool uwp_s2t_compat(const SurfaceBinding *surface, const TextureShape *shape)
+#else
+bool pgraph_gl_check_surface_to_texture_compatibility(
+    const SurfaceBinding *surface,
+    const TextureShape *shape)
+#endif
 {
     // FIXME: Better checks/handling on formats and surface-texture compat
 
