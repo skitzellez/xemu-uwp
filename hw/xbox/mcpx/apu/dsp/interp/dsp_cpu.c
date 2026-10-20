@@ -431,8 +431,16 @@ static const OpcodeEntry *lookup_opcode_slow(uint32_t op) {
     }
 
     fprintf(stderr, "op = %08x\n", op);
+#ifdef XEMU_UWP
+    /* an op no table entry matches (0x00101b after the sound program ran astray, Ultimate Spider-Man and Godzilla
+     * on one console, 2026-10-20): no template and no emu function, so it goes to emu_undefined, which steps over
+     * it like any instruction not emulated yet, instead of stopping xemu */
+    static const OpcodeEntry unknown_opcode = { NULL, "unknown", NULL, NULL, NULL };
+    return &unknown_opcode;
+#else
     assert(!"Invalid op code in dsp_cpu");
     return NULL;
+#endif
 }
 
 static const OpcodeEntry *lookup_opcode(uint32_t op) {
@@ -916,13 +924,14 @@ static uint32_t read_memory_p(dsp_core_t* dsp, uint32_t address)
  * 2026-10-18). On a console the access is answered instead: reads give 0,
  * writes are dropped, and the first of each kind is logged for the reports.
  */
-static bool dsp_uwp_out_of_range(const char *what, uint32_t address)
+static bool dsp_uwp_out_of_range(dsp_core_t *dsp, const char *what, uint32_t address)
 {
     static bool seen[4];
     int k = (what[0] == 'Y') * 2 + (what[2] == 'w');
     if (!seen[k]) {
         seen[k] = true;
-        uwp_log("sound chip: %s at %x is outside its memory; answered (first time only)", what, address);
+        uwp_log("sound chip: %s at %x is outside its memory; answered (first time only; %s, pc %04x)", what, address,
+                dsp->is_gp ? "GP" : "EP", dsp->pc);
     }
     return true;
 }
@@ -950,7 +959,7 @@ uint32_t dsp56k_read_memory(dsp_core_t* dsp, int space, uint32_t address)
         }
     } else if (space == DSP_SPACE_Y) {
 #ifdef XEMU_UWP
-        if (address >= DSP_YRAM_SIZE && dsp_uwp_out_of_range("Y read", address)) {
+        if (address >= DSP_YRAM_SIZE && dsp_uwp_out_of_range(dsp, "Y read", address)) {
             return 0;
         }
 #endif
@@ -986,7 +995,7 @@ static void write_memory_raw(dsp_core_t* dsp, int space, uint32_t address, uint3
         value &= 0x00FFFFFF;
     }
     if (address & 0xFF000000) {
-        dsp_uwp_out_of_range("X write", address);
+        dsp_uwp_out_of_range(dsp, "X write", address);
         return;
     }
 #endif
@@ -1004,7 +1013,7 @@ static void write_memory_raw(dsp_core_t* dsp, int space, uint32_t address, uint3
             dsp->mixbuffer[address-0xc00] = value;
         } else {
 #ifdef XEMU_UWP
-            if (address >= DSP_XRAM_SIZE && dsp_uwp_out_of_range("X write", address)) {
+            if (address >= DSP_XRAM_SIZE && dsp_uwp_out_of_range(dsp, "X write", address)) {
                 return;
             }
 #endif
@@ -1013,7 +1022,7 @@ static void write_memory_raw(dsp_core_t* dsp, int space, uint32_t address, uint3
         }
     } else if (space == DSP_SPACE_Y) {
 #ifdef XEMU_UWP
-        if (address >= DSP_YRAM_SIZE && dsp_uwp_out_of_range("Y write", address)) {
+        if (address >= DSP_YRAM_SIZE && dsp_uwp_out_of_range(dsp, "Y write", address)) {
             return;
         }
 #endif
