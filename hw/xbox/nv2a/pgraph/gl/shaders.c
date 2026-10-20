@@ -1353,10 +1353,16 @@ static void uwp_warm_start(PGRAPHGLState *r)
             uwp_warm_list[i].state.vsh.surface_scale_factor = 1;
             uwp_warm_list[i].check = uwp_warm_check(&uwp_warm_list[i]);
         }
-        /* the specular power left the shader state in 0.9.237 (glsl/vsh.c): the same for older entries */
-        if (uwp_warm_list[i].state.vsh.specular_power != 0 || uwp_warm_list[i].state.vsh.specular_power_back != 0) {
-            uwp_warm_list[i].state.vsh.specular_power = 0;
-            uwp_warm_list[i].state.vsh.specular_power_back = 0;
+        /* the specular power (0.9.237) and the point size and parameters (0.9.238) left the shader state
+           (glsl/vsh.c): the same for older entries */
+        VshState *v = &uwp_warm_list[i].state.vsh;
+        static const float zero8[8];
+        if (v->specular_power != 0 || v->specular_power_back != 0 || v->point_size != 0 ||
+            memcmp(v->point_params, zero8, sizeof(zero8))) {
+            v->specular_power = 0;
+            v->specular_power_back = 0;
+            v->point_size = 0;
+            memset(v->point_params, 0, sizeof(v->point_params));
             uwp_warm_list[i].check = uwp_warm_check(&uwp_warm_list[i]);
         }
     }

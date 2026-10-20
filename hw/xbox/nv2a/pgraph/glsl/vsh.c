@@ -147,12 +147,18 @@ void pgraph_glsl_set_vsh_state(PGRAPHState *pg, VshState *vsh)
 
     vsh->point_params_enable = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_D),
                                         NV_PGRAPH_CSV0_D_POINTPARAMSENABLE);
+#ifdef XEMU_UWP
+    /* point size and point parameters are uniforms (uwpPointSize, pointParams), set at every draw: not part of
+       the state, so they make no new shaders */
+    vsh->point_size = 0;
+#else
     vsh->point_size = pgraph_reg_r(pg, NV_PGRAPH_POINTSIZE) / 8.0f;
     if (vsh->point_params_enable) {
         for (int i = 0; i < 8; i++) {
             vsh->point_params[i] = pg->point_params[i];
         }
     }
+#endif
 
     vsh->smooth_shading = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_3),
                                    NV_PGRAPH_CONTROL_3_SHADEMODE) ==
@@ -345,9 +351,13 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
             VSH_VERSION_XVS, (uint32_t *)state->programmable.program_data,
             state->programmable.program_length, header, body);
         if (!state->point_params_enable) {
+#ifdef XEMU_UWP
+            mstring_append(body, "  oPts.x = (uwpPointSize <= 0.0 ? 1.0 : uwpPointSize) * renderScale;\n");
+#else
             mstring_append_fmt(body, "  oPts.x = %f * renderScale;\n",
                                state->point_size <= 0.f ? 1.f :
                                                           state->point_size);
+#endif
         }
     }
 
@@ -555,6 +565,10 @@ void pgraph_glsl_set_vsh_uniform_values(PGRAPHState *pg, const VshState *state,
 
     if (locs[VshUniform_renderScale] != -1) {
         values->renderScale[0] = pg->surface_scale_factor;
+    }
+
+    if (locs[VshUniform_uwpPointSize] != -1) {
+        values->uwpPointSize[0] = pgraph_reg_r(pg, NV_PGRAPH_POINTSIZE) / 8.0f;
     }
 
     if (locs[VshUniform_surfaceSize] != -1) {

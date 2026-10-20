@@ -499,7 +499,11 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
         mstring_append_fmt(body,
                            "  oPts.x = clamp(oPts.x * pointParams[3] + pointParams[7], ptMinSize, ptMaxSize) * renderScale;\n");
     } else {
+#ifdef XEMU_UWP
+        mstring_append(body, "  oPts.x = max(1.0, uwpPointSize) * renderScale;\n");
+#else
         mstring_append_fmt(body, "  oPts.x = %f * renderScale;\n",
                            MAX(1.f, state->point_size));
+#endif
     }
 }

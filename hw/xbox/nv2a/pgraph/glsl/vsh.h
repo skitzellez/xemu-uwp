@@ -96,6 +96,7 @@ void pgraph_glsl_set_vsh_state(PGRAPHState *pg, VshState *state);
     DECL(S, ltctxb, vec4, NV2A_LTCTXB_COUNT)                 \
     DECL(S, material_alpha, float, 1)                        \
     DECL(S, pointParams, float, 8)                           \
+    DECL(S, uwpPointSize, float, 1)                          \
     DECL(S, specularPower, float, 1)                         \
     DECL(S, renderScale, float, 1)                          \
     DECL(S, surfaceSize, vec2, 1)
