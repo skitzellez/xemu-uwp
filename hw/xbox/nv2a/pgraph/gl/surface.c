@@ -181,7 +181,9 @@ static void init_render_to_texture(PGRAPHState *pg)
      * word (depth << 8 | stencil), so A, R, G are the depth's high, middle
      * and low byte. The stencil byte (B) is given as 0. Read as an R8G8B8A8
      * texture (rgba = 1; Conker: Live & Reloaded's glow and fog) the same word
-     * gives R, G, B = high, middle, low byte and A = stencil.
+     * gives R, G, B = high, middle, low byte and A = stencil; as a B8G8R8A8
+     * texture (rgba = 2; Hot Wheels: Stunt Track Challenge) B, G, R = high,
+     * middle, low byte and A = stencil.
      */
     const char *zeta_fs =
         "#version 330\n"
@@ -192,7 +194,10 @@ static void init_render_to_texture(PGRAPHState *pg)
         "{\n"
         "    float d = texelFetch(tex, ivec2(gl_FragCoord.xy), 0).r;\n"
         "    uint v = min(uint(d * 16777215.0 + 0.5), 16777215u);\n"
-        "    if (rgba != 0)\n"
+        "    if (rgba == 2)\n"
+        "        out_Color = vec4(float(v & 255u), float((v >> 8) & 255u),\n"
+        "                         float(v >> 16), 0.0) / 255.0;\n"
+        "    else if (rgba != 0)\n"
         "        out_Color = vec4(float(v >> 16), float((v >> 8) & 255u),\n"
         "                         float(v & 255u), 0.0) / 255.0;\n"
         "    else\n"
@@ -275,13 +280,20 @@ static void init_render_to_texture(PGRAPHState *pg)
         "uniform sampler2D tex;\n"
         "uniform uvec4 dst;\n" /* width, height, pitch, swizzled */
         "uniform uint scale;\n"
+        "uniform uint color;\n" /* 1: an RGBA8 colour surface, stored as B, G, R, A bytes */
         "layout(std430, binding = 0) writeonly buffer Words { uint words[]; };\n"
         "layout(location = 0) out vec4 out_Color;\n"
         "void main()\n"
         "{\n"
         "    uvec2 p = uvec2(gl_FragCoord.xy);\n"
-        "    float d = texelFetch(tex, ivec2(p * scale), 0).r;\n"
-        "    uint v = min(uint(d * 16777215.0 + 0.5), 16777215u);\n"
+        "    uint word;\n"
+        "    if (color != 0u) {\n"
+        "        uvec4 c = uvec4(texelFetch(tex, ivec2(p * scale), 0) * 255.0 + 0.5);\n"
+        "        word = c.b | (c.g << 8) | (c.r << 16) | (c.a << 24);\n"
+        "    } else {\n"
+        "        float d = texelFetch(tex, ivec2(p * scale), 0).r;\n"
+        "        word = min(uint(d * 16777215.0 + 0.5), 16777215u) << 8;\n"
+        "    }\n"
         "    uint off;\n"
         "    if (dst.w != 0u) {\n"
         "        uint idx = 0u, mb = 1u;\n"
@@ -293,13 +305,14 @@ static void init_render_to_texture(PGRAPHState *pg)
         "    } else {\n"
         "        off = (p.y * dst.z) / 4u + p.x;\n"
         "    }\n"
-        "    words[off] = v << 8;\n"
+        "    words[off] = word;\n"
         "    out_Color = vec4(0.0);\n"
         "}\n";
     r->s2t_rndr.zeta_wb_prog = pgraph_gl_compile_shader(vs, zeta_wb_fs);
     r->s2t_rndr.zeta_wb_tex_loc = glGetUniformLocation(r->s2t_rndr.zeta_wb_prog, "tex");
     r->s2t_rndr.zeta_wb_dst_loc = glGetUniformLocation(r->s2t_rndr.zeta_wb_prog, "dst");
     r->s2t_rndr.zeta_wb_scale_loc = glGetUniformLocation(r->s2t_rndr.zeta_wb_prog, "scale");
+    r->s2t_rndr.zeta_wb_color_loc = glGetUniformLocation(r->s2t_rndr.zeta_wb_prog, "color");
     glGenBuffers(1, &r->s2t_rndr.zeta_wb_ssbo);
     r->s2t_rndr.zeta_wb_ssbo_size = 0;
 #endif
@@ -387,7 +400,9 @@ static bool uwp_zeta_as_color_ok(const SurfaceBinding *surface,
             shape->color_format ==
                 NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8 ||
             shape->color_format ==
-                NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8);
+                NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8 ||
+            shape->color_format ==
+                NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_B8G8R8A8);
 }
 #endif
 
@@ -474,9 +489,10 @@ static void render_surface_to(NV2AState *d, SurfaceBinding *surface,
         glUseProgram(r->s2t_rndr.zeta_prog);
         glProgramUniform1i(r->s2t_rndr.zeta_prog, r->s2t_rndr.zeta_tex_loc,
                            texture_unit);
-        glProgramUniform1i(r->s2t_rndr.zeta_prog, r->s2t_rndr.zeta_rgba_loc,
-                           tex_color_format ==
-                               NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8);
+        glProgramUniform1i(
+            r->s2t_rndr.zeta_prog, r->s2t_rndr.zeta_rgba_loc,
+            tex_color_format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_B8G8R8A8 ? 2 :
+            tex_color_format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8);
     } else
 #endif
     {
@@ -1710,7 +1726,8 @@ static bool uwp_wb_start_words(NV2AState *d, SurfaceBinding *surface, UwpWb *e)
     }
     size_t bytes = surface->swizzle ? (size_t)surface->width * surface->height * 4
                                     : (size_t)surface->pitch * surface->height;
-    if (surface->pitch % 4 || bytes > surface->size || bytes == 0) {
+    if (surface->pitch % 4 || bytes > surface->size || bytes == 0 ||
+        (surface->color && (surface->fmt.bytes_per_pixel != 4 || surface->fmt.gl_internal_format != GL_RGBA8))) {
         return false;
     }
 
@@ -1734,6 +1751,7 @@ static bool uwp_wb_start_words(NV2AState *d, SurfaceBinding *surface, UwpWb *e)
     glProgramUniform4ui(r->s2t_rndr.zeta_wb_prog, r->s2t_rndr.zeta_wb_dst_loc, surface->width, surface->height,
                         surface->pitch, surface->swizzle);
     glProgramUniform1ui(r->s2t_rndr.zeta_wb_prog, r->s2t_rndr.zeta_wb_scale_loc, pg->surface_scale_factor);
+    glProgramUniform1ui(r->s2t_rndr.zeta_wb_prog, r->s2t_rndr.zeta_wb_color_loc, surface->color);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, r->s2t_rndr.zeta_wb_ssbo);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, 0);
@@ -1892,6 +1910,12 @@ static void uwp_prefetch_color(NV2AState *d, SurfaceBinding *surface)
     UwpWb *e = &uwp_wb[(uwp_wb_head + uwp_wb_count) % UWP_WB_MAX];
     size_t bytes = (size_t)surface->width * surface->height * 4;
 
+    if (!e->pbo) {
+        glGenBuffers(1, &e->pbo);
+    }
+    /* on the GPU into memory order, as depth write-backs (uwp_wb_start_words); glReadPixels waited for the GPU */
+    e->words = uwp_wb_start_words(d, surface, e);
+    if (!e->words) {
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
@@ -1914,9 +1938,9 @@ static void uwp_prefetch_color(NV2AState *d, SurfaceBinding *surface)
     glPixelStorei(GL_PACK_ALIGNMENT, pa);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
     e->fence = 0;   /* see uwp_wb_fence_for_oldest */
-    e->words = false;
     glFramebufferTexture2D(GL_FRAMEBUFFER, surface->fmt.gl_attachment, GL_TEXTURE_2D, 0, 0);
     bind_current_surface(d);
+    }
 
     e->addr = surface->vram_addr;
     e->size = surface->size;

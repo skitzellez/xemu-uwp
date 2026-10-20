@@ -32,6 +32,8 @@ static TextureBinding* generate_texture(const TextureShape s, const uint8_t *tex
 static void texture_binding_destroy(gpointer data);
 #ifdef XEMU_UWP
 static void uwp_texture_cache_trim(PGRAPHGLState *r);
+static bool uwp_texture_refill(TextureBinding *binding, const TextureShape s, const uint8_t *texture_data,
+                               const uint8_t *palette_data);
 #endif
 
 struct pgraph_texture_possibly_dirty_struct {
@@ -517,6 +519,14 @@ void pgraph_gl_bind_textures(NV2AState *d)
         bool must_destroy = (key_out->binding != NULL)
                             && possibly_dirty
                             && (key_out->binding->data_hash != tex_data_hash);
+#ifdef XEMU_UWP
+        /* new contents for a texture already on the GPU: written into it (uwp_texture_refill) */
+        if (must_destroy && !surf_to_tex && uwp_texture_refill(key_out->binding, state, texture_data,
+                                                                         palette_data)) {
+            key_out->binding->data_hash = tex_data_hash;
+            must_destroy = false;
+        }
+#endif
         if (must_destroy) {
             texture_binding_destroy(key_out->binding);
             key_out->binding = NULL;
@@ -873,6 +883,49 @@ static void upload_gl_texture(GLenum gl_target,
         break;
     }
 }
+
+#ifdef XEMU_UWP
+/*
+ * A linear 2D texture whose memory changed (videos, pictures the game draws with the CPU) was thrown away and
+ * made anew: a new GPU allocation each time on the console's driver (Hot Wheels: Stunt Track Challenge, two
+ * 640x480 pictures a frame). The new contents are written into the same texture instead, converted the same
+ * way as upload_gl_texture does; the shape is the same (it is part of the cache key). Test file
+ * tex-refill-off.txt: made anew as before.
+ */
+static bool uwp_texture_refill(TextureBinding *binding, const TextureShape s, const uint8_t *texture_data,
+                               const uint8_t *palette_data)
+{
+    static int off = -1;
+    if (off < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        off = xemu_uwp_test_file_exists("tex-refill-off.txt");
+        if (off) {
+            uwp_log("textures: changed ones made anew (tex-refill-off.txt)");
+        }
+    }
+    ColorFormatInfo f = kelvin_color_format_gl_map[s.color_format];
+    if (off || binding->gl_target != GL_TEXTURE_2D || !f.linear || s.cubemap || s.dimensionality != 2 ||
+        f.gl_format == 0 || s.pitch % f.bytes_per_pixel) {
+        return false;
+    }
+    UWP_PROF_BEGIN(t0);
+    uint8_t *converted = pgraph_convert_texture_data(s, texture_data, palette_data, s.width, s.height, 1, s.pitch,
+                                                     0, NULL);
+    glBindTexture(GL_TEXTURE_2D, binding->gl_texture);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, converted ? 0 : s.pitch / f.bytes_per_pixel);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s.width, s.height, f.gl_format, f.gl_type,
+                    converted ? converted : texture_data);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    g_free(converted);
+    UWP_PROF_END(PF_TEX_UP, t0);
+    nv2a_profile_inc_counter(NV2A_PROF_TEX_UPLOAD);
+    static unsigned logged;
+    if (!logged++) {
+        uwp_log("textures: a changed %ux%u picture written into its texture again", s.width, s.height);
+    }
+    return true;
+}
+#endif
 
 static TextureBinding* generate_texture(const TextureShape s,
                                         const uint8_t *texture_data,

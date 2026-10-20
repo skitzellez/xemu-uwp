@@ -238,7 +238,7 @@ typedef struct PGRAPHGLState {
         GLuint zeta_fill_prog; /* XEMU_UWP: new depth surface filled from the parked one */
         GLint zeta_fill_tex_loc, zeta_fill_dst_loc, zeta_fill_src_loc;
         GLuint zeta_wb_prog, zeta_wb_ssbo; /* XEMU_UWP: depth write-back as guest memory words, on the GPU */
-        GLint zeta_wb_tex_loc, zeta_wb_dst_loc, zeta_wb_scale_loc;
+        GLint zeta_wb_tex_loc, zeta_wb_dst_loc, zeta_wb_scale_loc, zeta_wb_color_loc;
         size_t zeta_wb_ssbo_size;
     } s2t_rndr;
 
