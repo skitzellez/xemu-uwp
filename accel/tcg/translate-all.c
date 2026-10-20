@@ -679,6 +679,9 @@ void tcg_flush_jmp_cache(CPUState *cpu)
     if (unlikely(jc == NULL)) {
         return;
     }
+#ifdef XEMU_UWP
+    xemu_uwp_counters[UWP_CNT_JC_FLUSH]++;
+#endif
 
     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
         qatomic_set(&jc->array[i].tb, NULL);

@@ -260,6 +260,9 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
 
     hash = tb_jmp_cache_hash_func(s.pc);
     jc = cpu->tb_jmp_cache;
+#ifdef XEMU_UWP
+    xemu_uwp_counters[UWP_CNT_TB_LOOKUP]++;
+#endif
 
     tb = qatomic_read(&jc->array[hash].tb);
     if (likely(tb &&
@@ -270,8 +273,14 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, TCGTBCPUState s)
         goto hit;
     }
 
+#ifdef XEMU_UWP
+    xemu_uwp_counters[UWP_CNT_TB_JC_MISS]++;
+#endif
     tb = tb_htable_lookup(cpu, s);
     if (tb == NULL) {
+#ifdef XEMU_UWP
+        xemu_uwp_counters[UWP_CNT_TB_HT_MISS]++;
+#endif
         return NULL;
     }
 
@@ -956,6 +965,70 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
 
 /* main execution loop */
 
+#ifdef XEMU_UWP
+/*
+ * Measuring aid (test file loop-log.txt): blocks entered from the main loop instead of a direct jump from the
+ * block before. Every 256th is sampled by guest address; about every 5 s the most frequent addresses are
+ * logged with why they came this way (the block before ended without a way to jump on, or this block spans
+ * two pages) and the block's size and flags.
+ */
+typedef struct UwpLoopPc {
+    vaddr pc;
+    uint32_t count, nolast, xpage, size, flags, cflags;
+} UwpLoopPc;
+#define UWP_LOOP_SLOTS 512
+static void uwp_loop_note(TranslationBlock *tb, vaddr pc, bool nolast)
+{
+    static int on = -1;
+    static UwpLoopPc slot[UWP_LOOP_SLOTS];
+    static uint64_t n, total;
+    if (on < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        on = xemu_uwp_test_file_exists("loop-log.txt");
+    }
+    if (!on || (++n & 255)) {
+        return;
+    }
+    total++;
+    unsigned h = (unsigned)((pc >> 2) ^ (pc >> 11)) % UWP_LOOP_SLOTS;
+    for (int k = 0; k < 8; k++) {
+        UwpLoopPc *e = &slot[(h + k) % UWP_LOOP_SLOTS];
+        if (e->count == 0 || e->pc == pc) {
+            e->pc = pc;
+            e->count++;
+            e->nolast += nolast;
+            e->xpage += tb_page_addr1(tb) != -1;
+            e->size = tb->size;
+            e->flags = tb->flags;
+            e->cflags = tb->cflags;
+            break;
+        }
+    }
+    if (total % 1000000 == 0) {
+        GString *g = g_string_new(NULL);
+        for (int shown = 0; shown < 8; shown++) {
+            int top = -1;
+            for (int i = 0; i < UWP_LOOP_SLOTS; i++) {
+                if (slot[i].count && (top < 0 || slot[i].count > slot[top].count)) {
+                    top = i;
+                }
+            }
+            if (top < 0) {
+                break;
+            }
+            UwpLoopPc *e = &slot[top];
+            g_string_append_printf(g, " %08llx x%u (no jump %u, 2 pages %u, %u bytes, flags %x cflags %x);",
+                                   (unsigned long long)e->pc, e->count, e->nolast, e->xpage, e->size, e->flags,
+                                   e->cflags);
+            e->count = 0;   /* shown once; the rest start over */
+        }
+        uwp_log("main loop blocks (1 in 256 sampled):%s", g->str);
+        g_string_free(g, true);
+        memset(slot, 0, sizeof(slot));
+    }
+}
+#endif
+
 static int __attribute__((noinline))
 cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 {
@@ -988,6 +1061,9 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 break;
             }
 
+#ifdef XEMU_UWP
+            xemu_uwp_counters[UWP_CNT_TB_LOOP]++;
+#endif
             tb = tb_lookup(cpu, s);
             if (tb == NULL) {
                 CPUJumpCache *jc;
@@ -1007,6 +1083,9 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 qatomic_set(&jc->array[h].tb, tb);
             }
 
+#ifdef XEMU_UWP
+            uwp_loop_note(tb, s.pc, last_tb == NULL);
+#endif
 #ifndef CONFIG_USER_ONLY
             /*
              * We don't take care of direct jumps when address mapping

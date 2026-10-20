@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xemu-uwp.h"
 #include "qemu/main-loop.h"
 #include "qemu/target-info.h"
 #include "accel/tcg/cpu-ops.h"
@@ -148,6 +149,9 @@ static void tlb_window_reset(CPUTLBDesc *desc, int64_t ns,
 
 static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
 {
+#ifdef XEMU_UWP
+    xemu_uwp_counters[UWP_CNT_JC_PAGE]++;
+#endif
     CPUJumpCache *jc = cpu->tb_jmp_cache;
     int i, i0;
 

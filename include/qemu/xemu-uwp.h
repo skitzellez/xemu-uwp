@@ -55,6 +55,12 @@ enum {
     UWP_CNT_STREAM_WRAP,     /* 64 MB vertex stream buffer replaced */
     UWP_CNT_VERTEX_REPACK,   /* unaligned vertex attributes copied aligned (gl/vertex.c) */
     UWP_CNT_GL_ERRORS,
+    UWP_CNT_TB_LOOKUP,       /* translated-block lookups outside direct chaining (accel/tcg/cpu-exec.c) */
+    UWP_CNT_TB_JC_MISS,      /* ... not in the jump cache */
+    UWP_CNT_TB_HT_MISS,      /* ... not translated at all */
+    UWP_CNT_JC_FLUSH,        /* whole jump cache emptied */
+    UWP_CNT_JC_PAGE,         /* jump cache entries of one page dropped */
+    UWP_CNT_TB_LOOP,         /* ... of which from the main loop (a block ended without jumping on) */
     UWP_CNT_MAX
 };
 extern unsigned int xemu_uwp_counters[UWP_CNT_MAX];

@@ -3969,6 +3969,11 @@ static void uwp_log_memory(void)
                 c[UWP_CNT_SURF_NEW] - last[UWP_CNT_SURF_NEW], c[UWP_CNT_SURF_DEL] - last[UWP_CNT_SURF_DEL],
                 c[UWP_CNT_STREAM_WRAP] - last[UWP_CNT_STREAM_WRAP],
                 c[UWP_CNT_VERTEX_REPACK] - last[UWP_CNT_VERTEX_REPACK], c[UWP_CNT_GL_ERRORS]);
+        uwp_log("cpu jumps: %u looked up (%u from the main loop), %u not in the jump cache, %u not translated; "
+                "jump cache emptied %u times, %u pages dropped",
+                c[UWP_CNT_TB_LOOKUP] - last[UWP_CNT_TB_LOOKUP], c[UWP_CNT_TB_LOOP] - last[UWP_CNT_TB_LOOP], c[UWP_CNT_TB_JC_MISS] - last[UWP_CNT_TB_JC_MISS],
+                c[UWP_CNT_TB_HT_MISS] - last[UWP_CNT_TB_HT_MISS], c[UWP_CNT_JC_FLUSH] - last[UWP_CNT_JC_FLUSH],
+                c[UWP_CNT_JC_PAGE] - last[UWP_CNT_JC_PAGE]);
         memcpy(last, c, sizeof(last));
     }
 }
