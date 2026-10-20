@@ -861,7 +861,9 @@ static void update_shader_uniforms(PGRAPHState *pg, ShaderBinding *binding)
  * those needed in the first 30 s before the first frame, the rest in the background.
  */
 #define UWP_WARM_MAGIC 0x364d5257u /* "WRM6" */
-#define UWP_WARM_MAX 2048
+/* 2048 was full for big games (Ninja Gaiden Black: its attract demo still built 40-50 shaders a second);
+ * the warm-up stops with 1.5 GB left anyway, so a longer list only helps where memory allows */
+#define UWP_WARM_MAX 4096
 #define UWP_WARM_LAYOUT 1
 /* shaders first needed this soon after start are ready before the first frame; the rest
    are prepared in the background while the game runs */
@@ -1351,6 +1353,12 @@ static void uwp_warm_start(PGRAPHGLState *r)
             uwp_warm_list[i].state.vsh.surface_scale_factor = 1;
             uwp_warm_list[i].check = uwp_warm_check(&uwp_warm_list[i]);
         }
+        /* the specular power left the shader state in 0.9.237 (glsl/vsh.c): the same for older entries */
+        if (uwp_warm_list[i].state.vsh.specular_power != 0 || uwp_warm_list[i].state.vsh.specular_power_back != 0) {
+            uwp_warm_list[i].state.vsh.specular_power = 0;
+            uwp_warm_list[i].state.vsh.specular_power_back = 0;
+            uwp_warm_list[i].check = uwp_warm_check(&uwp_warm_list[i]);
+        }
     }
     /* repeats written by earlier builds are dropped, and the list is written back without them, so
        their room goes to shaders not learned yet */
@@ -1585,6 +1593,116 @@ void uwp_warm_draw(PGRAPHGLState *r)
 }
 #endif
 
+#ifdef XEMU_UWP
+/*
+ * Measuring aid (test file variant-log.txt): which parts of the shader state make new shaders. Each shader the
+ * game itself has to build is compared with the most alike of the last UWP_VAR_KEEP built, and the fields that
+ * differ are counted; every 30 s the log gets the most frequent ones. Off without the file (costs memory).
+ */
+#define UWP_VAR_KEEP 1024
+typedef struct UwpVarField {
+    const char *name;
+    size_t off, len;
+    unsigned count;
+} UwpVarField;
+#define UWP_VF(f) { #f, offsetof(ShaderState, f), sizeof(((ShaderState *)0)->f), 0 }
+static UwpVarField uwp_var_fields[] = {
+    UWP_VF(vsh.surface_scale_factor), UWP_VF(vsh.compressed_attrs), UWP_VF(vsh.uniform_attrs),
+    UWP_VF(vsh.swizzle_attrs), UWP_VF(vsh.fog_enable), UWP_VF(vsh.fog_mode), UWP_VF(vsh.specular_enable),
+    UWP_VF(vsh.separate_specular), UWP_VF(vsh.ignore_specular_alpha), UWP_VF(vsh.specular_power),
+    UWP_VF(vsh.specular_power_back), UWP_VF(vsh.point_params_enable), UWP_VF(vsh.point_size),
+    UWP_VF(vsh.point_params), UWP_VF(vsh.smooth_shading), UWP_VF(vsh.z_perspective),
+    UWP_VF(vsh.is_fixed_function), UWP_VF(vsh.fixed_function.normalization),
+    UWP_VF(vsh.fixed_function.texture_matrix_enable), UWP_VF(vsh.fixed_function.texgen),
+    UWP_VF(vsh.fixed_function.foggen), UWP_VF(vsh.fixed_function.skinning), UWP_VF(vsh.fixed_function.lighting),
+    UWP_VF(vsh.fixed_function.light), UWP_VF(vsh.fixed_function.emission_src),
+    UWP_VF(vsh.fixed_function.ambient_src), UWP_VF(vsh.fixed_function.diffuse_src),
+    UWP_VF(vsh.fixed_function.specular_src), UWP_VF(vsh.fixed_function.local_eye),
+    UWP_VF(vsh.programmable.program_data), UWP_VF(vsh.programmable.program_length), UWP_VF(vsh.uwp_attr_kinds),
+    UWP_VF(geom), UWP_VF(psh.combiner_control), UWP_VF(psh.shader_stage_program), UWP_VF(psh.other_stage_input),
+    UWP_VF(psh.final_inputs_0), UWP_VF(psh.final_inputs_1), UWP_VF(psh.rgb_inputs), UWP_VF(psh.rgb_outputs),
+    UWP_VF(psh.alpha_inputs), UWP_VF(psh.alpha_outputs), UWP_VF(psh.point_sprite), UWP_VF(psh.rect_tex),
+    UWP_VF(psh.snorm_tex), UWP_VF(psh.compare_mode), UWP_VF(psh.alphakill), UWP_VF(psh.colorkey_mode),
+    UWP_VF(psh.conv_tex), UWP_VF(psh.tex_x8y24), UWP_VF(psh.dim_tex), UWP_VF(psh.tex_cubemap),
+    UWP_VF(psh.border_logical_size), UWP_VF(psh.border_inv_real_size), UWP_VF(psh.shadow_map),
+    UWP_VF(psh.shadow_depth_func), UWP_VF(psh.alpha_test), UWP_VF(psh.alpha_func),
+    UWP_VF(psh.window_clip_exclusive), UWP_VF(psh.smooth_shading), UWP_VF(psh.depth_clipping),
+    UWP_VF(psh.z_perspective), UWP_VF(psh.surface_zeta_format), UWP_VF(psh.depth_format),
+};
+#define UWP_VAR_NFIELDS (sizeof(uwp_var_fields) / sizeof(uwp_var_fields[0]))
+
+static void uwp_variant_note(const ShaderState *st)
+{
+    static int on = -1;
+    static ShaderState *keep;
+    static int kept, next;
+    static unsigned total, only_one;
+    static int64_t last_log;
+    if (on < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        on = xemu_uwp_test_file_exists("variant-log.txt");
+        if (on) {
+            keep = g_new0(ShaderState, UWP_VAR_KEEP);
+            uwp_log("shader variants: measuring which state makes new shaders (variant-log.txt)");
+        }
+    }
+    if (!on) {
+        return;
+    }
+    /* the most alike: fewest differing fields */
+    int best = -1, best_n = INT_MAX;
+    bool best_diff[UWP_VAR_NFIELDS];
+    for (int k = 0; k < kept; k++) {
+        bool diff[UWP_VAR_NFIELDS];
+        int n = 0;
+        for (size_t f = 0; f < UWP_VAR_NFIELDS && n < best_n; f++) {
+            UwpVarField *v = &uwp_var_fields[f];
+            diff[f] = memcmp((const uint8_t *)st + v->off, (const uint8_t *)&keep[k] + v->off, v->len) != 0;
+            n += diff[f];
+        }
+        if (n < best_n) {
+            best_n = n;
+            best = k;
+            memcpy(best_diff, diff, sizeof(diff));
+        }
+    }
+    if (best >= 0) {
+        total++;
+        only_one += best_n == 1;
+        for (size_t f = 0; f < UWP_VAR_NFIELDS; f++) {
+            uwp_var_fields[f].count += best_diff[f];
+        }
+    }
+    keep[next] = *st;
+    next = (next + 1) % UWP_VAR_KEEP;
+    kept = MIN(kept + 1, UWP_VAR_KEEP);
+
+    int64_t now = g_get_monotonic_time();
+    if (total && now - last_log > 30 * G_USEC_PER_SEC) {
+        last_log = now;
+        GString *g = g_string_new(NULL);
+        bool listed[UWP_VAR_NFIELDS] = { 0 };
+        for (int shown = 0; shown < 12; shown++) {
+            int top = -1;
+            for (size_t f = 0; f < UWP_VAR_NFIELDS; f++) {
+                if (uwp_var_fields[f].count && (top < 0 || uwp_var_fields[f].count > uwp_var_fields[top].count) &&
+                    !listed[f]) {
+                    top = f;
+                }
+            }
+            if (top < 0) {
+                break;
+            }
+            listed[top] = true;
+            g_string_append_printf(g, " %s %u,", uwp_var_fields[top].name, uwp_var_fields[top].count);
+        }
+        uwp_log("shader variants: %u new, %u differ in one field only; fields that differed:%s", total, only_one,
+                g->str);
+        g_string_free(g, true);
+    }
+}
+#endif
+
 void pgraph_gl_bind_shaders(PGRAPHState *pg)
 {
     PGRAPHGLState *r = pg->gl_renderer_state;
@@ -1618,6 +1736,9 @@ void pgraph_gl_bind_shaders(PGRAPHState *pg)
 
     if (!binding->initialized && !pgraph_gl_shader_load_from_memory(binding)) {
         nv2a_profile_inc_counter(NV2A_PROF_SHADER_GEN);
+#ifdef XEMU_UWP
+        uwp_variant_note(&state);
+#endif
         UWP_PROF_BEGIN(t0);
         generate_shaders(r, binding);
         UWP_PROF_END(PF_SHADER_GEN, t0);

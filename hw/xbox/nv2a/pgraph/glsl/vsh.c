@@ -131,8 +131,16 @@ void pgraph_glsl_set_vsh_state(PGRAPHState *pg, VshState *vsh)
     vsh->ignore_specular_alpha =
         !GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_C),
                   NV_PGRAPH_CSV0_C_ALPHA_FROM_MATERIAL_SPECULAR);
+#ifdef XEMU_UWP
+    /* the shaders read the power from the specularPower uniform (set at every draw), never from here: kept
+       as 0 so materials that differ only in shininess share one shader (Ninja Gaiden Black: 70% of the shaders
+       it had to build while playing, each a stutter) */
+    vsh->specular_power = 0;
+    vsh->specular_power_back = 0;
+#else
     vsh->specular_power = pg->specular_power;
     vsh->specular_power_back = pg->specular_power_back;
+#endif
 
     vsh->z_perspective = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0) &
                          NV_PGRAPH_CONTROL_0_Z_PERSPECTIVE_ENABLE;
