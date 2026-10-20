@@ -84,6 +84,7 @@ typedef struct TextureBinding {
 #ifdef XEMU_UWP
     /* Size of the storage set up for surface-to-texture copies (0: none). */
     unsigned int s2t_width, s2t_height;
+    GLenum s2t_ifmt; /* XEMU_UWP: internal format the surface-to-texture paths gave it (0: as made) */
 #endif
 } TextureBinding;
 

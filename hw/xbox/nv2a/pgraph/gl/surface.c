@@ -604,7 +604,8 @@ void pgraph_gl_render_surface_to_texture(NV2AState *d, SurfaceBinding *surface,
          texture->gl_target == GL_TEXTURE_RECTANGLE)) {
         glActiveTexture(GL_TEXTURE0 + texture_unit);
         glBindTexture(texture->gl_target, texture->gl_texture);
-        if (texture->s2t_width != width || texture->s2t_height != height) {
+        GLenum ifmt = zeta_tex ? surface->fmt.gl_internal_format : f->gl_internal_format;
+        if (texture->s2t_width != width || texture->s2t_height != height || texture->s2t_ifmt != ifmt) {
             glTexParameteri(texture->gl_target, GL_TEXTURE_BASE_LEVEL, 0);
             glTexParameteri(texture->gl_target, GL_TEXTURE_MAX_LEVEL, 0);
             glTexParameteri(texture->gl_target, GL_TEXTURE_MIN_FILTER,
@@ -621,6 +622,7 @@ void pgraph_gl_render_surface_to_texture(NV2AState *d, SurfaceBinding *surface,
                          height, 0, f->gl_format, f->gl_type, NULL);
             texture->s2t_width = width;
             texture->s2t_height = height;
+            texture->s2t_ifmt = ifmt;
         }
         glCopyImageSubData(surface->gl_buffer, GL_TEXTURE_2D, 0, 0, 0, 0,
                            texture->gl_texture, texture->gl_target, 0, 0, 0, 0,
@@ -631,11 +633,27 @@ void pgraph_gl_render_surface_to_texture(NV2AState *d, SurfaceBinding *surface,
 
     glActiveTexture(GL_TEXTURE0 + texture_unit);
     glBindTexture(texture->gl_target, texture->gl_texture);
+#ifdef XEMU_UWP
+    /*
+     * The texture keeps its storage when size and format are the same as last time: new storage on every copy
+     * was a GPU allocation made and freed each time on the console's driver (Grand Theft Auto: San Andreas,
+     * ~840 copies a second, a third of the graphics thread). The draw below covers the whole image.
+     */
+    if (texture->s2t_width != width || texture->s2t_height != height ||
+        texture->s2t_ifmt != f->gl_internal_format)
+#endif
+    {
     glTexParameteri(texture->gl_target, GL_TEXTURE_BASE_LEVEL, 0);
     glTexParameteri(texture->gl_target, GL_TEXTURE_MAX_LEVEL, 0);
     glTexParameteri(texture->gl_target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexImage2D(texture->gl_target, 0, f->gl_internal_format, width, height, 0,
                  f->gl_format, f->gl_type, NULL);
+#ifdef XEMU_UWP
+    texture->s2t_width = width;
+    texture->s2t_height = height;
+    texture->s2t_ifmt = f->gl_internal_format;
+#endif
+    }
     glBindTexture(texture->gl_target, 0);
     render_surface_to(d, surface, texture_unit, texture->gl_target,
                              texture->gl_texture, width, height,

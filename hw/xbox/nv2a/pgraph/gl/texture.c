@@ -904,7 +904,9 @@ static bool uwp_texture_refill(TextureBinding *binding, const TextureShape s, co
         }
     }
     ColorFormatInfo f = kelvin_color_format_gl_map[s.color_format];
-    if (off || binding->gl_target != GL_TEXTURE_2D || !f.linear || s.cubemap || s.dimensionality != 2 ||
+    /* not one a surface was copied into (its storage may have another size or format) */
+    if (off || binding->s2t_width || binding->gl_target != GL_TEXTURE_2D || !f.linear || s.cubemap ||
+        s.dimensionality != 2 ||
         f.gl_format == 0 || s.pitch % f.bytes_per_pixel) {
         return false;
     }
@@ -1050,6 +1052,7 @@ static TextureBinding* generate_texture(const TextureShape s,
 #ifdef XEMU_UWP
     ret->s2t_width = 0;
     ret->s2t_height = 0;
+    ret->s2t_ifmt = 0;
 #endif
     return ret;
 }
