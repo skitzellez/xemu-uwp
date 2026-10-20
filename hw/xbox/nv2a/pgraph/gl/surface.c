@@ -374,6 +374,34 @@ static bool uwp_zeta_tex_upstream(void)
     return off;
 }
 
+/* test file b8-copy-off.txt: an 8-bit target sampled as an 8-bit texture goes through memory again */
+static bool uwp_b8_copy_off(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        off = xemu_uwp_test_file_exists("b8-copy-off.txt");
+        if (off) {
+            uwp_log("surface test: 8-bit targets read as textures through memory (b8-copy-off.txt)");
+        }
+    }
+    return off;
+}
+
+/* test file z16f-copy-off.txt: a float 16-bit depth surface read as a texture goes through memory again */
+static bool uwp_z16f_copy_off(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        off = xemu_uwp_test_file_exists("z16f-copy-off.txt");
+        if (off) {
+            uwp_log("depth texture test: float 16-bit depth read as a texture through memory (z16f-copy-off.txt)");
+        }
+    }
+    return off;
+}
+
 static bool uwp_zeta_to_texture_ok(const SurfaceBinding *surface,
                                    const TextureShape *shape)
 {
@@ -387,7 +415,7 @@ static bool uwp_zeta_to_texture_ok(const SurfaceBinding *surface,
            /* a float 16-bit depth surface (GL_DEPTH_COMPONENT32F here) as a float 16-bit depth texture: the
             * read-back through memory gave the texture the same depth values (Mortal Kombat: Shaolin Monks'
             * 256x256 shadow map, a read-back with a GPU wait each time, frames of 0.4-0.6 s) */
-           (surface->fmt.gl_internal_format == GL_DEPTH_COMPONENT32F &&
+           (surface->fmt.gl_internal_format == GL_DEPTH_COMPONENT32F && !uwp_z16f_copy_off() &&
             shape->color_format ==
                 NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_Y16_FLOAT) ||
            (surface->fmt.gl_internal_format == GL_DEPTH24_STENCIL8 &&
@@ -461,7 +489,7 @@ static bool surface_to_texture_can_fastpath(SurfaceBinding *surface,
      * image is copied on the GPU. The read-back through memory carried the very
      * same bytes (Power Drome: 160x120 targets as Y8, ~80 read-backs a second).
      */
-    case NV097_SET_SURFACE_FORMAT_COLOR_LE_B8: switch (texture_fmt) {
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_B8: if (uwp_b8_copy_off()) break; switch (texture_fmt) {
         case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y8: return true;
         case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y8: return true;
         case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8: return true;
@@ -796,7 +824,7 @@ bool pgraph_gl_check_surface_to_texture_compatibility(
      * image is copied on the GPU. The read-back through memory carried the very
      * same bytes (Power Drome: 160x120 targets as Y8, ~80 read-backs a second).
      */
-    case NV097_SET_SURFACE_FORMAT_COLOR_LE_B8: switch (texture_fmt) {
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_B8: if (uwp_b8_copy_off()) break; switch (texture_fmt) {
         case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y8: return true;
         case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y8: return true;
         case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8: return true;
@@ -2539,8 +2567,24 @@ void pgraph_gl_uwp_clear_cover(unsigned int width, unsigned int height, bool col
     uwp_clear_stencil = stencil;
 }
 
+static bool uwp_clear_cover_off(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        off = xemu_uwp_test_file_exists("clear-cover-off.txt");
+        if (off) {
+            uwp_log("surface test: new surfaces are filled from memory even when a clear covers them (clear-cover-off.txt)");
+        }
+    }
+    return off;
+}
+
 static bool uwp_clear_covers(const SurfaceBinding *e)
 {
+    if (uwp_clear_cover_off()) {
+        return false;
+    }
     if (!e->width || !e->height || uwp_clear_w < e->width || uwp_clear_h < e->height) {
         return false;
     }

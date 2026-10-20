@@ -81,6 +81,9 @@ typedef struct {
 
 
 void pgraph_glsl_set_vsh_state(PGRAPHState *pg, VshState *state);
+#ifdef XEMU_UWP
+bool uwp_texgen_in_state(void);
+#endif
 
 #define VSH_UNIFORM_DECL_X(S, DECL)                          \
     DECL(S, c, vec4, NV2A_VERTEXSHADER_CONSTANTS)            \

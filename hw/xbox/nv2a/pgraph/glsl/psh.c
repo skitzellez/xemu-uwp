@@ -240,6 +240,18 @@ void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state)
      * - the clip-plane comparisons of a texture stage that is not in clip-plane mode
      * - point sprites when no points are drawn (gl_PointCoord means nothing then)
      */
+    static int canon_off = -1;
+    if (canon_off < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        extern void uwp_log(const char *fmt, ...);
+        canon_off = xemu_uwp_test_file_exists("psh-canon-off.txt");
+        if (canon_off) {
+            uwp_log("shader test: pixel shader settings kept as set (psh-canon-off.txt)");
+        }
+    }
+    if (canon_off) {
+        return;
+    }
     if (!state->alpha_test || state->alpha_func == ALPHA_FUNC_ALWAYS) {
         state->alpha_test = false;
         state->alpha_func = 0;

@@ -180,6 +180,7 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
     }
 
 #ifdef XEMU_UWP
+    if (!uwp_texgen_in_state()) {
     /*
      * The mode of each texture coordinate is a uniform (uwpTexgen, glsl/vsh.c): one shader serves every mix of
      * modes. Each coordinate gets only the modes the hardware has for it (sphere map: S, T; reflection and
@@ -209,7 +210,9 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
             mstring_append_fmt(body, "default: oT%d.%c = texture%d.%c; break;\n}\n", i, c, i, c);
         }
     }
-#else
+    } else
+#endif
+    {
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
         mstring_append_fmt(body, "/* Texgen for stage %d */\n",
                            i);
@@ -273,18 +276,19 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
             }
         }
     }
-#endif
+    }
 
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
 #ifdef XEMU_UWP
-        mstring_append_fmt(body, "if (uwpTexMatOn[%d] != 0) oT%d = oT%d * texMat%d;\n", i, i, i, i);
-#else
+        if (!uwp_texgen_in_state()) {
+            mstring_append_fmt(body, "if (uwpTexMatOn[%d] != 0) oT%d = oT%d * texMat%d;\n", i, i, i, i);
+        } else
+#endif
         if (state->fixed_function.texture_matrix_enable[i]) {
             mstring_append_fmt(body,
                                "oT%d = oT%d * texMat%d;\n",
                                i, i, i);
         }
-#endif
     }
 
     if (!state->fixed_function.lighting) {

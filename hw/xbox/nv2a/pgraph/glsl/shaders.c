@@ -90,12 +90,15 @@ bool pgraph_glsl_check_shader_state_dirty(PGRAPHState *pg,
             return true;
         }
 
-#ifndef XEMU_UWP   /* a uniform on the Xbox port (glsl/vsh.c) */
-        if (pg->texture_matrix_enable[i] !=
+#ifdef XEMU_UWP   /* a uniform on the Xbox port (glsl/vsh.c), unless texgen-shader.txt */
+        if (uwp_texgen_in_state() &&
+#else
+        if (
+#endif
+            pg->texture_matrix_enable[i] !=
             state->vsh.fixed_function.texture_matrix_enable[i]) {
             return true;
         }
-#endif
     }
 
     return false;

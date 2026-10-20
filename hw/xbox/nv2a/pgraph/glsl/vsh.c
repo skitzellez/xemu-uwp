@@ -27,6 +27,24 @@
 
 DEF_UNIFORM_INFO_ARR(VshUniform, VSH_UNIFORM_DECL_X)
 
+#ifdef XEMU_UWP
+/* test file texgen-shader.txt: texture matrix on/off and texture coordinate modes are shader state again (as
+   upstream), not uniforms */
+bool uwp_texgen_in_state(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        extern void uwp_log(const char *fmt, ...);
+        on = xemu_uwp_test_file_exists("texgen-shader.txt");
+        if (on) {
+            uwp_log("shader test: texture matrix and texture coordinate modes are shader state (texgen-shader.txt)");
+        }
+    }
+    return on;
+}
+#endif
+
 static void set_fixed_function_vsh_state(PGRAPHState *pg,
                                          FixedFunctionVshState *state)
 {
@@ -50,7 +68,7 @@ static void set_fixed_function_vsh_state(PGRAPHState *pg,
 #ifdef XEMU_UWP
         /* a uniform (uwpTexMatOn), set at every draw: switching a texture matrix on or off makes no new shader
            (Crazy Taxi 3: about a fifth of the shaders it built while playing) */
-        state->texture_matrix_enable[i] = false;
+        state->texture_matrix_enable[i] = uwp_texgen_in_state() ? pg->texture_matrix_enable[i] : false;
 #else
         state->texture_matrix_enable[i] = pg->texture_matrix_enable[i];
 #endif
@@ -60,7 +78,8 @@ static void set_fixed_function_vsh_state(PGRAPHState *pg,
     /* a uniform (uwpTexgen), set at every draw; the shader picks the mode (glsl/vsh-ff.c). Crazy Taxi 3: the
        texture coordinate modes made more new shaders while playing than anything else */
     memset(state->texgen, 0, sizeof(state->texgen));
-#else
+    if (uwp_texgen_in_state())
+#endif
     for (int i = 0; i < 4; i++) {
         unsigned int reg = (i < 2) ? NV_PGRAPH_CSV1_A : NV_PGRAPH_CSV1_B;
         for (int j = 0; j < 4; j++) {
@@ -74,7 +93,6 @@ static void set_fixed_function_vsh_state(PGRAPHState *pg,
                 (enum VshTexgen)GET_MASK(pgraph_reg_r(pg, reg), masks[j]);
         }
     }
-#endif
 
     state->lighting =
         GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_C), NV_PGRAPH_CSV0_C_LIGHTING);
