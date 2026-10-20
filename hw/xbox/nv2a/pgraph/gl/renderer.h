@@ -235,6 +235,11 @@ typedef struct PGRAPHGLState {
         GLuint zeta_dl_prog, zeta_dl_tex; /* XEMU_UWP: depth read-back through a colour image */
         GLint zeta_dl_tex_loc;
         unsigned int zeta_dl_w, zeta_dl_h;
+        GLuint zeta_fill_prog; /* XEMU_UWP: new depth surface filled from the parked one */
+        GLint zeta_fill_tex_loc, zeta_fill_dst_loc, zeta_fill_src_loc;
+        GLuint zeta_wb_prog, zeta_wb_ssbo; /* XEMU_UWP: depth write-back as guest memory words, on the GPU */
+        GLint zeta_wb_tex_loc, zeta_wb_dst_loc, zeta_wb_scale_loc;
+        size_t zeta_wb_ssbo_size;
     } s2t_rndr;
 
     struct disp_rndr {
@@ -316,7 +321,7 @@ void pgraph_gl_surface_invalidate(NV2AState *d, SurfaceBinding *e);
 void pgraph_gl_unbind_surface(NV2AState *d, bool color);
 void pgraph_gl_upload_surface_data(NV2AState *d, SurfaceBinding *surface, bool force);
 #ifdef XEMU_UWP
-void pgraph_gl_uwp_wb_flush_range(NV2AState *d, hwaddr addr, hwaddr len);
+bool pgraph_gl_uwp_wb_flush_range(NV2AState *d, hwaddr addr, hwaddr len);
 void pgraph_gl_uwp_wb_frame(NV2AState *d);
 #endif
 void pgraph_gl_shader_cache_to_disk(ShaderBinding *snode);

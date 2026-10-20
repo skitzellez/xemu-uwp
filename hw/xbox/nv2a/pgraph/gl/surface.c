@@ -230,6 +230,78 @@ static void init_render_to_texture(PGRAPHState *pg)
         glGetUniformLocation(r->s2t_rndr.zeta_dl_prog, "tex");
     glGenTextures(1, &r->s2t_rndr.zeta_dl_tex);
     r->s2t_rndr.zeta_dl_w = r->s2t_rndr.zeta_dl_h = 0;
+    /*
+     * A new depth surface filled on the GPU from the depth surface whose bytes
+     * its memory holds (see uwp_zeta_fill_from_parked): for each texel the
+     * byte offset in guest memory (swizzled or at dst's pitch), and from that
+     * the source texel at src's pitch. Stencil comes out 0, as the read-back
+     * through memory gives it.
+     */
+    const char *zeta_fill_fs =
+        "#version 330\n"
+        "uniform sampler2D tex;\n"
+        "uniform uvec4 dst;\n" /* width, height, pitch, swizzled */
+        "uniform uvec2 src;\n" /* pitch, scale */
+        "void main()\n"
+        "{\n"
+        "    uvec2 f = uvec2(gl_FragCoord.xy);\n"
+        "    uvec2 p = f / src.y, sub = f % src.y;\n"
+        "    uint off;\n"
+        "    if (dst.w != 0u) {\n"
+        "        uint idx = 0u, mb = 1u;\n"
+        "        for (uint b = 1u; b < max(dst.x, dst.y); b <<= 1) {\n"
+        "            if (b < dst.x) { if ((p.x & b) != 0u) idx |= mb; mb <<= 1; }\n"
+        "            if (b < dst.y) { if ((p.y & b) != 0u) idx |= mb; mb <<= 1; }\n"
+        "        }\n"
+        "        off = idx * 4u;\n"
+        "    } else {\n"
+        "        off = p.y * dst.z + p.x * 4u;\n"
+        "    }\n"
+        "    ivec2 s = ivec2(uvec2((off % src.x) / 4u, off / src.x) * src.y + sub);\n"
+        "    gl_FragDepth = texelFetch(tex, s, 0).r;\n"
+        "}\n";
+    r->s2t_rndr.zeta_fill_prog = pgraph_gl_compile_shader(vs, zeta_fill_fs);
+    r->s2t_rndr.zeta_fill_tex_loc = glGetUniformLocation(r->s2t_rndr.zeta_fill_prog, "tex");
+    r->s2t_rndr.zeta_fill_dst_loc = glGetUniformLocation(r->s2t_rndr.zeta_fill_prog, "dst");
+    r->s2t_rndr.zeta_fill_src_loc = glGetUniformLocation(r->s2t_rndr.zeta_fill_prog, "src");
+    /*
+     * Depth write-back in the background (uwp_wb_start): each texel's word
+     * (depth << 8, stencil 0, as zeta_dl_fs gives it) goes straight into a
+     * storage buffer at its byte offset in guest memory, swizzled or at the
+     * surface's pitch, so the CPU only copies it into place later.
+     */
+    const char *zeta_wb_fs =
+        "#version 430\n"
+        "uniform sampler2D tex;\n"
+        "uniform uvec4 dst;\n" /* width, height, pitch, swizzled */
+        "uniform uint scale;\n"
+        "layout(std430, binding = 0) writeonly buffer Words { uint words[]; };\n"
+        "layout(location = 0) out vec4 out_Color;\n"
+        "void main()\n"
+        "{\n"
+        "    uvec2 p = uvec2(gl_FragCoord.xy);\n"
+        "    float d = texelFetch(tex, ivec2(p * scale), 0).r;\n"
+        "    uint v = min(uint(d * 16777215.0 + 0.5), 16777215u);\n"
+        "    uint off;\n"
+        "    if (dst.w != 0u) {\n"
+        "        uint idx = 0u, mb = 1u;\n"
+        "        for (uint b = 1u; b < max(dst.x, dst.y); b <<= 1) {\n"
+        "            if (b < dst.x) { if ((p.x & b) != 0u) idx |= mb; mb <<= 1; }\n"
+        "            if (b < dst.y) { if ((p.y & b) != 0u) idx |= mb; mb <<= 1; }\n"
+        "        }\n"
+        "        off = idx;\n"
+        "    } else {\n"
+        "        off = (p.y * dst.z) / 4u + p.x;\n"
+        "    }\n"
+        "    words[off] = v << 8;\n"
+        "    out_Color = vec4(0.0);\n"
+        "}\n";
+    r->s2t_rndr.zeta_wb_prog = pgraph_gl_compile_shader(vs, zeta_wb_fs);
+    r->s2t_rndr.zeta_wb_tex_loc = glGetUniformLocation(r->s2t_rndr.zeta_wb_prog, "tex");
+    r->s2t_rndr.zeta_wb_dst_loc = glGetUniformLocation(r->s2t_rndr.zeta_wb_prog, "dst");
+    r->s2t_rndr.zeta_wb_scale_loc = glGetUniformLocation(r->s2t_rndr.zeta_wb_prog, "scale");
+    glGenBuffers(1, &r->s2t_rndr.zeta_wb_ssbo);
+    r->s2t_rndr.zeta_wb_ssbo_size = 0;
 #endif
     r->s2t_rndr.tex_loc = glGetUniformLocation(r->s2t_rndr.prog, "tex");
     r->s2t_rndr.surface_size_loc = glGetUniformLocation(r->s2t_rndr.prog,
@@ -252,6 +324,9 @@ static void finalize_render_to_texture(PGRAPHState *pg)
 #ifdef XEMU_UWP
     glDeleteProgram(r->s2t_rndr.zeta_prog);
     glDeleteProgram(r->s2t_rndr.zeta_dl_prog);
+    glDeleteProgram(r->s2t_rndr.zeta_fill_prog);
+    glDeleteProgram(r->s2t_rndr.zeta_wb_prog);
+    glDeleteBuffers(1, &r->s2t_rndr.zeta_wb_ssbo);
     glDeleteTextures(1, &r->s2t_rndr.zeta_dl_tex);
     r->s2t_rndr.zeta_prog = 0;
 #endif
@@ -828,6 +903,128 @@ static bool uwp_unpark_matches(PGRAPHState *pg, const SurfaceBinding *e)
            e->fmt.gl_internal_format == uwp_parked.fmt.gl_internal_format &&
            pg->surface_scale_factor == uwp_parked_scale;
 }
+
+static bool uwp_zeta_fill_off(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        off = xemu_uwp_test_file_exists("zeta-fill-off.txt");
+        if (off) {
+            uwp_log("depth fill on the GPU: off (zeta-fill-off.txt)");
+        }
+    }
+    return off;
+}
+
+/*
+ * The depth buffer just parked (uwp_park_zeta) is the last thing written to
+ * the memory a new, smaller depth surface at its address takes over. Filling
+ * that surface from guest memory meant waiting for the parked one's background
+ * write-back first: a full GPU wait each time (Conker: Live & Reloaded's pub,
+ * 32x32 and 640x480 at one address about 140 times a second, half of the
+ * graphics thread, 14-22 fps). The same bytes are taken on the GPU instead,
+ * texel by texel through the memory layout of both. False: fill from memory.
+ */
+static bool uwp_zeta_fill_from_parked(NV2AState *d, SurfaceBinding *surface)
+{
+    PGRAPHState *pg = &d->pgraph;
+    PGRAPHGLState *r = pg->gl_renderer_state;
+    const SurfaceBinding *src = &uwp_parked;
+    if (!uwp_parked_valid || surface->color || !surface->width || !surface->height ||
+        surface->vram_addr != src->vram_addr || pg->surface_scale_factor != uwp_parked_scale ||
+        surface->fmt.gl_internal_format != GL_DEPTH24_STENCIL8 ||
+        src->fmt.gl_internal_format != GL_DEPTH24_STENCIL8 || src->swizzle ||
+        src->pitch != src->width * 4 || uwp_zeta_fill_off()) {
+        return false;
+    }
+    /* every byte the new surface reads lies inside the parked image */
+    uint64_t last = surface->swizzle ? (uint64_t)surface->width * surface->height * 4
+                                     : (uint64_t)(surface->height - 1) * surface->pitch + surface->width * 4;
+    if (last > (uint64_t)src->pitch * src->height) {
+        return false;
+    }
+    unsigned int s = pg->surface_scale_factor;
+    UWP_PROF_BEGIN(t_fill);
+
+    GLint prev_active, prev_tex, prev_vp[4], prev_func;
+    GLboolean prev_mask, prev_cmask[4];
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+    glGetIntegerv(GL_VIEWPORT, prev_vp);
+    glGetIntegerv(GL_DEPTH_FUNC, &prev_func);
+    glGetBooleanv(GL_DEPTH_WRITEMASK, &prev_mask);
+    glGetBooleanv(GL_COLOR_WRITEMASK, prev_cmask);
+    GLboolean prev_depth = glIsEnabled(GL_DEPTH_TEST), prev_stencil = glIsEnabled(GL_STENCIL_TEST),
+              prev_scissor = glIsEnabled(GL_SCISSOR_TEST), prev_blend = glIsEnabled(GL_BLEND),
+              prev_cull = glIsEnabled(GL_CULL_FACE);
+    GLint prev_smask, prev_sclear;
+    glGetIntegerv(GL_STENCIL_WRITEMASK, &prev_smask);
+    glGetIntegerv(GL_STENCIL_CLEAR_VALUE, &prev_sclear);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, r->s2t_rndr.fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, surface->gl_buffer, 0);
+    glDrawBuffer(GL_NONE);
+    glReadBuffer(GL_NONE);
+    bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    if (ok) {
+        glBindTexture(GL_TEXTURE_2D, src->gl_buffer);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+        glUseProgram(r->s2t_rndr.zeta_fill_prog);
+        glProgramUniform1i(r->s2t_rndr.zeta_fill_prog, r->s2t_rndr.zeta_fill_tex_loc, 0);
+        glProgramUniform4ui(r->s2t_rndr.zeta_fill_prog, r->s2t_rndr.zeta_fill_dst_loc, surface->width,
+                            surface->height, surface->pitch, surface->swizzle);
+        glProgramUniform2ui(r->s2t_rndr.zeta_fill_prog, r->s2t_rndr.zeta_fill_src_loc, src->pitch, s);
+        glBindVertexArray(r->s2t_rndr.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, r->s2t_rndr.vbo);
+        glViewport(0, 0, surface->width * s, surface->height * s);
+        glColorMask(false, false, false, false);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_BLEND);
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_STENCIL_TEST);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_ALWAYS);
+        glDepthMask(GL_TRUE);
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        glStencilMask(0xff);
+        glClearStencil(0);
+        glClear(GL_STENCIL_BUFFER_BIT);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_FRAMEBUFFER, r->gl_framebuffer);
+    glBindTexture(GL_TEXTURE_2D, prev_tex);
+    glActiveTexture(prev_active);
+    glUseProgram(r->shader_binding ? r->shader_binding->gl_program : 0);
+    glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+    glDepthFunc(prev_func);
+    glDepthMask(prev_mask);
+    glColorMask(prev_cmask[0], prev_cmask[1], prev_cmask[2], prev_cmask[3]);
+    glStencilMask(prev_smask);
+    glClearStencil(prev_sclear);
+    (prev_depth ? glEnable : glDisable)(GL_DEPTH_TEST);
+    (prev_stencil ? glEnable : glDisable)(GL_STENCIL_TEST);
+    (prev_scissor ? glEnable : glDisable)(GL_SCISSOR_TEST);
+    (prev_blend ? glEnable : glDisable)(GL_BLEND);
+    (prev_cull ? glEnable : glDisable)(GL_CULL_FACE);
+    UWP_PROF_END(PF_ZFILL, t_fill);
+    if (!ok) {
+        return false;
+    }
+    static unsigned logged;
+    if (!logged++) {
+        uwp_log("depth fill on the GPU: %ux%u%s at %x from the parked %ux%u (no wait for its write-back)",
+                surface->width, surface->height, surface->swizzle ? " swizzled" : "",
+                (unsigned)surface->vram_addr, src->width, src->height);
+    }
+    return true;
+}
 #endif
 
 static void invalidate_overlapping_surfaces(NV2AState *d, SurfaceBinding *surface)
@@ -908,6 +1105,83 @@ SurfaceBinding *pgraph_gl_surface_get_within(NV2AState *d, hwaddr addr)
     return NULL;
 }
 
+#ifdef XEMU_UWP
+/*
+ * Surface textures thrown out are kept for the next surface of the same size
+ * and format instead of being deleted. Each new GPU texture is a driver
+ * allocation made and freed again (Conker: Live & Reloaded's pub builds and
+ * drops a 32x32 depth buffer about 100 times a second). Test file
+ * surf-recycle-off.txt: deleted and made anew as before.
+ */
+#define UWP_SURF_POOL 8
+typedef struct UwpSurfTex {
+    GLuint tex;
+    GLenum ifmt;
+    unsigned int w, h;   /* as allocated, scale applied */
+} UwpSurfTex;
+static UwpSurfTex uwp_surf_pool[UWP_SURF_POOL];
+static int uwp_surf_pool_n;
+static uint64_t uwp_surf_reused;
+
+static bool uwp_surf_recycle_off(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        off = xemu_uwp_test_file_exists("surf-recycle-off.txt");
+        if (off) {
+            uwp_log("surface textures: deleted and made anew (surf-recycle-off.txt)");
+        }
+    }
+    return off;
+}
+
+static void uwp_surf_tex_release(PGRAPHState *pg, SurfaceBinding *surface)
+{
+    if (!surface->gl_buffer) {
+        return;
+    }
+    if (uwp_surf_recycle_off() || !surface->width || !surface->height) {
+        glDeleteTextures(1, &surface->gl_buffer);
+        return;
+    }
+    if (uwp_surf_pool_n == UWP_SURF_POOL) {   /* the oldest goes */
+        glDeleteTextures(1, &uwp_surf_pool[0].tex);
+        memmove(&uwp_surf_pool[0], &uwp_surf_pool[1], sizeof(uwp_surf_pool[0]) * (UWP_SURF_POOL - 1));
+        uwp_surf_pool_n--;
+    }
+    unsigned int w = surface->width, h = surface->height;
+    pgraph_apply_scaling_factor(pg, &w, &h);
+    uwp_surf_pool[uwp_surf_pool_n++] = (UwpSurfTex){ surface->gl_buffer, surface->fmt.gl_internal_format, w, h };
+}
+
+/* a kept texture of this size and format (bound to GL_TEXTURE_2D), or 0 */
+static GLuint uwp_surf_tex_take(GLenum ifmt, unsigned int w, unsigned int h)
+{
+    for (int i = uwp_surf_pool_n - 1; i >= 0; i--) {
+        UwpSurfTex *e = &uwp_surf_pool[i];
+        if (e->ifmt == ifmt && e->w == w && e->h == h) {
+            GLuint tex = e->tex;
+            memmove(e, e + 1, sizeof(*e) * (uwp_surf_pool_n - i - 1));
+            uwp_surf_pool_n--;
+            if (!uwp_surf_reused++) {
+                uwp_log("surface textures: a %ux%u texture used again instead of a new one", w, h);
+            }
+            return tex;
+        }
+    }
+    return 0;
+}
+
+static void uwp_surf_pool_clear(void)
+{
+    for (int i = 0; i < uwp_surf_pool_n; i++) {
+        glDeleteTextures(1, &uwp_surf_pool[i].tex);
+    }
+    uwp_surf_pool_n = 0;
+}
+#endif
+
 void pgraph_gl_surface_invalidate(NV2AState *d, SurfaceBinding *surface)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -926,9 +1200,11 @@ void pgraph_gl_surface_invalidate(NV2AState *d, SurfaceBinding *surface)
 
     unregister_cpu_access_callback(d, surface);
 
-    glDeleteTextures(1, &surface->gl_buffer);
 #ifdef XEMU_UWP
+    uwp_surf_tex_release(pg, surface);
     xemu_uwp_counters[UWP_CNT_SURF_DEL]++;
+#else
+    glDeleteTextures(1, &surface->gl_buffer);
 #endif
 
     QTAILQ_REMOVE(&r->surfaces, surface, entry);
@@ -1120,24 +1396,45 @@ static bool uwp_zeta_readpixels(void)
 
 /* see zeta_dl_fs in pgraph_gl_init_surfaces: draws the depth surface as the colour image of its words into
  * zeta_dl_tex and leaves that image bound for reading; uwp_zeta_color_done puts the GL state back */
+static void uwp_zeta_draw_as_color_prog(NV2AState *d, SurfaceBinding *surface, GLuint prog, GLint tex_loc,
+                                        unsigned int w, unsigned int h, GLint *prev_active, GLint *prev_tex);
+
 static void uwp_zeta_draw_as_color(NV2AState *d, SurfaceBinding *surface, GLint *prev_active, GLint *prev_tex)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHGLState *r = pg->gl_renderer_state;
-    unsigned int w = pg->surface_scale_factor * surface->width;
-    unsigned int h = pg->surface_scale_factor * surface->height;
+    uwp_zeta_draw_as_color_prog(d, surface, r->s2t_rndr.zeta_dl_prog, r->s2t_rndr.zeta_dl_tex_loc,
+                                pg->surface_scale_factor * surface->width,
+                                pg->surface_scale_factor * surface->height, prev_active, prev_tex);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+/* the setup for drawing the depth surface with prog into the read-back colour image, viewport w x h */
+static void uwp_zeta_draw_as_color_prog(NV2AState *d, SurfaceBinding *surface, GLuint prog, GLint tex_loc,
+                                        unsigned int w, unsigned int h, GLint *prev_active, GLint *prev_tex)
+{
+    PGRAPHState *pg = &d->pgraph;
+    PGRAPHGLState *r = pg->gl_renderer_state;
 
     glGetIntegerv(GL_ACTIVE_TEXTURE, prev_active);
     glActiveTexture(GL_TEXTURE0);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, prev_tex);
 
     glBindTexture(GL_TEXTURE_2D, r->s2t_rndr.zeta_dl_tex);
-    if (r->s2t_rndr.zeta_dl_w != w || r->s2t_rndr.zeta_dl_h != h) {
+    /* only ever grows: the image is drawn and read in its bottom-left w x h. Made anew at every size change,
+     * it was a new GPU allocation each time (Conker: Live & Reloaded's pub, 640x480 and 32x32 about 100 times
+     * a second) */
+    unsigned int want_w = w, want_h = h;
+    if (r->s2t_rndr.zeta_dl_w < w || r->s2t_rndr.zeta_dl_h < h) {
+        w = MAX(w, r->s2t_rndr.zeta_dl_w);
+        h = MAX(h, r->s2t_rndr.zeta_dl_h);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         r->s2t_rndr.zeta_dl_w = w;
         r->s2t_rndr.zeta_dl_h = h;
+        w = want_w;
+        h = want_h;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, r->s2t_rndr.fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r->s2t_rndr.zeta_dl_tex, 0);
@@ -1147,8 +1444,8 @@ static void uwp_zeta_draw_as_color(NV2AState *d, SurfaceBinding *surface, GLint 
 
     glBindTexture(GL_TEXTURE_2D, surface->gl_buffer);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
-    glUseProgram(r->s2t_rndr.zeta_dl_prog);
-    glProgramUniform1i(r->s2t_rndr.zeta_dl_prog, r->s2t_rndr.zeta_dl_tex_loc, 0);
+    glUseProgram(prog);
+    glProgramUniform1i(prog, tex_loc, 0);
     glBindVertexArray(r->s2t_rndr.vao);
     glBindBuffer(GL_ARRAY_BUFFER, r->s2t_rndr.vbo);
     glViewport(0, 0, w, h);
@@ -1160,7 +1457,6 @@ static void uwp_zeta_draw_as_color(NV2AState *d, SurfaceBinding *surface, GLint 
     glDisable(GL_CULL_FACE);
     glDisable(GL_DEPTH_TEST);
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 
 static void uwp_zeta_color_done(NV2AState *d, GLint prev_active, GLint prev_tex)
@@ -1217,6 +1513,7 @@ typedef struct UwpWb {
     size_t size, pbo_size;
     unsigned int width, height, pitch, scale;
     bool swizzle;
+    bool words;   /* the buffer holds guest memory's bytes (uwp_wb_start_words), not a colour image */
     uint64_t frame;
 } UwpWb;
 static UwpWb uwp_wb[UWP_WB_MAX];
@@ -1235,6 +1532,26 @@ static bool uwp_zeta_wb_off(void)
     return off;
 }
 
+/*
+ * Write-backs get no fence of their own: on the console's GL driver every
+ * fence is a GPU submission, and about 180 a second made it wait for old ones
+ * (a millisecond or more each, Conker: Live & Reloaded's pub). The GPU does
+ * them in order, so the first fence at or after the oldest one tells when
+ * that one is done; when there is none, one is put after the newest.
+ */
+static GLsync uwp_wb_fence_for_oldest(void)
+{
+    for (int i = 0; i < uwp_wb_count; i++) {
+        UwpWb *e = &uwp_wb[(uwp_wb_head + i) % UWP_WB_MAX];
+        if (e->fence) {
+            return e->fence;
+        }
+    }
+    UwpWb *newest = &uwp_wb[(uwp_wb_head + uwp_wb_count - 1) % UWP_WB_MAX];
+    newest->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    return newest->fence;
+}
+
 /* the oldest write-back: into guest memory (waits for the GPU when not done and wait is set) */
 static bool uwp_wb_finish_oldest(NV2AState *d, bool wait)
 {
@@ -1242,14 +1559,38 @@ static bool uwp_wb_finish_oldest(NV2AState *d, bool wait)
         return false;
     }
     UwpWb *e = &uwp_wb[uwp_wb_head];
-    if (!wait && glClientWaitSync(e->fence, 0, 0) == GL_TIMEOUT_EXPIRED) {
+    GLsync fence = uwp_wb_fence_for_oldest();
+    if (!wait && glClientWaitSync(fence, 0, 0) == GL_TIMEOUT_EXPIRED) {
         return false;
     }
-    glClientWaitSync(e->fence, GL_SYNC_FLUSH_COMMANDS_BIT, 2000000000ull);
-    glDeleteSync(e->fence);
-    e->fence = 0;
+    glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 2000000000ull);
+    if (e->fence) {
+        glDeleteSync(e->fence);
+        e->fence = 0;
+    }
 
     glBindBuffer(GL_PIXEL_PACK_BUFFER, e->pbo);
+    if (e->words) {
+        size_t bytes = e->swizzle ? (size_t)e->width * e->height * 4 : (size_t)e->pitch * e->height;
+        const uint8_t *src = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, bytes, GL_MAP_READ_BIT);
+        if (src) {
+            if (e->swizzle) {
+                memcpy(d->vram_ptr + e->addr, src, bytes);
+            } else {
+                for (unsigned int y = 0; y < e->height; y++) {
+                    memcpy(d->vram_ptr + e->addr + (size_t)y * e->pitch, src + (size_t)y * e->pitch,
+                           (size_t)e->width * 4);
+                }
+            }
+            glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+            memory_region_set_client_dirty(d->vram, e->addr, (hwaddr)e->pitch * e->height, DIRTY_MEMORY_VGA);
+            memory_region_set_client_dirty(d->vram, e->addr, (hwaddr)e->pitch * e->height, DIRTY_MEMORY_NV2A_TEX);
+        }
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        uwp_wb_head = (uwp_wb_head + 1) % UWP_WB_MAX;
+        uwp_wb_count--;
+        return true;
+    }
     const uint8_t *src = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)e->width * e->scale *
                                           e->height * e->scale * 4, GL_MAP_READ_BIT);
     if (src) {
@@ -1314,9 +1655,9 @@ static bool uwp_wb_flush_range(NV2AState *d, hwaddr addr, hwaddr len)
     return last >= 0;
 }
 
-void pgraph_gl_uwp_wb_flush_range(NV2AState *d, hwaddr addr, hwaddr len)
+bool pgraph_gl_uwp_wb_flush_range(NV2AState *d, hwaddr addr, hwaddr len)
 {
-    uwp_wb_flush_range(d, addr, len);
+    return uwp_wb_flush_range(d, addr, len);
 }
 
 /* at a frame's end: the finished ones, and any older than two frames */
@@ -1337,6 +1678,100 @@ static void uwp_wb_flush_all(NV2AState *d)
     }
 }
 
+/*
+ * The write-back's bytes made on the GPU: a draw writes each texel's word at
+ * its place in guest memory into a storage buffer, which is copied into the
+ * slot's read-back buffer. Before, glReadPixels into the pixel buffer: the
+ * console's GL driver does that on the CPU, waiting for the GPU first (about a
+ * millisecond each, 20% of the graphics thread in Conker: Live & Reloaded's
+ * pub). Test file wb-readpixels.txt: as before.
+ */
+static bool uwp_wb_words_off(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        off = xemu_uwp_test_file_exists("wb-readpixels.txt");
+        if (off) {
+            uwp_log("depth write-back test: through glReadPixels as before (wb-readpixels.txt)");
+        }
+    }
+    return off;
+}
+
+static bool uwp_wb_flush_each(void);
+
+static bool uwp_wb_start_words(NV2AState *d, SurfaceBinding *surface, UwpWb *e)
+{
+    PGRAPHState *pg = &d->pgraph;
+    PGRAPHGLState *r = pg->gl_renderer_state;
+    if (uwp_wb_words_off() || !r->s2t_rndr.zeta_wb_prog) {
+        return false;
+    }
+    size_t bytes = surface->swizzle ? (size_t)surface->width * surface->height * 4
+                                    : (size_t)surface->pitch * surface->height;
+    if (surface->pitch % 4 || bytes > surface->size || bytes == 0) {
+        return false;
+    }
+
+    /* the storage buffer, and the slot's read-back buffer (GL_STREAM_READ: memory the CPU reads directly) */
+    if (r->s2t_rndr.zeta_wb_ssbo_size < bytes) {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, r->s2t_rndr.zeta_wb_ssbo);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, bytes, NULL, GL_DYNAMIC_COPY);
+        r->s2t_rndr.zeta_wb_ssbo_size = bytes;
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, e->pbo);
+    if (e->pbo_size < bytes) {
+        glBufferData(GL_PIXEL_PACK_BUFFER, bytes, NULL, GL_STREAM_READ);
+        e->pbo_size = bytes;
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+    /* the draw: one fragment per texel at scale 1, into the colour image used for read-backs (only grows) */
+    GLint prev_active, prev_tex;
+    uwp_zeta_draw_as_color_prog(d, surface, r->s2t_rndr.zeta_wb_prog, r->s2t_rndr.zeta_wb_tex_loc,
+                                surface->width, surface->height, &prev_active, &prev_tex);
+    glProgramUniform4ui(r->s2t_rndr.zeta_wb_prog, r->s2t_rndr.zeta_wb_dst_loc, surface->width, surface->height,
+                        surface->pitch, surface->swizzle);
+    glProgramUniform1ui(r->s2t_rndr.zeta_wb_prog, r->s2t_rndr.zeta_wb_scale_loc, pg->surface_scale_factor);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, r->s2t_rndr.zeta_wb_ssbo);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, 0);
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+
+    glBindBuffer(GL_COPY_READ_BUFFER, r->s2t_rndr.zeta_wb_ssbo);
+    glBindBuffer(GL_COPY_WRITE_BUFFER, e->pbo);
+    glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, bytes);
+    glBindBuffer(GL_COPY_READ_BUFFER, 0);
+    glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
+    e->fence = 0;   /* see uwp_wb_fence_for_oldest */
+    if (uwp_wb_flush_each()) {
+        glFlush();
+    }
+    uwp_zeta_color_done(d, prev_active, prev_tex);
+    return true;
+}
+
+/*
+ * Each write-back used to end with glFlush: about 100 small GPU submissions a
+ * second in Conker: Live & Reloaded's pub, and the driver waited for old ones
+ * to finish before taking new ones. The fence is flushed with the next draws
+ * or the frame's end; a wait for it flushes too (GL_SYNC_FLUSH_COMMANDS_BIT).
+ * Test file wb-flush.txt: flush each one as before.
+ */
+static bool uwp_wb_flush_each(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        on = xemu_uwp_test_file_exists("wb-flush.txt");
+        if (on) {
+            uwp_log("depth write-back test: flushed one by one (wb-flush.txt)");
+        }
+    }
+    return on;
+}
+
 /* starts the write-back of a Z24S8 surface; false when it is not one (or the test switch is on) */
 static bool uwp_wb_start(NV2AState *d, SurfaceBinding *surface)
 {
@@ -1354,6 +1789,29 @@ static bool uwp_wb_start(NV2AState *d, SurfaceBinding *surface)
     unsigned int h = pg->surface_scale_factor * surface->height;
     size_t bytes = (size_t)w * h * 4;
 
+    UWP_PROF_BEGIN(t_wb);
+    if (!e->pbo) {
+        glGenBuffers(1, &e->pbo);
+    }
+    e->words = uwp_wb_start_words(d, surface, e);
+    if (e->words) {
+        UWP_PROF_END(PF_WB_START, t_wb);
+        e->addr = surface->vram_addr;
+        e->size = surface->size;
+        e->width = surface->width;
+        e->height = surface->height;
+        e->pitch = surface->pitch;
+        e->scale = pg->surface_scale_factor;
+        e->swizzle = surface->swizzle;
+        e->frame = pg->frame_time;
+        uwp_wb_count++;
+        static unsigned logged_words;
+        if (!logged_words++) {
+            uwp_log("depth write-back in the background, on the GPU into memory order: %ux%u at %x",
+                    surface->width, surface->height, (unsigned)surface->vram_addr);
+        }
+        return true;
+    }
     GLint prev_active, prev_tex;
     uwp_zeta_draw_as_color(d, surface, &prev_active, &prev_tex);
     if (!e->pbo) {
@@ -1373,9 +1831,12 @@ static bool uwp_wb_start(NV2AState *d, SurfaceBinding *surface)
     glPixelStorei(GL_PACK_ROW_LENGTH, rl);
     glPixelStorei(GL_PACK_ALIGNMENT, pa);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-    e->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-    glFlush();
+    e->fence = 0;   /* see uwp_wb_fence_for_oldest */
+    if (uwp_wb_flush_each()) {
+        glFlush();
+    }
     uwp_zeta_color_done(d, prev_active, prev_tex);
+    UWP_PROF_END(PF_WB_START, t_wb);
 
     e->addr = surface->vram_addr;
     e->size = surface->size;
@@ -1452,8 +1913,8 @@ static void uwp_prefetch_color(NV2AState *d, SurfaceBinding *surface)
     glPixelStorei(GL_PACK_ROW_LENGTH, rl);
     glPixelStorei(GL_PACK_ALIGNMENT, pa);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-    e->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-    glFlush();
+    e->fence = 0;   /* see uwp_wb_fence_for_oldest */
+    e->words = false;
     glFramebufferTexture2D(GL_FRAMEBUFFER, surface->fmt.gl_attachment, GL_TEXTURE_2D, 0, 0);
     bind_current_surface(d);
 
@@ -1944,9 +2405,11 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
 
     Surface *surface = color ? &pg->surface_color : &pg->surface_zeta;
 
+    UWP_PROF_BEGIN(t_dirty);
     bool mem_dirty = !tcg_enabled() && memory_region_test_and_clear_dirty(
                                            d->vram, entry.vram_addr, entry.size,
                                            DIRTY_MEMORY_NV2A);
+    UWP_PROF_END(PF_SU_DIRTY, t_dirty);
 
     if (upload && (surface->buffer_dirty || mem_dirty)) {
         pgraph_gl_unbind_surface(d, color);
@@ -1993,6 +2456,9 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
             pg->surface_shape.clip_height);
 
         bool should_create = true;
+#ifdef XEMU_UWP
+        bool uwp_parked_now = false;
+#endif
 
         if (found != NULL) {
             bool is_compatible =
@@ -2113,18 +2579,23 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
                 }
 #endif
                 UWP_DL_SITE(EVICT_INCOMPATIBLE);
+                UWP_PROF_BEGIN(t_evict);
 #ifdef XEMU_UWP
                 if (uwp_evict_without_download(found, &entry)) {
                     found->draw_dirty = false;
-                } else if (!uwp_park_zeta(d, found, &entry) && uwp_wb_start(d, found)) {
+                } else if (uwp_park_zeta(d, found, &entry)) {
+                    uwp_parked_now = true;
+                } else if (uwp_wb_start(d, found)) {
                     found->draw_dirty = false;   /* its bytes reach guest memory in the background */
                 }
 #endif
                 pgraph_gl_surface_download_if_dirty(d, found);
                 pgraph_gl_surface_invalidate(d, found);
+                UWP_PROF_END(PF_SU_EVICT, t_evict);
             }
         }
 
+        UWP_PROF_BEGIN(t_new);
 #ifdef XEMU_UWP
         bool uwp_from_park = should_create && uwp_unpark_matches(pg, &entry);
         if (uwp_from_park) {
@@ -2144,6 +2615,17 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
         } else
 #endif
         if (should_create) {
+#ifdef XEMU_UWP
+            unsigned int uwp_w = entry.width ? entry.width : 1;
+            unsigned int uwp_h = entry.height ? entry.height : 1;
+            pgraph_apply_scaling_factor(pg, &uwp_w, &uwp_h);
+            entry.gl_buffer = uwp_surf_tex_take(entry.fmt.gl_internal_format, uwp_w, uwp_h);
+            if (entry.gl_buffer) {
+                glBindTexture(GL_TEXTURE_2D, entry.gl_buffer);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+            } else
+#endif
+            {
             glGenTextures(1, &entry.gl_buffer);
             glBindTexture(GL_TEXTURE_2D, entry.gl_buffer);
             NV2A_GL_DLABEL(GL_TEXTURE, entry.gl_buffer,
@@ -2162,7 +2644,14 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
             glTexImage2D(GL_TEXTURE_2D, 0, entry.fmt.gl_internal_format, width,
                          height, 0, entry.fmt.gl_format, entry.fmt.gl_type,
                          NULL);
+            }
             found = surface_put(d, entry.vram_addr, &entry);
+#ifdef XEMU_UWP
+            /* memory the CPU wrote since (mem_dirty) is filled from memory as before */
+            if (uwp_parked_now && !mem_dirty && uwp_zeta_fill_from_parked(d, found)) {
+                found->upload_pending = false;
+            }
+#endif
 
             /* FIXME: Refactor */
             pg->surface_binding_dim.width = entry.width;
@@ -2176,6 +2665,7 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
                 pg->surface_zeta.buffer_dirty = true;
             }
         }
+        UWP_PROF_END(PF_SU_NEW, t_new);
 
 #define TRACE_ARGS found->vram_addr, found->width, found->height, \
                    found->swizzle ? "sz" : "ln", found->shape.anti_aliasing, \
@@ -2200,10 +2690,12 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
         }
 #undef TRACE_ARGS
 
+        UWP_PROF_BEGIN(t_fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, entry.fmt.gl_attachment,
                                GL_TEXTURE_2D, found->gl_buffer, 0);
         assert(glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
                GL_FRAMEBUFFER_COMPLETE);
+        UWP_PROF_END(PF_SU_FBO, t_fbo);
 
         surface->buffer_dirty = false;
     }
@@ -2311,6 +2803,7 @@ void pgraph_gl_surface_update(NV2AState *d, bool upload, bool color_write,
 
     bool swizzle = (pg->surface_type == NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE);
 
+    UWP_PROF_BEGIN(t_up);
     if (r->color_binding) {
         r->color_binding->frame_time = pg->frame_time;
         if (upload) {
@@ -2328,6 +2821,7 @@ void pgraph_gl_surface_update(NV2AState *d, bool upload, bool color_write,
             r->zeta_binding->swizzle = swizzle;
         }
     }
+    UWP_PROF_END(PF_SU_UPLOAD, t_up);
 
     // Sanity check color and zeta dimensions match
     if (r->color_binding && r->zeta_binding) {
@@ -2341,7 +2835,9 @@ void pgraph_gl_surface_update(NV2AState *d, bool upload, bool color_write,
 #endif
     }
 
+    UWP_PROF_BEGIN(t_old);
     surface_evict_old(d);
+    UWP_PROF_END(PF_SU_OLD, t_old);
 }
 
 // FIXME: Move to common
@@ -2396,6 +2892,9 @@ static void flush_surfaces(NV2AState *d)
         // pgraph_gl_surface_download_if_dirty(d, s);
         pgraph_gl_surface_invalidate(d, s);
     }
+#ifdef XEMU_UWP
+    uwp_surf_pool_clear();   /* the render scale may change next */
+#endif
 }
 
 void pgraph_gl_finalize_surfaces(PGRAPHState *pg)

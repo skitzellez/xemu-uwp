@@ -413,7 +413,21 @@ void pgraph_gl_bind_textures(NV2AState *d)
         }
 
 #ifdef XEMU_UWP
-        pgraph_gl_uwp_wb_flush_range(d, texture_vram_offset, length);
+        /* a texture copied from a surface on the GPU never reads guest memory: no wait for write-backs there
+         * (Conker: Live & Reloaded's pub, a 32x32 depth buffer read as a texture where a parked one is on its
+         * way to memory) */
+        if (!surf_to_tex) {
+            int64_t t_wb = get_clock_realtime();
+            if (pgraph_gl_uwp_wb_flush_range(d, texture_vram_offset, length)) {
+                static unsigned logged;
+                if (logged < 8) {
+                    logged++;
+                    uwp_log("texture at %x (%ux%u fmt 0x%x%s) waited %lld us for a depth write-back to land",
+                            (unsigned)texture_vram_offset, state.width, state.height, state.color_format,
+                            surface ? ", a surface there" : "", (long long)(get_clock_realtime() - t_wb) / 1000);
+                }
+            }
+        }
 #endif
         if (!surf_to_tex) {
             // FIXME: Restructure to support rendering surfaces to cubemap faces
