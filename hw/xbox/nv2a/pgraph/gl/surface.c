@@ -449,6 +449,21 @@ static bool surface_to_texture_can_fastpath(SurfaceBinding *surface,
         default: break;
         }
         break;
+#ifdef XEMU_UWP
+    /*
+     * An 8-bit target sampled as an 8-bit texture: both are GL_R8 here, so the
+     * image is copied on the GPU. The read-back through memory carried the very
+     * same bytes (Power Drome: 160x120 targets as Y8, ~80 read-backs a second).
+     */
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_B8: switch (texture_fmt) {
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y8: return true;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y8: return true;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8: return true;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8: return true;
+        default: break;
+        }
+        break;
+#endif
     default: break;
     }
 
@@ -733,6 +748,21 @@ bool pgraph_gl_check_surface_to_texture_compatibility(
         default: break;
         }
         break;
+#ifdef XEMU_UWP
+    /*
+     * An 8-bit target sampled as an 8-bit texture: both are GL_R8 here, so the
+     * image is copied on the GPU. The read-back through memory carried the very
+     * same bytes (Power Drome: 160x120 targets as Y8, ~80 read-backs a second).
+     */
+    case NV097_SET_SURFACE_FORMAT_COLOR_LE_B8: switch (texture_fmt) {
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y8: return true;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y8: return true;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8: return true;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8: return true;
+        default: break;
+        }
+        break;
+#endif
     default:
         break;
     }
@@ -1076,6 +1106,8 @@ static void invalidate_overlapping_surfaces(NV2AState *d, SurfaceBinding *surfac
 #ifdef XEMU_UWP
             if (uwp_evict_without_download(other_surface, surface)) {
                 other_surface->draw_dirty = false;
+            } else if (other_surface->draw_dirty && uwp_wb_start(d, other_surface)) {
+                other_surface->draw_dirty = false;   /* its bytes reach guest memory in the background */
             }
 #endif
             pgraph_gl_surface_download_if_dirty(d, other_surface);
@@ -1812,8 +1844,12 @@ static bool uwp_wb_flush_each(void)
 static bool uwp_wb_start(NV2AState *d, SurfaceBinding *surface)
 {
     PGRAPHState *pg = &d->pgraph;
-    if (surface->color || surface->fmt.gl_internal_format != GL_DEPTH24_STENCIL8 || uwp_zeta_wb_off() ||
-        uwp_zeta_readpixels() || !surface->width || !surface->height) {
+    /* a 32-bit colour surface too, through the GPU path only (uwp_wb_start_words): Power Drome's 320x240
+       target thrown out when its memory turns back into a depth buffer, a read-back with a GPU wait each time */
+    bool zeta = !surface->color && surface->fmt.gl_internal_format == GL_DEPTH24_STENCIL8;
+    bool color = surface->color && surface->fmt.bytes_per_pixel == 4 && surface->fmt.gl_internal_format == GL_RGBA8 &&
+                 !uwp_wb_words_off();
+    if ((!zeta && !color) || uwp_zeta_wb_off() || uwp_zeta_readpixels() || !surface->width || !surface->height) {
         return false;
     }
     /* no wait for older write-backs to the same memory: they land first anyway (oldest first) */
@@ -1841,12 +1877,16 @@ static bool uwp_wb_start(NV2AState *d, SurfaceBinding *surface)
         e->swizzle = surface->swizzle;
         e->frame = pg->frame_time;
         uwp_wb_count++;
-        static unsigned logged_words;
-        if (!logged_words++) {
-            uwp_log("depth write-back in the background, on the GPU into memory order: %ux%u at %x",
-                    surface->width, surface->height, (unsigned)surface->vram_addr);
+        static unsigned logged_words, logged_color;
+        if (surface->color ? !logged_color++ : !logged_words++) {
+            uwp_log("%s write-back in the background, on the GPU into memory order: %ux%u at %x",
+                    surface->color ? "colour" : "depth", surface->width, surface->height,
+                    (unsigned)surface->vram_addr);
         }
         return true;
+    }
+    if (surface->color) {
+        return false;   /* no other way for colour */
     }
     GLint prev_active, prev_tex;
     uwp_zeta_draw_as_color(d, surface, &prev_active, &prev_tex);
@@ -1917,7 +1957,8 @@ static bool uwp_color_prefetch_off(void)
 static void uwp_prefetch_color(NV2AState *d, SurfaceBinding *surface)
 {
     PGRAPHState *pg = &d->pgraph;
-    if (!surface || !surface->color || !surface->draw_dirty || !surface->swizzle ||
+    /* linear ones too, through the GPU path (Power Drome reads a 20x15 target with the CPU every frame) */
+    if (!surface || !surface->color || !surface->draw_dirty || (!surface->swizzle && uwp_wb_words_off()) ||
         surface->size > 16384 || surface->fmt.bytes_per_pixel != 4 || pg->surface_scale_factor != 1 ||
         !surface->width || !surface->height || uwp_color_prefetch_off()) {
         return;
@@ -2437,6 +2478,37 @@ static void populate_surface_binding_entry(NV2AState *d, bool color,
     populate_surface_binding_entry_sized(d, color, width, height, entry);
 }
 
+#ifdef XEMU_UWP
+/*
+ * A surface made for a clear that covers all of it: its old memory is not uploaded first. That upload was
+ * thrown away by the clear at once, and it waited for any write-back still on its way to that memory (Power
+ * Drome: a 320x240 colour target in a 640x480 depth buffer's memory, two waits a frame). Set by
+ * pgraph_gl_clear_surface around its surface update.
+ */
+static unsigned int uwp_clear_w, uwp_clear_h;
+static bool uwp_clear_color, uwp_clear_depth, uwp_clear_stencil;
+
+void pgraph_gl_uwp_clear_cover(unsigned int width, unsigned int height, bool color, bool depth, bool stencil)
+{
+    uwp_clear_w = width;
+    uwp_clear_h = height;
+    uwp_clear_color = color;
+    uwp_clear_depth = depth;
+    uwp_clear_stencil = stencil;
+}
+
+static bool uwp_clear_covers(const SurfaceBinding *e)
+{
+    if (!e->width || !e->height || uwp_clear_w < e->width || uwp_clear_h < e->height) {
+        return false;
+    }
+    if (e->color) {
+        return uwp_clear_color;
+    }
+    return uwp_clear_depth && (uwp_clear_stencil || e->fmt.gl_internal_format != GL_DEPTH24_STENCIL8);
+}
+#endif
+
 static void update_surface_part(NV2AState *d, bool upload, bool color)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -2692,6 +2764,13 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
             /* memory the CPU wrote since (mem_dirty) is filled from memory as before */
             if (uwp_parked_now && !mem_dirty && uwp_zeta_fill_from_parked(d, found)) {
                 found->upload_pending = false;
+            } else if (pg->clearing && uwp_clear_covers(found)) {
+                found->upload_pending = false;
+                static unsigned logged;
+                if (!logged++) {
+                    uwp_log("surfaces: a new %ux%u %s surface is cleared whole: its old memory is not read",
+                            found->width, found->height, color ? "colour" : "depth");
+                }
             }
 #endif
 

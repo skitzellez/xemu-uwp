@@ -47,9 +47,20 @@ static void set_fixed_function_vsh_state(PGRAPHState *pg,
         pgraph_reg_r(pg, NV_PGRAPH_CSV0_C), NV_PGRAPH_CSV0_C_SPECULAR);
 
     for (int i = 0; i < 4; i++) {
+#ifdef XEMU_UWP
+        /* a uniform (uwpTexMatOn), set at every draw: switching a texture matrix on or off makes no new shader
+           (Crazy Taxi 3: about a fifth of the shaders it built while playing) */
+        state->texture_matrix_enable[i] = false;
+#else
         state->texture_matrix_enable[i] = pg->texture_matrix_enable[i];
+#endif
     }
 
+#ifdef XEMU_UWP
+    /* a uniform (uwpTexgen), set at every draw; the shader picks the mode (glsl/vsh-ff.c). Crazy Taxi 3: the
+       texture coordinate modes made more new shaders while playing than anything else */
+    memset(state->texgen, 0, sizeof(state->texgen));
+#else
     for (int i = 0; i < 4; i++) {
         unsigned int reg = (i < 2) ? NV_PGRAPH_CSV1_A : NV_PGRAPH_CSV1_B;
         for (int j = 0; j < 4; j++) {
@@ -63,6 +74,7 @@ static void set_fixed_function_vsh_state(PGRAPHState *pg,
                 (enum VshTexgen)GET_MASK(pgraph_reg_r(pg, reg), masks[j]);
         }
     }
+#endif
 
     state->lighting =
         GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_C), NV_PGRAPH_CSV0_C_LIGHTING);
@@ -634,6 +646,27 @@ void pgraph_glsl_set_vsh_uniform_values(PGRAPHState *pg, const VshState *state,
 
         if (locs[VshUniform_specularPower] != -1) {
             values->specularPower[0] = pg->specular_power;
+        }
+
+        if (locs[VshUniform_uwpTexMatOn] != -1) {
+            for (int i = 0; i < 4; i++) {
+                values->uwpTexMatOn[i] = pg->texture_matrix_enable[i];
+            }
+        }
+
+        if (locs[VshUniform_uwpTexgen] != -1) {
+            for (int i = 0; i < 4; i++) {
+                unsigned int reg = (i < 2) ? NV_PGRAPH_CSV1_A : NV_PGRAPH_CSV1_B;
+                unsigned int masks[] = {
+                    (i % 2) ? NV_PGRAPH_CSV1_A_T1_S : NV_PGRAPH_CSV1_A_T0_S,
+                    (i % 2) ? NV_PGRAPH_CSV1_A_T1_T : NV_PGRAPH_CSV1_A_T0_T,
+                    (i % 2) ? NV_PGRAPH_CSV1_A_T1_R : NV_PGRAPH_CSV1_A_T0_R,
+                    (i % 2) ? NV_PGRAPH_CSV1_A_T1_Q : NV_PGRAPH_CSV1_A_T0_Q
+                };
+                for (int j = 0; j < 4; j++) {
+                    values->uwpTexgen[i * 4 + j] = GET_MASK(pgraph_reg_r(pg, reg), masks[j]);
+                }
+            }
         }
     }
 }

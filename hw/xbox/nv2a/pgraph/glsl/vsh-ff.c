@@ -179,6 +179,37 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
         mstring_append(body, "tNormal = normalize(tNormal);\n");
     }
 
+#ifdef XEMU_UWP
+    /*
+     * The mode of each texture coordinate is a uniform (uwpTexgen, glsl/vsh.c): one shader serves every mix of
+     * modes. Each coordinate gets only the modes the hardware has for it (sphere map: S, T; reflection and
+     * normal map: S, T, R), as below; anything else leaves the coordinate as given.
+     */
+    mstring_append(body,
+                   "vec3 uwpTgU = normalize(tPosition.xyz);\n"
+                   "vec3 uwpTgR = reflect(uwpTgU, tNormal);\n"
+                   "float uwpTgInvM = 1.0 / (2.0 * length(uwpTgR + vec3(0.0, 0.0, 1.0)));\n");
+    for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
+        for (j = 0; j < 4; j++) {
+            char c = "xyzw"[j];
+            char cSuffix = "STRQ"[j];
+            mstring_append_fmt(body, "switch (uwpTexgen[%d]) {\n", i * 4 + j);
+            mstring_append_fmt(body, "case %d: oT%d.%c = dot(texPlane%c%d, tPosition); break;\n",
+                               TEXGEN_EYE_LINEAR, i, c, cSuffix, i);
+            mstring_append_fmt(body, "case %d: oT%d.%c = dot(texPlane%c%d, position); break;\n",
+                               TEXGEN_OBJECT_LINEAR, i, c, cSuffix, i);
+            if (j < 2) {
+                mstring_append_fmt(body, "case %d: oT%d.%c = uwpTgR.%c * uwpTgInvM + 0.5; break;\n",
+                                   TEXGEN_SPHERE_MAP, i, c, c);
+            }
+            if (j < 3) {
+                mstring_append_fmt(body, "case %d: oT%d.%c = uwpTgR.%c; break;\n", TEXGEN_REFLECTION_MAP, i, c, c);
+                mstring_append_fmt(body, "case %d: oT%d.%c = tNormal.%c; break;\n", TEXGEN_NORMAL_MAP, i, c, c);
+            }
+            mstring_append_fmt(body, "default: oT%d.%c = texture%d.%c; break;\n}\n", i, c, i, c);
+        }
+    }
+#else
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
         mstring_append_fmt(body, "/* Texgen for stage %d */\n",
                            i);
@@ -242,13 +273,18 @@ GLSL_DEFINE(materialEmissionColor, GLSL_LTCTXA(NV_IGRAPH_XF_LTCTXA_CM_COL) ".xyz
             }
         }
     }
+#endif
 
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
+#ifdef XEMU_UWP
+        mstring_append_fmt(body, "if (uwpTexMatOn[%d] != 0) oT%d = oT%d * texMat%d;\n", i, i, i, i);
+#else
         if (state->fixed_function.texture_matrix_enable[i]) {
             mstring_append_fmt(body,
                                "oT%d = oT%d * texMat%d;\n",
                                i, i, i);
         }
+#endif
     }
 
     if (!state->fixed_function.lighting) {

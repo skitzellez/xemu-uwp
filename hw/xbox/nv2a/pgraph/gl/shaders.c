@@ -522,6 +522,9 @@ static void shader_cache_entry_init(Lru *lru, LruNode *node, const void *state)
     binding->save_thread = NULL;
 #ifdef XEMU_UWP
     binding->uwp_warm_noted = false;
+    binding->uwp_vsh_last = NULL;
+    binding->uwp_psh_last = NULL;
+    binding->uwp_last_program = 0;
 #endif
 }
 
@@ -543,6 +546,13 @@ static void shader_cache_entry_post_evict(Lru *lru, LruNode *node)
     binding->save_thread = NULL;
     binding->program = NULL;
     memset(&binding->state, 0, sizeof(ShaderState));
+#ifdef XEMU_UWP
+    g_free(binding->uwp_vsh_last);
+    g_free(binding->uwp_psh_last);
+    binding->uwp_vsh_last = NULL;
+    binding->uwp_psh_last = NULL;
+    binding->uwp_last_program = 0;
+#endif
 }
 
 static bool shader_cache_entry_compare(Lru *lru, LruNode *node, const void *key)
@@ -761,8 +771,34 @@ void pgraph_gl_shader_cache_to_disk(ShaderBinding *binding)
     qemu_thread_create(binding->save_thread, name, shader_write_to_disk, binding, QEMU_THREAD_JOINABLE);
 }
 
+#ifdef XEMU_UWP
+/*
+ * Every draw handed every uniform to GL again, the 192 vertex shader constants (3 KB) included: the GL
+ * driver compared or re-uploaded them each time, a large part of its work in scenes with thousands of
+ * draws a frame (Project Gotham Racing: 3,300). The values last given to this program are kept (last);
+ * unchanged uniforms are skipped, and of a changed array only the changed elements are sent (array
+ * elements have consecutive locations in Mesa). Test file uniform-all.txt: everything every draw.
+ */
+static bool uwp_uniform_all(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        on = xemu_uwp_test_file_exists("uniform-all.txt");
+        if (on) {
+            uwp_log("uniforms: all sent at every draw (uniform-all.txt)");
+        }
+    }
+    return on;
+}
+#endif
+
 static void apply_uniform_updates(const UniformInfo *info, int *locs,
-                                  void *values, size_t count)
+                                  void *values, size_t count
+#ifdef XEMU_UWP
+                                  , void *last
+#endif
+                                  )
 {
     for (int i = 0; i < count; i++) {
         if (locs[i] == -1) {
@@ -770,39 +806,69 @@ static void apply_uniform_updates(const UniformInfo *info, int *locs,
         }
 
         void *value = (char*)values + info[i].val_offs;
+#ifdef XEMU_UWP
+        int loc = locs[i];
+        size_t n = info[i].count;
+        if (last) {
+            void *prev = (char *)last + info[i].val_offs;
+            size_t es = info[i].size;
+            if (!memcmp(prev, value, es * n)) {
+                continue;
+            }
+            size_t first = 0, end = n;
+            while (first < n && !memcmp((char *)prev + first * es, (char *)value + first * es, es)) {
+                first++;
+            }
+            while (end > first && !memcmp((char *)prev + (end - 1) * es, (char *)value + (end - 1) * es, es)) {
+                end--;
+            }
+            memcpy((char *)prev + first * es, (char *)value + first * es, (end - first) * es);
+            loc += first;
+            value = (char *)value + first * es;
+            n = end - first;
+        }
+#define UWP_LOC loc
+#define UWP_N n
+#else
+#define UWP_LOC locs[i]
+#define UWP_N info[i].count
+#endif
 
         switch (info[i].type) {
         case UniformElementType_uint:
-            glUniform1uiv(locs[i], info[i].count, value);
+            glUniform1uiv(UWP_LOC, UWP_N, value);
             break;
         case UniformElementType_int:
-            glUniform1iv(locs[i], info[i].count, value);
+            glUniform1iv(UWP_LOC, UWP_N, value);
             break;
         case UniformElementType_ivec2:
-            glUniform2iv(locs[i], info[i].count, value);
+            glUniform2iv(UWP_LOC, UWP_N, value);
             break;
         case UniformElementType_ivec4:
-            glUniform4iv(locs[i], info[i].count, value);
+            glUniform4iv(UWP_LOC, UWP_N, value);
             break;
         case UniformElementType_float:
-            glUniform1fv(locs[i], info[i].count, value);
+            glUniform1fv(UWP_LOC, UWP_N, value);
             break;
         case UniformElementType_vec2:
-            glUniform2fv(locs[i], info[i].count, value);
+            glUniform2fv(UWP_LOC, UWP_N, value);
             break;
         case UniformElementType_vec3:
-            glUniform3fv(locs[i], info[i].count, value);
+            glUniform3fv(UWP_LOC, UWP_N, value);
             break;
         case UniformElementType_vec4:
-            glUniform4fv(locs[i], info[i].count, value);
+            glUniform4fv(UWP_LOC, UWP_N, value);
             break;
         case UniformElementType_mat2:
-            glUniformMatrix2fv(locs[i], info[i].count, GL_FALSE, value);
+            glUniformMatrix2fv(UWP_LOC, UWP_N, GL_FALSE, value);
             break;
         default:
             g_assert_not_reached();
         }
+#undef UWP_LOC
+#undef UWP_N
     }
+
 
 #ifdef XEMU_UWP
     {
@@ -830,11 +896,27 @@ static void update_shader_uniforms(PGRAPHState *pg, ShaderBinding *binding)
 {
     PGRAPHGLState *r = pg->gl_renderer_state;
 
+#ifdef XEMU_UWP
+    /* the first update for this program (or a new program in this binding) sends everything */
+    bool fresh = binding->uwp_last_program != binding->gl_program || !binding->uwp_vsh_last || uwp_uniform_all();
+    if (!binding->uwp_vsh_last) {
+        binding->uwp_vsh_last = g_new0(VshUniformValues, 1);
+        binding->uwp_psh_last = g_new0(PshUniformValues, 1);
+    }
+#endif
     VshUniformValues vsh_values;
     pgraph_glsl_set_vsh_uniform_values(pg, &binding->state.vsh,
                                   binding->uniform_locs.vsh, &vsh_values);
+#ifdef XEMU_UWP
+    if (fresh) {
+        memcpy(binding->uwp_vsh_last, &vsh_values, sizeof(vsh_values));
+    }
+    apply_uniform_updates(VshUniformInfo, binding->uniform_locs.vsh,
+                          &vsh_values, VshUniform__COUNT, fresh ? NULL : binding->uwp_vsh_last);
+#else
     apply_uniform_updates(VshUniformInfo, binding->uniform_locs.vsh,
                           &vsh_values, VshUniform__COUNT);
+#endif
 
     PshUniformValues psh_values;
     pgraph_glsl_set_psh_uniform_values(pg, binding->uniform_locs.psh, &psh_values);
@@ -845,8 +927,17 @@ static void update_shader_uniforms(PGRAPHState *pg, ShaderBinding *binding)
             psh_values.texScale[i] = scale;
         }
     }
+#ifdef XEMU_UWP
+    if (fresh) {
+        memcpy(binding->uwp_psh_last, &psh_values, sizeof(psh_values));
+    }
+    apply_uniform_updates(PshUniformInfo, binding->uniform_locs.psh,
+                          &psh_values, PshUniform__COUNT, fresh ? NULL : binding->uwp_psh_last);
+    binding->uwp_last_program = binding->gl_program;
+#else
     apply_uniform_updates(PshUniformInfo, binding->uniform_locs.psh,
                           &psh_values, PshUniform__COUNT);
+#endif
 }
 
 #ifdef XEMU_UWP
@@ -1357,12 +1448,17 @@ static void uwp_warm_start(PGRAPHGLState *r)
            (glsl/vsh.c): the same for older entries */
         VshState *v = &uwp_warm_list[i].state.vsh;
         static const float zero8[8];
+        static const bool off4[4];
         if (v->specular_power != 0 || v->specular_power_back != 0 || v->point_size != 0 ||
-            memcmp(v->point_params, zero8, sizeof(zero8))) {
+            memcmp(v->point_params, zero8, sizeof(zero8)) ||
+            memcmp(v->fixed_function.texture_matrix_enable, off4, sizeof(off4)) ||
+            memcmp(v->fixed_function.texgen, (const enum VshTexgen[4][4]){ 0 }, sizeof(v->fixed_function.texgen))) {
             v->specular_power = 0;
             v->specular_power_back = 0;
             v->point_size = 0;
             memset(v->point_params, 0, sizeof(v->point_params));
+            memset(v->fixed_function.texture_matrix_enable, 0, sizeof(off4));   /* a uniform since 0.9.247 */
+            memset(v->fixed_function.texgen, 0, sizeof(v->fixed_function.texgen));   /* a uniform since 0.9.247 */
             uwp_warm_list[i].check = uwp_warm_check(&uwp_warm_list[i]);
         }
     }

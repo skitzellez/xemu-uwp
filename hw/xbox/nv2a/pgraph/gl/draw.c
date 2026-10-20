@@ -76,7 +76,24 @@ void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
         glClearColor(rgba[0], rgba[1], rgba[2], rgba[3]);
     }
 
+#ifdef XEMU_UWP
+    {
+        /* what this clear covers, for a surface made by the update below (its old memory need not be read) */
+        uint32_t rx = pgraph_reg_r(pg, NV_PGRAPH_CLEARRECTX), ry = pgraph_reg_r(pg, NV_PGRAPH_CLEARRECTY);
+        bool at0 = !GET_MASK(rx, NV_PGRAPH_CLEARRECTX_XMIN) && !GET_MASK(ry, NV_PGRAPH_CLEARRECTY_YMIN) &&
+                   !pg->surface_shape.anti_aliasing;
+        uint32_t all = NV097_CLEAR_SURFACE_R | NV097_CLEAR_SURFACE_G | NV097_CLEAR_SURFACE_B |
+                       NV097_CLEAR_SURFACE_A;
+        pgraph_gl_uwp_clear_cover(at0 ? GET_MASK(rx, NV_PGRAPH_CLEARRECTX_XMAX) + 1 : 0,
+                                  at0 ? GET_MASK(ry, NV_PGRAPH_CLEARRECTY_YMAX) + 1 : 0,
+                                  write_color && (parameter & all) == all, parameter & NV097_CLEAR_SURFACE_Z,
+                                  parameter & NV097_CLEAR_SURFACE_STENCIL);
+    }
+#endif
     pgraph_gl_surface_update(d, true, write_color, write_zeta);
+#ifdef XEMU_UWP
+    pgraph_gl_uwp_clear_cover(0, 0, false, false, false);
+#endif
 
     /* FIXME: Needs confirmation */
     unsigned int xmin =

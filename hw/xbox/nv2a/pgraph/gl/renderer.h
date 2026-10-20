@@ -127,6 +127,10 @@ typedef struct ShaderBinding {
     GLenum gl_primitive_mode;
 #ifdef XEMU_UWP
     bool uwp_warm_noted; /* its first draw is in the warm-up list (shaders.c) */
+    /* the uniform values last handed to gl_program (update_shader_uniforms): only changes go to GL */
+    VshUniformValues *uwp_vsh_last;
+    PshUniformValues *uwp_psh_last;
+    GLuint uwp_last_program;
 #endif
 
     struct {
@@ -323,6 +327,7 @@ void pgraph_gl_unbind_surface(NV2AState *d, bool color);
 void pgraph_gl_upload_surface_data(NV2AState *d, SurfaceBinding *surface, bool force);
 #ifdef XEMU_UWP
 bool pgraph_gl_uwp_wb_flush_range(NV2AState *d, hwaddr addr, hwaddr len);
+void pgraph_gl_uwp_clear_cover(unsigned int width, unsigned int height, bool color, bool depth, bool stencil);
 void pgraph_gl_uwp_wb_frame(NV2AState *d);
 #endif
 void pgraph_gl_shader_cache_to_disk(ShaderBinding *snode);
