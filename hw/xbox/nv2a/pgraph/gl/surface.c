@@ -384,6 +384,12 @@ static bool uwp_zeta_to_texture_ok(const SurfaceBinding *surface,
     return (surface->fmt.gl_internal_format == GL_DEPTH_COMPONENT16 &&
             shape->color_format ==
                 NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_Y16_FIXED) ||
+           /* a float 16-bit depth surface (GL_DEPTH_COMPONENT32F here) as a float 16-bit depth texture: the
+            * read-back through memory gave the texture the same depth values (Mortal Kombat: Shaolin Monks'
+            * 256x256 shadow map, a read-back with a GPU wait each time, frames of 0.4-0.6 s) */
+           (surface->fmt.gl_internal_format == GL_DEPTH_COMPONENT32F &&
+            shape->color_format ==
+                NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_Y16_FLOAT) ||
            (surface->fmt.gl_internal_format == GL_DEPTH24_STENCIL8 &&
             shape->color_format ==
                 NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_X8_Y24_FIXED);
