@@ -1461,6 +1461,30 @@ static void uwp_warm_start(PGRAPHGLState *r)
             memset(v->fixed_function.texgen, 0, sizeof(v->fixed_function.texgen));   /* a uniform since 0.9.247 */
             uwp_warm_list[i].check = uwp_warm_check(&uwp_warm_list[i]);
         }
+        /* pixel shader settings the shader does not read are set to one value since 0.9.250 (glsl/psh.c,
+           end of pgraph_glsl_set_psh_state): the same for older entries */
+        PshState *ps = &uwp_warm_list[i].state.psh;
+        PshState before = *ps;
+        if (!ps->alpha_test || ps->alpha_func == ALPHA_FUNC_ALWAYS) {
+            ps->alpha_test = false;
+            ps->alpha_func = 0;
+        }
+        bool any_shadow = false;
+        for (int k = 0; k < 4; k++) {
+            any_shadow |= ps->shadow_map[k];
+            if (((ps->shader_stage_program >> (k * 5)) & 0x1F) != PS_TEXTUREMODES_CLIPPLANE) {
+                memset(ps->compare_mode[k], 0, sizeof(ps->compare_mode[k]));
+            }
+        }
+        if (!any_shadow) {
+            ps->shadow_depth_func = 0;
+        }
+        if (uwp_warm_list[i].state.geom.primitive_mode != PRIM_TYPE_POINTS) {
+            ps->point_sprite = false;
+        }
+        if (memcmp(&before, ps, sizeof(before))) {
+            uwp_warm_list[i].check = uwp_warm_check(&uwp_warm_list[i]);
+        }
     }
     /* repeats written by earlier builds are dropped, and the list is written back without them, so
        their room goes to shaders not learned yet */

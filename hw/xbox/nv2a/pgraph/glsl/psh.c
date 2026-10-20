@@ -229,6 +229,35 @@ void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state)
         assert(!"Unknown zeta surface format");
         break;
     }
+
+#ifdef XEMU_UWP
+    /*
+     * Settings the generated shader never reads in this state are set to one value, so that they do not
+     * make shaders that differ only there (each a stutter while playing; idea from another Xbox port of
+     * xemu):
+     * - the alpha function without alpha test, and "always" with it (the same as no test)
+     * - the shadow comparison when no texture is a shadow map
+     * - the clip-plane comparisons of a texture stage that is not in clip-plane mode
+     * - point sprites when no points are drawn (gl_PointCoord means nothing then)
+     */
+    if (!state->alpha_test || state->alpha_func == ALPHA_FUNC_ALWAYS) {
+        state->alpha_test = false;
+        state->alpha_func = 0;
+    }
+    bool any_shadow = false;
+    for (int i = 0; i < 4; i++) {
+        any_shadow |= state->shadow_map[i];
+        if (((state->shader_stage_program >> (i * 5)) & 0x1F) != PS_TEXTUREMODES_CLIPPLANE) {
+            memset(state->compare_mode[i], 0, sizeof(state->compare_mode[i]));
+        }
+    }
+    if (!any_shadow) {
+        state->shadow_depth_func = 0;
+    }
+    if (pg->primitive_mode != PRIM_TYPE_POINTS) {
+        state->point_sprite = false;
+    }
+#endif
 }
 
 struct InputInfo {
