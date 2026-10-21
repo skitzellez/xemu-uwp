@@ -2859,78 +2859,6 @@ static void uwp_watch_second(void)
     uwp_watch.quiet = 0;
 }
 
-/*
- * Preparing the game's shaders before it starts. The warm-up list of a game played before (gl/shaders.c) was
- * only replayed for the shaders of its first 30 s, the rest in the background while the game ran: the Xbox
- * start-up animation shared the GPU with those compiles and stuttered, and a level reached before its shaders
- * were ready still froze on them. Now the emulated console is held (paused) at the start until the whole list
- * is ready, with the progress on screen (ui/xui/main.cc); B starts the game at once, the rest then goes on in
- * the background as before. A first run has no list and starts straight away. The no-picture watch does not
- * count while the console is held (it only counts while running).
- */
-#define UWP_PREP_MAX_MS 180000 /* a safety limit; the warm-up also stops by itself with 1.5 GB left */
-bool xemu_uwp_warm_status(int *done, int *total); /* gl/shaders.c */
-bool xemu_uwp_prep_on;      /* the start screen is shown (ui/xui/main.cc) */
-int xemu_uwp_prep_done, xemu_uwp_prep_total;
-static enum { UWP_PREP_START, UWP_PREP_HOLD, UWP_PREP_OVER } uwp_prep;
-static uint64_t uwp_prep_t0;
-
-/* each UI frame until it is over; returns how long the console was held, once, when it ends */
-static uint64_t uwp_prepare_tick(void)
-{
-    if (uwp_prep == UWP_PREP_OVER) {
-        return 0;
-    }
-    int done = 0, total = 0;
-    bool busy = xemu_uwp_warm_status(&done, &total);
-    if (uwp_prep == UWP_PREP_START) {
-        uwp_prep = UWP_PREP_OVER;
-        if (!busy || done >= total) {
-            return 0;   /* no list for this disc yet: nothing to prepare */
-        }
-        xemu_main_loop_lock();
-        bool running = runstate_is_running();
-        if (running) {
-            vm_stop(RUN_STATE_PAUSED);
-        }
-        xemu_main_loop_unlock();
-        if (!running) {
-            return 0;
-        }
-        uwp_prep = UWP_PREP_HOLD;
-        uwp_prep_t0 = SDL_GetTicks();
-        xemu_uwp_prep_total = total;
-        xemu_uwp_prep_on = true;
-        uwp_log("shader preparing: holding the start for %d shaders (%d ready)", total, done);
-        return 0;
-    }
-    xemu_uwp_prep_done = done;
-    uint64_t held = SDL_GetTicks() - uwp_prep_t0;
-    /* a new press only: a B still held from the launcher does not skip it */
-    static bool b_before = true;
-    ControllerState *p1 = xemu_input_get_bound(0);
-    bool b_now = p1 && (p1->buttons & CONTROLLER_BUTTON_B);
-    bool skip = b_now && !b_before;
-    b_before = b_now;
-    const char *why = !busy ? "all ready" : skip ? "B pressed" : held >= UWP_PREP_MAX_MS ? "time limit" : NULL;
-    xemu_main_loop_lock();
-    bool paused = runstate_check(RUN_STATE_PAUSED);
-    if (!why && !paused) {
-        why = "started from the menu";   /* xemu's menu resumed it */
-    }
-    if (why && paused) {
-        vm_start();
-    }
-    xemu_main_loop_unlock();
-    if (!why) {
-        return 0;
-    }
-    uwp_prep = UWP_PREP_OVER;
-    xemu_uwp_prep_on = false;
-    uwp_log("shader preparing: %d of %d ready after %llu ms (%s)", done, total, (unsigned long long)held, why);
-    return held;
-}
-
 static bool uwp_file_exists(const char *path);
 
 static void uwp_box_sample(void)
@@ -5651,8 +5579,6 @@ int main(int argc, char **argv)
             uwp_poll_quit_combo();
         }
         uwp_press_poll();
-        /* time held at the start screen does not count towards the 45 s below */
-        uwp_started_ms += uwp_prepare_tick();
         /*
          * Asked for by the launch link. Not before the game has had 45 seconds: a state
          * loaded while the console is still booting can leave the audio processor (DSP)

@@ -948,8 +948,7 @@ static void update_shader_uniforms(PGRAPHState *pg, ShaderBinding *binding)
  * of 0.1 to 1.4 s, and every new track or level stalled the same way. The first draw of every
  * shader of a run is recorded per disc in uwp_warm_<disc>.bin (shader state + draw setup + when
  * it was first needed); the next start replays those draws off screen, with no pixels covered:
- * those needed in the first 30 s before the first frame, the rest in the background. Since 0.9.939
- * the start screen (ui/xemu.c, uwp_prepare_tick) holds the emulated console until all are done.
+ * those needed in the first 30 s before the first frame, the rest in the background.
  */
 #define UWP_WARM_MAGIC 0x364d5257u /* "WRM6" */
 /* 2048 was full for big games (Ninja Gaiden Black: its attract demo still built 40-50 shaders a second);
@@ -1287,19 +1286,6 @@ static char *uwp_warm_busy_path; /* exists while a warm-up runs */
 static int uwp_warm_unfinished; /* warm-ups before this one that ended unfinished, in a row (in the busy file) */
 static int uwp_warm_progress[UWP_WARM_THREADS]; /* next entry each thread will take */
 static int uwp_warm_before; /* entries [0, uwp_warm_before) are needed before the first frame */
-static int uwp_warm_done; /* entries replayed so far, all threads */
-
-/*
- * For the start screen (ui/xemu.c holds the emulated console while the whole list is prepared): how far the
- * warm-up is. false once no warm-up runs (none started, all done, or stopped for memory).
- */
-bool xemu_uwp_warm_status(int *done, int *total);
-bool xemu_uwp_warm_status(int *done, int *total)
-{
-    *done = qatomic_read(&uwp_warm_done);
-    *total = uwp_warm_list_len;
-    return qatomic_read(&uwp_warm_threads_left) > 0;
-}
 
 typedef struct UwpWarmJob {
     PGRAPHGLState *r;
@@ -1355,7 +1341,6 @@ static void *uwp_warm_thread(void *arg)
             failed++;
         }
         glFlush(); /* hand each draw to the driver now, so its compiles start in order */
-        qatomic_inc(&uwp_warm_done);
     }
     glFinish();
     qatomic_set(&uwp_warm_progress[job->index], INT_MAX);
@@ -1550,7 +1535,6 @@ static void uwp_warm_start(PGRAPHGLState *r)
         snprintf(count, sizeof(count), "%d", uwp_warm_unfinished);
         g_file_set_contents(uwp_warm_busy_path, count, -1, NULL);
         /* the driver compiles in parallel: several threads finish before the logo needs them */
-        uwp_warm_done = 0;
         uwp_warm_threads_left = UWP_WARM_THREADS;
         for (int t = 0; t < UWP_WARM_THREADS; t++) {
             UwpWarmJob *job = g_new(UwpWarmJob, 1);
