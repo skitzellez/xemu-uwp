@@ -28,6 +28,7 @@ bool xemu_uwp_skip_draws;
 unsigned int xemu_uwp_prim_hist[16];
 #endif
 #include "qemu/xemu-uwp.h"
+#include "../texsigns.h"
 
 void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
 {
@@ -211,12 +212,20 @@ void pgraph_gl_draw_begin(NV2AState *d)
                                     NV_PGRAPH_BLEND_DFACTOR);
         assert(sfactor < ARRAY_SIZE(pgraph_blend_factor_gl_map));
         assert(dfactor < ARRAY_SIZE(pgraph_blend_factor_gl_map));
-        glBlendFunc(pgraph_blend_factor_gl_map[sfactor],
-                    pgraph_blend_factor_gl_map[dfactor]);
 
         uint32_t equation = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_BLEND),
                                      NV_PGRAPH_BLEND_EQN);
         assert(equation < ARRAY_SIZE(pgraph_blend_equation_gl_map));
+        bool signed_rgb;
+        equation = texsigns_blend_equation(equation, &signed_rgb);
+        if (signed_rgb) {
+            glBlendFuncSeparate(GL_ONE_MINUS_SRC_COLOR, GL_ONE,
+                                pgraph_blend_factor_gl_map[sfactor],
+                                pgraph_blend_factor_gl_map[dfactor]);
+        } else {
+            glBlendFunc(pgraph_blend_factor_gl_map[sfactor],
+                        pgraph_blend_factor_gl_map[dfactor]);
+        }
         glBlendEquation(pgraph_blend_equation_gl_map[equation]);
 
         uint32_t blend_color = pgraph_reg_r(pg, NV_PGRAPH_BLENDCOLOR);

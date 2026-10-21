@@ -28,6 +28,39 @@
 #include "hw/xbox/nv2a/nv2a_regs.h"
 #include "qemu/xemu-uwp.h"
 
+/*
+ * Signed blend equations (upstream xemu #996: headlight glow drawn as a solid white area). The source
+ * is read as two's complement, so a white source adds almost nothing. Approach of upstream xemu PR #1901
+ * (polymetal0), checked there against nxdk_pgraph_tests hardware results.
+ */
+uint32_t texsigns_blend_equation(uint32_t equation, bool *signed_rgb)
+{
+    *signed_rgb = false;
+    if (equation != 5 && equation != 6) {
+        return equation;
+    }
+#ifdef XEMU_UWP
+    static int off = -1;
+    if (off < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        off = xemu_uwp_test_file_exists("signed-blend-off.txt");
+        if (off) {
+            uwp_log("blend test: signed blend equations as plain add/subtract (signed-blend-off.txt)");
+        }
+    }
+    if (off) {
+        return equation;
+    }
+    static bool noted;
+    if (!noted) {
+        noted = true;
+        uwp_log("signed blending: first draw with %s", equation == 6 ? "ADD_SIGNED" : "REVERSE_SUBTRACT_SIGNED");
+    }
+#endif
+    *signed_rgb = true;
+    return equation == 5 ? 6 : 5;
+}
+
 uint8_t texsigns_channel_signs(uint32_t filter)
 {
 #ifdef XEMU_UWP

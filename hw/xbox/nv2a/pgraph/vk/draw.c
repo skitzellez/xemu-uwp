@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qemu/fast-hash.h"
 #include "renderer.h"
+#include "../texsigns.h"
 #include <math.h>
 
 void pgraph_vk_draw_begin(NV2AState *d)
@@ -908,6 +909,12 @@ static void create_pipeline(PGRAPHState *pg)
         uint32_t equation =
             GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_BLEND), NV_PGRAPH_BLEND_EQN);
         assert(equation < ARRAY_SIZE(pgraph_blend_equation_vk_map));
+        bool signed_rgb;
+        equation = texsigns_blend_equation(equation, &signed_rgb);
+        if (signed_rgb) {
+            color_blend_attachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+            color_blend_attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        }
 
         color_blend_attachment.colorBlendOp =
             pgraph_blend_equation_vk_map[equation];

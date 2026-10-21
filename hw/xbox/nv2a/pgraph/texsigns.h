@@ -4,6 +4,10 @@
 void texsigns_init_conversion(void);
 /* the sign bits of a NV_PGRAPH_TEXFILTER0 value as TEX_CHANNEL_* (0 with test file signed-tex-off.txt) */
 uint8_t texsigns_channel_signs(uint32_t filter);
+/* blend equation as the GL/Vulkan maps index it: the two signed equations (5 = REVERSE_SUBTRACT_SIGNED,
+ * 6 = ADD_SIGNED) swapped, and *signed_rgb set when the RGB source factor must become ONE_MINUS_SRC_COLOR
+ * and the RGB destination factor ONE (test file signed-blend-off.txt: as before) */
+uint32_t texsigns_blend_equation(uint32_t equation, bool *signed_rgb);
 void texsigns_inplace_to_unsigned_rgba(uint8_t *data, int len, int channel_signs);
 
 uint8_t *texsigns_convert_argb1555(
