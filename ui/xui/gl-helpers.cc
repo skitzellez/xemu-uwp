@@ -958,8 +958,19 @@ void RenderFramebuffer(GLint tex, int width, int height, bool flip)
     } else if (g_config.display.ui.fit == CONFIG_DISPLAY_UI_FIT_CENTER) {
         // Centered
         float t_ratio = GetDisplayAspectRatio(tw, th);
+#ifdef XEMU_UWP
+        /* the game's own picture times the largest whole number that fits the TV: sharp, and the same size
+         * at every render scale. 1:1 texels made it a 640x480 box at 1x and shrank it whenever the render
+         * scale was lowered while playing (Game Vault's Xemu setup offers Center to players). */
+        float gh = (float)th / (float)std::max(nv2a_get_surface_scale_factor(), 1u);
+        int k = (int)std::min((float)height / gh, (float)width / (t_ratio * gh));
+        float sh = gh * (float)std::max(k, 1);
+        scale[0] = std::min(t_ratio * sh / (float)width, 1.0f);
+        scale[1] = std::min(sh / (float)height, 1.0f);
+#else
         scale[0] = t_ratio*(float)th/(float)width;
         scale[1] = (float)th/(float)height;
+#endif
     } else {
         float t_ratio = GetDisplayAspectRatio(tw, th);
         float w_ratio = (float)width/(float)height;
