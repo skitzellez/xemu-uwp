@@ -2167,6 +2167,22 @@ static void uwp_prefetch_color(NV2AState *d, SurfaceBinding *surface)
     if (!e->words && (pg->surface_scale_factor != 1 || surface->fmt.bytes_per_pixel != 4)) {
         return;   /* glReadPixels below reads 32-bit at 1x only: read back when the CPU asks, as before */
     }
+    /*
+     * Test file ra-fence.txt: a fence right after the read-ahead, so that the CPU's read waits for this
+     * much only. Without it the fence is made when the CPU waits (uwp_wb_fence_for_oldest), at the end of
+     * everything queued since (Power Drome's races: 21% of the time in that wait).
+     */
+    static int ra_fence = -1;
+    if (ra_fence < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        ra_fence = xemu_uwp_test_file_exists("ra-fence.txt");
+        if (ra_fence) {
+            uwp_log("colour read-ahead test: a fence after each (ra-fence.txt)");
+        }
+    }
+    if (ra_fence && e->words) {
+        e->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    }
     static int verify = -1;
     if (verify < 0) {
         extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
