@@ -2782,13 +2782,56 @@ static struct {
     unsigned frames, quiet;
 } uwp_watch = { .on = true };
 
+/*
+ * Some players' own BIOS files never show anything, not even the Xbox start-up animation (reports 2026-10-21:
+ * four BIOS dumps on two consoles, 17 starts of 6 games, all black; the same games drew with other dumps). They
+ * were told "this game did not start" for every game. A mark per BIOS file (bios_ok_<md5>.txt next to xemu.toml)
+ * is written the first time it shows a picture; a black start with a BIOS that never did names the file as the
+ * likely cause. uwp_bios_ok -1: not known (free BIOS, or the file could not be read).
+ */
+static int uwp_bios_ok = -2; /* -2: not looked at yet */
+static char *uwp_bios_mark;
+static void uwp_bios_check(void)
+{
+    if (uwp_bios_ok != -2) {
+        return;
+    }
+    uwp_bios_ok = -1;
+    const char *f = g_config.sys.files.flashrom_path;
+    gchar *data = NULL;
+    gsize len = 0;
+    if (!f || !*f || strstr(f, "SpiritBoot") || !g_file_get_contents(f, &data, &len, NULL)) {
+        return;
+    }
+    gchar *md5 = g_compute_checksum_for_data(G_CHECKSUM_MD5, (const guchar *)data, len);
+    g_free(data);
+    uwp_bios_mark = g_strdup_printf("%sbios_ok_%s.txt", xemu_settings_get_base_path(), md5);
+    uwp_bios_ok = g_file_test(uwp_bios_mark, G_FILE_TEST_EXISTS) ? 1 : 0;
+    uwp_log("BIOS md5 %s (%u KB): %s", md5, (unsigned)(len >> 10),
+            uwp_bios_ok ? "has shown a picture on this console before" : "no picture seen with it yet");
+    g_free(md5);
+}
+
+static void uwp_bios_drew(void)
+{
+    uwp_bios_check();
+    if (uwp_bios_ok == 0) {
+        g_file_set_contents(uwp_bios_mark, "", 0, NULL);
+        uwp_bios_ok = 1;
+    }
+}
+
 /* what the player reads on the black screen */
 static void uwp_watch_tell(void)
 {
     bool free_bios = strstr(g_config.sys.files.flashrom_path ? g_config.sys.files.flashrom_path : "", "SpiritBoot");
+    uwp_bios_check();
     xemu_queue_notification(free_bios
         ? "No picture: the free Xbox BIOS cannot start this game yet.\n"
           "Hold View + Menu, then add your own BIOS in Game Vault: Options, Xbox setup"
+        : uwp_bios_ok == 0
+        ? "No picture: your Xbox BIOS file has not started anything yet, it may not work in xemu.\n"
+          "Hold View + Menu, then add another BIOS dump in Game Vault: Options, Xbox setup"
         : "No picture: this game did not start in xemu.\n"
           "Hold View + Menu to go back to Game Vault");
 }
@@ -2822,6 +2865,7 @@ static void uwp_watch_second(void)
         g_free(f);
         SDL_free(own);
     }
+    uwp_bios_check();   /* once: its md5 goes into the log */
     if (!uwp_watch.on || uwp_background_since_ms(false, false) || !runstate_is_running()) {
         return;
     }
@@ -2830,6 +2874,7 @@ static void uwp_watch_second(void)
     }
     if (g_nv2a_stats.frame_count != uwp_watch.frames) {
         uwp_watch.on = false;   /* a picture: the start worked */
+        uwp_bios_drew();
         return;
     }
     if (++uwp_watch.quiet < 25) {
@@ -2842,7 +2887,9 @@ static void uwp_watch_second(void)
         return;
     }
     if (uwp_watch.restarted) {
-        uwp_event("still no picture 25 s after the restart: this game may not start in xemu yet");
+        uwp_bios_check();
+        uwp_event(uwp_bios_ok == 0 ? "still no picture 25 s after the restart: this BIOS file never showed one"
+                                   : "still no picture 25 s after the restart: this game may not start in xemu yet");
         uwp_watch.gave_up = true;   /* watched on: a late first frame still ends it, and the player is told */
         uwp_watch_tell();
         return;
