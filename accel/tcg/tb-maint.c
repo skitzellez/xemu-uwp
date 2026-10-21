@@ -906,10 +906,32 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
     CPUState *cpu;
 
     if (tb_cflags(tb) & CF_PCREL) {
+#ifdef XEMU_UWP
+        /*
+         * Only the entries that hold this TB. Emptying the whole cache for each
+         * TB made every jump after it look its target up again: Xbox games
+         * invalidate 300-700 TBs a second (code and data share pages), each
+         * followed by thousands of hash-table lookups. Going over the entries
+         * costs about the same as clearing them.
+         */
+        CPU_FOREACH(cpu) {
+            CPUJumpCache *jc = cpu->tb_jmp_cache;
+
+            if (unlikely(jc == NULL)) {
+                continue;
+            }
+            for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
+                if (qatomic_read(&jc->array[i].tb) == tb) {
+                    qatomic_set(&jc->array[i].tb, NULL);
+                }
+            }
+        }
+#else
         /* A TB may be at any virtual address */
         CPU_FOREACH(cpu) {
             tcg_flush_jmp_cache(cpu);
         }
+#endif
     } else {
         uint32_t h = tb_jmp_cache_hash_func(tb->pc);
 
