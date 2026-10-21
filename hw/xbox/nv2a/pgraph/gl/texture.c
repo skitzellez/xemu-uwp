@@ -957,9 +957,15 @@ static bool uwp_texture_refill(TextureBinding *binding, const TextureShape s, co
     UWP_PROF_BEGIN(t0);
     uint8_t *converted = pgraph_convert_texture_data(s, texture_data, palette_data, s.width, s.height, 1, s.pitch,
                                                      0, NULL);
+    /* converted data has its own layout (RGBA8 or RGBA16, as upload_gl_texture gives it), not the table's */
+    GLint conv_ifmt;
+    GLenum gl_format = f.gl_format, gl_type = f.gl_type;
+    if (converted) {
+        get_converted_gl_format(&s, &conv_ifmt, &gl_format, &gl_type);
+    }
     glBindTexture(GL_TEXTURE_2D, binding->gl_texture);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, converted ? 0 : s.pitch / f.bytes_per_pixel);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s.width, s.height, f.gl_format, f.gl_type,
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, s.width, s.height, gl_format, gl_type,
                     converted ? converted : texture_data);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     g_free(converted);
