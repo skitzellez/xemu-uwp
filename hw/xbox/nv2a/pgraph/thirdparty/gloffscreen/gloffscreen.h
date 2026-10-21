@@ -48,6 +48,9 @@ GloContext *glo_context_create(void);
 /* Destroy a previously created OpenGL context */
 void glo_context_destroy(GloContext *context);
 
+/* Destroy a context with its GL context (glo_context_destroy keeps the GL context alive) */
+void glo_context_destroy_gl(GloContext *context);
+
 void glo_readpixels(GLenum gl_format, GLenum gl_type,
                     unsigned int bytes_per_pixel, unsigned int stride,
                     unsigned int width, unsigned int height, bool vflip,

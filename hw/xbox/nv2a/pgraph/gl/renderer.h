@@ -110,6 +110,9 @@ typedef struct ShaderModuleCacheEntry {
     LruNode node;
     ShaderModuleCacheKey key;
     GLuint gl_shader;
+#ifdef XEMU_UWP
+    uint64_t uwp_text_hash; /* of its GLSL text: counts programs whose source repeats another's (shaders.c) */
+#endif
 } ShaderModuleCacheEntry;
 
 typedef struct ShaderBinding {
@@ -223,6 +226,9 @@ typedef struct PGRAPHGLState {
 
     Lru shader_module_cache;
     ShaderModuleCacheEntry *shader_module_cache_entries;
+    /* guards shader_module_cache on its own, so the shader warm-up threads can build programs without
+       shader_cache_lock, which the game's draws take. Order: shader_cache_lock, then this one. */
+    QemuMutex shader_module_lock;
 
     unsigned int zpass_pixel_count_result;
     unsigned int gl_zpass_pixel_count_query_count;

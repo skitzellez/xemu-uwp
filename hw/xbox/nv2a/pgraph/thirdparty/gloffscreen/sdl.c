@@ -108,3 +108,11 @@ void glo_context_destroy(GloContext *context)
     glo_set_current(NULL);
     free(context);
 }
+
+void glo_context_destroy_gl(GloContext *context)
+{
+    if (!context) return;
+    glo_set_current(NULL);
+    SDL_GL_DestroyContext(context->gl_context);
+    free(context);
+}

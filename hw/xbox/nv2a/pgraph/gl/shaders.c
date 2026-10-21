@@ -162,6 +162,10 @@ static void shader_module_cache_entry_init(Lru *lru, LruNode *node,
 
     module->gl_shader =
         create_gl_shader(module->key.kind, mstring_get_str(code), kind_str);
+#ifdef XEMU_UWP
+    module->uwp_text_hash =
+        fast_hash((const uint8_t *)mstring_get_str(code), strlen(mstring_get_str(code)));
+#endif
     mstring_unref(code);
 }
 
@@ -180,29 +184,68 @@ static bool shader_module_cache_entry_compare(Lru *lru, LruNode *node,
     return memcmp(&module->key, key, sizeof(ShaderModuleCacheKey));
 }
 
-static GLuint get_shader_module_for_key(PGRAPHGLState *r,
-                                        const ShaderModuleCacheKey *key)
+/* attaches the module of key to program; shader_module_lock held */
+static uint64_t attach_shader_module(PGRAPHGLState *r, GLuint program,
+                                     const ShaderModuleCacheKey *key)
 {
     uint64_t hash = fast_hash((void *)key, sizeof(ShaderModuleCacheKey));
     LruNode *node = lru_lookup(&r->shader_module_cache, hash, key);
     ShaderModuleCacheEntry *module =
         container_of(node, ShaderModuleCacheEntry, node);
-    return module->gl_shader;
+    glAttachShader(program, module->gl_shader);
+#ifdef XEMU_UWP
+    return module->uwp_text_hash;
+#else
+    return 0;
+#endif
 }
 
-static void generate_shaders(PGRAPHGLState *r, ShaderBinding *binding)
+#ifdef XEMU_UWP
+/*
+ * Measuring aid: how many linked programs repeat the GLSL source of one linked before. Each one costs the
+ * whole compile again in Mesa (link, NIR, DXIL) although the console's driver reuses its compile of the same
+ * bytecode; if many repeat, programs can be shared by their source. Logged every 50 programs.
+ * shader_module_lock held.
+ */
+static void uwp_note_program_source(uint64_t vs, uint64_t gs, uint64_t fs)
+{
+    static GHashTable *seen;
+    static int made, repeats;
+    if (!seen) {
+        seen = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+    }
+    uint64_t key[3] = { vs, gs, fs };
+    gint64 *h = g_new(gint64, 1);
+    *h = (gint64)fast_hash((const uint8_t *)key, sizeof(key));
+    if (g_hash_table_contains(seen, h)) {
+        repeats++;
+        g_free(h);
+    } else {
+        g_hash_table_add(seen, h);
+    }
+    if (++made % 50 == 0) {
+        uwp_log("shader programs: %d linked, %d of them repeat the source of an earlier one", made, repeats);
+    }
+}
+#endif
+
+/*
+ * Makes and links the program of state. Only the module cache is shared, under its own lock, so the shader
+ * warm-up threads build programs here without shader_cache_lock.
+ */
+static GLuint link_shader_program(PGRAPHGLState *r, const ShaderState *state)
 {
     GLuint program = glCreateProgram();
-
-    ShaderState *state = &binding->state;
     ShaderModuleCacheKey key;
+    uint64_t gs_text = 0;
 
+    qemu_mutex_lock(&r->shader_module_lock);
     bool need_geometry_shader = pgraph_glsl_need_geom(&state->geom);
     if (need_geometry_shader) {
         memset(&key, 0, sizeof(key));
         key.kind = GL_GEOMETRY_SHADER;
         key.geom.state = state->geom;
-        glAttachShader(program, get_shader_module_for_key(r, &key));
+        gs_text = attach_shader_module(r, program, &key);
     }
 
     /* create the vertex shader */
@@ -210,13 +253,21 @@ static void generate_shaders(PGRAPHGLState *r, ShaderBinding *binding)
     key.kind = GL_VERTEX_SHADER;
     key.vsh.state = state->vsh;
     key.vsh.glsl_opts.prefix_outputs = need_geometry_shader;
-    glAttachShader(program, get_shader_module_for_key(r, &key));
+    uint64_t vs_text = attach_shader_module(r, program, &key);
 
     /* generate a fragment shader from register combiners */
     memset(&key, 0, sizeof(key));
     key.kind = GL_FRAGMENT_SHADER;
     key.psh.state = state->psh;
-    glAttachShader(program, get_shader_module_for_key(r, &key));
+    uint64_t fs_text = attach_shader_module(r, program, &key);
+#ifdef XEMU_UWP
+    uwp_note_program_source(vs_text, gs_text, fs_text);
+#else
+    (void)gs_text;
+    (void)vs_text;
+    (void)fs_text;
+#endif
+    qemu_mutex_unlock(&r->shader_module_lock);
 
     /* link the program */
     glLinkProgram(program);
@@ -228,6 +279,13 @@ static void generate_shaders(PGRAPHGLState *r, ShaderBinding *binding)
         fprintf(stderr, "nv2a: shader linking failed: %s\n", log);
         abort();
     }
+    return program;
+}
+
+/* fills in binding for its linked program; program becomes current in the calling thread's context */
+static void finish_shader_binding(ShaderBinding *binding, GLuint program)
+{
+    ShaderState *state = &binding->state;
 
     glUseProgram(program);
 
@@ -250,6 +308,11 @@ static void generate_shaders(PGRAPHGLState *r, ShaderBinding *binding)
     }
 
     update_shader_uniform_locs(binding);
+}
+
+static void generate_shaders(PGRAPHGLState *r, ShaderBinding *binding)
+{
+    finish_shader_binding(binding, link_shader_program(r, &binding->state));
 }
 
 static const char *shader_gl_vendor = NULL;
@@ -588,10 +651,12 @@ static void uwp_shader_cache_trim(PGRAPHGLState *r)
     while (freed < want && lru_try_evict_one(&r->shader_cache)) {
         freed++;
     }
+    qemu_mutex_lock(&r->shader_module_lock);
     int mkept = r->shader_module_cache.num_used, mwant = mkept / 4, mfreed = 0;
     while (mfreed < mwant && lru_try_evict_one(&r->shader_module_cache)) {
         mfreed++;
     }
+    qemu_mutex_unlock(&r->shader_module_lock);
     uwp_log("shader cache: %llu MB in use, %llu MB still allowed: %d of %d programs and %d of %d modules freed",
             (unsigned long long)(used >> 20), (unsigned long long)(left >> 20), freed, kept, mfreed, mkept);
 }
@@ -602,6 +667,7 @@ void pgraph_gl_init_shaders(PGRAPHState *pg)
     PGRAPHGLState *r = pg->gl_renderer_state;
 
     qemu_mutex_init(&r->shader_cache_lock);
+    qemu_mutex_init(&r->shader_module_lock);
     qemu_event_init(&r->shader_cache_writeback_complete, false);
 
     if (!shader_gl_vendor) {
@@ -660,6 +726,7 @@ void pgraph_gl_finalize_shaders(PGRAPHState *pg)
     g_free(r->shader_module_cache_entries);
     r->shader_module_cache_entries = NULL;
 
+    qemu_mutex_destroy(&r->shader_module_lock);
     qemu_mutex_destroy(&r->shader_cache_lock);
 }
 
@@ -1342,12 +1409,22 @@ static void *uwp_warm_thread(void *arg)
         qemu_mutex_lock(&r->shader_cache_lock);
         LruNode *node = lru_lookup(&r->shader_cache, hash, &rec->state);
         ShaderBinding *binding = container_of(node, ShaderBinding, node);
-        if (!binding->initialized) {
-            generate_shaders(r, binding);
+        GLuint program = binding->initialized ? binding->gl_program : 0;
+        qemu_mutex_unlock(&r->shader_cache_lock);
+        /*
+         * A new program is built and drawn here without shader_cache_lock (0.9.956): the game's draws take
+         * that lock for every shader change, and a build held it for the whole compile, so a game running
+         * beside the background warm-up waited on shaders it did not even need. The program goes into the
+         * cache afterwards; if the game built the same one meanwhile, ours is thrown away.
+         */
+        ShaderBinding *made = NULL;
+        if (!program) {
+            made = g_new0(ShaderBinding, 1);
+            made->state = rec->state;
+            finish_shader_binding(made, link_shader_program(r, &rec->state));
+            program = made->gl_program;
             built++;
         }
-        GLuint program = binding->gl_program;
-        qemu_mutex_unlock(&r->shader_cache_lock);
         glUseProgram(program);
         if (uwp_warm_replay(&rec->pipe, fbo, vao)) {
             drawn++;
@@ -1355,6 +1432,24 @@ static void *uwp_warm_thread(void *arg)
             failed++;
         }
         glFlush(); /* hand each draw to the driver now, so its compiles start in order */
+        if (made) {
+            qemu_mutex_lock(&r->shader_cache_lock);
+            node = lru_lookup(&r->shader_cache, hash, &rec->state);
+            binding = container_of(node, ShaderBinding, node);
+            bool took = !binding->initialized;
+            if (took) {
+                binding->gl_program = made->gl_program;
+                binding->gl_primitive_mode = made->gl_primitive_mode;
+                binding->uniform_locs = made->uniform_locs;
+                binding->initialized = true;
+            }
+            qemu_mutex_unlock(&r->shader_cache_lock);
+            if (!took) {
+                glUseProgram(0);
+                glDeleteProgram(made->gl_program);
+            }
+            g_free(made);
+        }
         qatomic_inc(&uwp_warm_done);
     }
     glFinish();
@@ -1362,7 +1457,15 @@ static void *uwp_warm_thread(void *arg)
     glDeleteFramebuffers(1, &fbo);
     glDeleteVertexArrays(1, &vao);
     glDeleteBuffers(1, &buf);
-    glo_set_current(NULL);
+    glUseProgram(0);
+    /*
+     * The context goes now (0.9.956). In the GL-on-D3D12 driver each context keeps its own pipelines, so this
+     * one's were never used by the game, which makes its own (the console's driver keeps the compiled shaders
+     * after a pipeline is freed: PSO probe 5, 0.04 ms to make it again), and they stayed for the whole run.
+     */
+    GloContext *ctx = g_uwp_warm_context[job->index];
+    g_uwp_warm_context[job->index] = NULL;
+    glo_context_destroy_gl(ctx);
     uwp_log("shader warm-up thread %d: %d shaders built, %d draws replayed, %d skipped, "
             "done at %lld ms", job->index, built, drawn, failed,
             (long long)(qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - uwp_warm_start_ms));
