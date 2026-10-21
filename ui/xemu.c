@@ -4333,6 +4333,60 @@ static char *uwp_take_activation_disc(void)
                 g_strlcpy(uwp_warm_key, v, sizeof(uwp_warm_key));
             }
         }
+        /* Game Vault's Xemu setup (Options > Games): xemu's own settings, sent only when the player changed them there */
+        if (!strcmp(p, "skipboot=1") || !strcmp(p, "skipboot=0")) {
+            g_config.general.skip_boot_anim = p[9] == '1';
+            uwp_log("link: skip startup animation %s", p[9] == '1' ? "on" : "off");
+        }
+        if (!strcmp(p, "rumble=1") || !strcmp(p, "rumble=0")) {
+            extern bool xemu_uwp_rumble_off; /* ui/xemu-input.c */
+            xemu_uwp_rumble_off = p[7] == '0';
+            uwp_log("link: rumble %s", p[7] == '1' ? "on" : "off");
+        }
+        if (!strncmp(p, "scale=", 6)) {
+            int v = atoi(p + 6);
+            if (v >= 1 && v <= 10) {
+                g_config.display.quality.surface_scale = v;
+                uwp_log("link: internal resolution scale %dx", v);
+            }
+        }
+        if (!strncmp(p, "aspect=", 7)) {
+            const char *v = p + 7;
+            int a = !strcmp(v, "native") ? CONFIG_DISPLAY_UI_ASPECT_RATIO_NATIVE
+                    : !strcmp(v, "auto") ? CONFIG_DISPLAY_UI_ASPECT_RATIO_AUTO
+                    : !strcmp(v, "4x3")  ? CONFIG_DISPLAY_UI_ASPECT_RATIO_4X3
+                    : !strcmp(v, "16x9") ? CONFIG_DISPLAY_UI_ASPECT_RATIO_16X9 : -1;
+            if (a >= 0) {
+                g_config.display.ui.aspect_ratio = a;
+                uwp_log("link: aspect ratio %s", v);
+            }
+        }
+        if (!strncmp(p, "pad=", 4)) {
+            /* Controller mapping: 15 host buttons (0-14, SDL gamepad order) for xemu's 15 emulated buttons, '-'
+               between them, then '.' and four 0/1 for the inverted axes (left X, left Y, right X, right Y) */
+            int btn[15];
+            bool inv[4];
+            const char *c = p + 4;
+            bool ok = true;
+            for (int i = 0; i < 15 && ok; i++) {
+                char *e;
+                long v = strtol(c, &e, 10);
+                ok = e != c && v >= 0 && v <= 14 && *e == (i < 14 ? '-' : '.');
+                btn[i] = (int)v;
+                c = e + 1;
+            }
+            for (int i = 0; i < 4 && ok; i++) {
+                ok = c[i] == '0' || c[i] == '1';
+                inv[i] = c[i] == '1';
+            }
+            if (ok && !c[4]) {
+                extern void xemu_uwp_set_pad_map(const int btn[15], const bool invert[4]); /* ui/xemu-input.c */
+                xemu_uwp_set_pad_map(btn, inv);
+                uwp_log("link: controller mapping %s", p + 4);
+            } else {
+                uwp_log("link: controller mapping refused");
+            }
+        }
         if (!strncmp(p, "fit=", 4)) {
             /* how the picture fills the TV, chosen in Game Vault (Menu > Picture): for this session only */
             const char *v = p + 4;

@@ -527,6 +527,40 @@ uint64_t xemu_uwp_held_until;
  * left the menu with no buttons at all (0.9.195.0, Faisal: "I cant press anything on xemu settings").
  */
 bool xemu_uwp_menu_open;
+bool xemu_uwp_rumble_off;   /* "rumble=0" in the launch link (ui/xemu.c) */
+
+/*
+ * The button map from Game Vault's Xemu setup (Controller mapping), "pad=" in the launch link: for every gamepad,
+ * this session only. It is laid over a copy of the controller's own map when the buttons are read, so xemu.toml
+ * keeps the map the player set in xemu's own menu.
+ */
+static bool uwp_pad_on;
+static int uwp_pad_btn[15];      /* host button per emulated button, in the order of xemu's mapping table */
+static bool uwp_pad_invert[4];   /* left X, left Y, right X, right Y */
+
+void xemu_uwp_set_pad_map(const int btn[15], const bool invert[4]);
+void xemu_uwp_set_pad_map(const int btn[15], const bool invert[4])
+{
+    memcpy(uwp_pad_btn, btn, sizeof(uwp_pad_btn));
+    memcpy(uwp_pad_invert, invert, sizeof(uwp_pad_invert));
+    uwp_pad_on = true;
+}
+
+static void uwp_pad_over(struct controller_mapping *m)
+{
+    if (!uwp_pad_on) {
+        return;
+    }
+    int *b[15] = { &m->a, &m->b, &m->x, &m->y, &m->back, &m->guide, &m->start, &m->lstick_btn, &m->rstick_btn,
+                   &m->lshoulder, &m->rshoulder, &m->dpad_up, &m->dpad_down, &m->dpad_left, &m->dpad_right };
+    for (int i = 0; i < 15; i++) {
+        *b[i] = uwp_pad_btn[i];
+    }
+    m->invert_axis_left_x = uwp_pad_invert[0];
+    m->invert_axis_left_y = uwp_pad_invert[1];
+    m->invert_axis_right_x = uwp_pad_invert[2];
+    m->invert_axis_right_y = uwp_pad_invert[3];
+}
 
 bool xemu_uwp_game_input_held(const ControllerState *state)
 {
@@ -737,11 +771,15 @@ void xemu_input_update_sdl_controller_state(ControllerState *state)
 {
     state->buttons = 0;
     memset(state->axis, 0, sizeof(state->axis));
+    struct controller_mapping map = state->controller_map->controller_mapping;
+#ifdef XEMU_UWP
+    uwp_pad_over(&map);
+#endif
 
 #define SDL_MASK_BUTTON(state, btn, idx)                  \
     (SDL_GetGamepadButton(                                \
          (state)->sdl_gamepad,                            \
-         (state)->controller_map->controller_mapping.btn) \
+         map.btn) \
      << idx)
 
     state->buttons |= SDL_MASK_BUTTON(state, a, 0);
@@ -765,7 +803,7 @@ void xemu_input_update_sdl_controller_state(ControllerState *state)
 #define SDL_GET_AXIS(state, axis)    \
     SDL_GetGamepadAxis(              \
         (state)->sdl_gamepad,        \
-        (state)->controller_map->controller_mapping.axis)
+        map.axis)
 
     state->axis[0] = SDL_GET_AXIS(state, axis_trigger_left);
     state->axis[1] = SDL_GET_AXIS(state, axis_trigger_right);
@@ -816,19 +854,19 @@ void xemu_input_update_sdl_controller_state(ControllerState *state)
 #define INVERT_AXIS(controller_axis) \
     state->axis[controller_axis] = -1 - state->axis[controller_axis]
 
-    if (state->controller_map->controller_mapping.invert_axis_left_x) {
+    if (map.invert_axis_left_x) {
         INVERT_AXIS(CONTROLLER_AXIS_LSTICK_X);
     }
 
-    if (!state->controller_map->controller_mapping.invert_axis_left_y) {
+    if (!map.invert_axis_left_y) {
         INVERT_AXIS(CONTROLLER_AXIS_LSTICK_Y);
     }
 
-    if (state->controller_map->controller_mapping.invert_axis_right_x) {
+    if (map.invert_axis_right_x) {
         INVERT_AXIS(CONTROLLER_AXIS_RSTICK_X);
     }
 
-    if (!state->controller_map->controller_mapping.invert_axis_right_y) {
+    if (!map.invert_axis_right_y) {
         INVERT_AXIS(CONTROLLER_AXIS_RSTICK_Y);
     }
 
@@ -846,6 +884,11 @@ void xemu_input_update_rumble(ControllerState *state)
     if (!state->controller_map->enable_rumble) {
         return;
     }
+#ifdef XEMU_UWP
+    if (xemu_uwp_rumble_off) {   /* Rumble off in Game Vault's Xemu setup */
+        return;
+    }
+#endif
 
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
     if (ABS(now - state->last_rumble_updated_ts) <
