@@ -4048,7 +4048,63 @@ static void uwp_log_memory(void)
 static char *uwp_toml_bootrom, *uwp_toml_bios, *uwp_toml_hdd, *uwp_toml_eeprom;
 static bool uwp_toml_remembered;
 
+/*
+ * Settings Game Vault's Xemu setup sends with each game (skipboot=, scale=, aspect=, fit=) are for that session:
+ * xemu.toml keeps the player's own value. They were written into it when xemu closed, so a row later set back to
+ * "untouched" in Game Vault left xemu on Game Vault's last value instead of the player's (a test with scale=2
+ * changed the owner's 4x to 2x). A value the player changed in xemu's own menu during the session is saved.
+ */
+typedef struct {
+    bool set;
+    int toml, link;
+} UwpLinkSetting;
+static UwpLinkSetting uwp_ov_skipboot, uwp_ov_scale, uwp_ov_aspect, uwp_ov_fit;
+
+static void uwp_link_setting(UwpLinkSetting *o, int now, int link)
+{
+    if (!o->set) {
+        o->set = true;
+        o->toml = now;
+    }
+    o->link = link;
+}
+
+/* swap: xemu.toml's own values in before saving (back = false), the session's values back after (true) */
+static void uwp_link_settings_swap(bool back)
+{
+    static int saved[4];
+    UwpLinkSetting *o[4] = { &uwp_ov_skipboot, &uwp_ov_scale, &uwp_ov_aspect, &uwp_ov_fit };
+    int cur[4] = { g_config.general.skip_boot_anim, g_config.display.quality.surface_scale,
+                   g_config.display.ui.aspect_ratio, g_config.display.ui.fit };
+    for (int i = 0; i < 4; i++) {
+        int v = cur[i];
+        if (!back) {
+            saved[i] = cur[i];
+            if (o[i]->set && cur[i] == o[i]->link) {
+                v = o[i]->toml;
+            }
+        } else {
+            v = saved[i];
+        }
+        switch (i) {
+        case 0: g_config.general.skip_boot_anim = v; break;
+        case 1: g_config.display.quality.surface_scale = v; break;
+        case 2: g_config.display.ui.aspect_ratio = v; break;
+        default: g_config.display.ui.fit = v; break;
+        }
+    }
+}
+
+static void uwp_save_settings_paths(void);
+
 static void uwp_save_settings(void)
+{
+    uwp_link_settings_swap(false);
+    uwp_save_settings_paths();
+    uwp_link_settings_swap(true);
+}
+
+static void uwp_save_settings_paths(void)
 {
     if (!uwp_toml_remembered) {
         xemu_settings_save();
@@ -4396,6 +4452,7 @@ static char *uwp_take_activation_disc(void)
         }
         /* Game Vault's Xemu setup (Options > Games): xemu's own settings, sent only when the player changed them there */
         if (!strcmp(p, "skipboot=1") || !strcmp(p, "skipboot=0")) {
+            uwp_link_setting(&uwp_ov_skipboot, g_config.general.skip_boot_anim, p[9] == '1');
             g_config.general.skip_boot_anim = p[9] == '1';
             uwp_log("link: skip startup animation %s", p[9] == '1' ? "on" : "off");
         }
@@ -4407,6 +4464,7 @@ static char *uwp_take_activation_disc(void)
         if (!strncmp(p, "scale=", 6)) {
             int v = atoi(p + 6);
             if (v >= 1 && v <= 10) {
+                uwp_link_setting(&uwp_ov_scale, g_config.display.quality.surface_scale, v);
                 g_config.display.quality.surface_scale = v;
                 uwp_log("link: internal resolution scale %dx", v);
             }
@@ -4418,6 +4476,7 @@ static char *uwp_take_activation_disc(void)
                     : !strcmp(v, "4x3")  ? CONFIG_DISPLAY_UI_ASPECT_RATIO_4X3
                     : !strcmp(v, "16x9") ? CONFIG_DISPLAY_UI_ASPECT_RATIO_16X9 : -1;
             if (a >= 0) {
+                uwp_link_setting(&uwp_ov_aspect, g_config.display.ui.aspect_ratio, a);
                 g_config.display.ui.aspect_ratio = a;
                 uwp_log("link: aspect ratio %s", v);
             }
@@ -4455,6 +4514,7 @@ static char *uwp_take_activation_disc(void)
                       : !strcmp(v, "scale")  ? CONFIG_DISPLAY_UI_FIT_SCALE
                       : !strcmp(v, "center") ? CONFIG_DISPLAY_UI_FIT_CENTER : -1;
             if (fit >= 0) {
+                uwp_link_setting(&uwp_ov_fit, g_config.display.ui.fit, fit);
                 g_config.display.ui.fit = fit;
                 uwp_log("link: picture %s", v);
             } else {
