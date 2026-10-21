@@ -2867,12 +2867,15 @@ static void uwp_watch_second(void)
  * is ready, with the progress on screen (ui/xui/main.cc); B starts the game at once, the rest then goes on in
  * the background as before. A first run has no list and starts straight away. The no-picture watch does not
  * count while the console is held (it only counts while running).
+ * Experimental, off unless the link has prep=1 (Game Vault: Xemu setup, Experimental): without it xemu starts
+ * games as before the start screen existed (0.9.947).
  */
 #define UWP_PREP_MAX_MS 180000 /* a safety limit; the warm-up also stops by itself with 1.5 GB left */
 bool xemu_uwp_warm_status(int *done, int *total); /* gl/shaders.c */
 bool xemu_uwp_prep_on;      /* the start screen is shown (ui/xui/main.cc) */
 int xemu_uwp_prep_done, xemu_uwp_prep_total;
 static enum { UWP_PREP_START, UWP_PREP_HOLD, UWP_PREP_OVER } uwp_prep;
+static bool uwp_prep_wanted; /* link prep=1 */
 static uint64_t uwp_prep_t0;
 
 /* each UI frame until it is over; returns how long the console was held, once, when it ends */
@@ -2885,6 +2888,9 @@ static uint64_t uwp_prepare_tick(void)
     bool busy = xemu_uwp_warm_status(&done, &total);
     if (uwp_prep == UWP_PREP_START) {
         uwp_prep = UWP_PREP_OVER;
+        if (!uwp_prep_wanted) {
+            return 0;   /* the start screen is switched off (the default) */
+        }
         if (!busy || done >= total) {
             return 0;   /* no list for this disc yet: nothing to prepare */
         }
@@ -4542,6 +4548,11 @@ static char *uwp_take_activation_disc(void)
         }
         if (!strcmp(p, "clearcache=1")) {
             uwp_clear_cache_wanted = true;
+        }
+        if (!strcmp(p, "prep=1")) {
+            /* Game Vault's Xemu setup, Experimental: prepare all shaders before the game starts */
+            uwp_prep_wanted = true;
+            uwp_log("link: shaders prepared before the start (experimental)");
         }
         if (!strncmp(p, "warm=", 5)) {
             /* the game's ID (from Game Vault, e.g. VU-003): a shared shader warm-up list may lie in the
