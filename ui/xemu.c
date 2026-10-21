@@ -2353,12 +2353,15 @@ static void uwp_state(bool save)
  * half a second, a number is a pause of that many milliseconds). Each press
  * is held for 150 ms and followed by 350 ms of nothing. "qsave" / "qload" make
  * a quick save / quick load at that point, as View + RB / View + LB do.
+ * "<ls|rs><up|down|left|right>=<ms>" pushes a stick fully that long (looking around for picture checks).
  */
 extern uint16_t xemu_uwp_injected_buttons;
 static uint16_t uwp_press_queue[64];
 static uint16_t uwp_press_pause[64];
 static int16_t uwp_press_trigger[64];
 static uint8_t uwp_press_state[64];   /* 1: quick save, 2: quick load at this point */
+static int8_t uwp_press_stick_axis[64];   /* >= 0: a stick push (axis), its milliseconds in uwp_press_pause */
+static int16_t uwp_press_stick_value[64];
 static uint16_t uwp_press_hold_mask[64]; /* "<button>=<s>": button held, seconds in uwp_press_trigger */ /* > 0: right trigger seconds, < 0: left */
 static int uwp_press_count, uwp_press_next;
 static uint64_t uwp_press_until, uwp_press_release_at;
@@ -2386,6 +2389,30 @@ static void uwp_press(const char *list)
         uint16_t mask = 0, pause = 0;
         uwp_press_hold_mask[uwp_press_count] = 0;
         uwp_press_state[uwp_press_count] = 0;
+        uwp_press_stick_axis[uwp_press_count] = -1;
+        if ((!g_ascii_strncasecmp(parts[i], "ls", 2) || !g_ascii_strncasecmp(parts[i], "rs", 2)) &&
+            strchr(parts[i], '=')) {
+            const char *dir = parts[i] + 2;
+            bool right_stick = g_ascii_tolower(parts[i][0]) == 'r';
+            int axis = -1, value = 0;
+            if (!g_ascii_strncasecmp(dir, "up=", 3)) {
+                axis = right_stick ? CONTROLLER_AXIS_RSTICK_Y : CONTROLLER_AXIS_LSTICK_Y, value = 32767;
+            } else if (!g_ascii_strncasecmp(dir, "down=", 5)) {
+                axis = right_stick ? CONTROLLER_AXIS_RSTICK_Y : CONTROLLER_AXIS_LSTICK_Y, value = -32768;
+            } else if (!g_ascii_strncasecmp(dir, "left=", 5)) {
+                axis = right_stick ? CONTROLLER_AXIS_RSTICK_X : CONTROLLER_AXIS_LSTICK_X, value = -32768;
+            } else if (!g_ascii_strncasecmp(dir, "right=", 6)) {
+                axis = right_stick ? CONTROLLER_AXIS_RSTICK_X : CONTROLLER_AXIS_LSTICK_X, value = 32767;
+            }
+            if (axis >= 0) {
+                uwp_press_queue[uwp_press_count] = 0;
+                uwp_press_trigger[uwp_press_count] = 0;
+                uwp_press_pause[uwp_press_count] = (uint16_t)atoi(strchr(parts[i], '=') + 1);
+                uwp_press_stick_value[uwp_press_count] = value;
+                uwp_press_stick_axis[uwp_press_count++] = axis;
+                continue;
+            }
+        }
         if (!g_ascii_strcasecmp(parts[i], "qsave") || !g_ascii_strcasecmp(parts[i], "qload")) {
             uwp_press_queue[uwp_press_count] = 0;
             uwp_press_trigger[uwp_press_count] = 0;
@@ -2455,7 +2482,14 @@ static void uwp_press_poll(void)
     int16_t trigger = uwp_press_trigger[uwp_press_next];
     uint16_t pause = uwp_press_pause[uwp_press_next++];
     uint16_t hold = uwp_press_hold_mask[uwp_press_next - 1];
-    if (uwp_press_state[uwp_press_next - 1]) {
+    if (uwp_press_stick_axis[uwp_press_next - 1] >= 0) {
+        extern int xemu_uwp_injected_stick_axis, xemu_uwp_injected_stick_value;
+        extern uint64_t xemu_uwp_injected_stick_until;
+        xemu_uwp_injected_stick_axis = uwp_press_stick_axis[uwp_press_next - 1];
+        xemu_uwp_injected_stick_value = uwp_press_stick_value[uwp_press_next - 1];
+        xemu_uwp_injected_stick_until = now + pause;
+        uwp_press_until = now + pause + 300;
+    } else if (uwp_press_state[uwp_press_next - 1]) {
         if (uwp_press_state[uwp_press_next - 1] == 1) {
             uwp_save_state_wanted = true;
         } else {

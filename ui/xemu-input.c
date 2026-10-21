@@ -514,6 +514,9 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
 uint16_t xemu_uwp_injected_buttons;
 /* right / left trigger held from outside until this SDL tick (see uwp_press in ui/xemu.c) */
 uint64_t xemu_uwp_injected_rt_until, xemu_uwp_injected_lt_until;
+/* a stick pushed from outside (press= "rsdown=<ms>" and the like, ui/xemu.c): axis, value, until */
+int xemu_uwp_injected_stick_axis = -1, xemu_uwp_injected_stick_value;
+uint64_t xemu_uwp_injected_stick_until;
 /* a button held from outside until this SDL tick ("a=<seconds>" in a launch link) */
 uint16_t xemu_uwp_held_buttons;
 uint64_t xemu_uwp_held_until;
@@ -612,6 +615,9 @@ void xemu_input_update_controller(ControllerState *state)
     }
     if (SDL_GetTicks() < xemu_uwp_injected_lt_until) {
         state->axis[CONTROLLER_AXIS_LTRIG] = INT16_MAX;
+    }
+    if (xemu_uwp_injected_stick_axis >= 0 && SDL_GetTicks() < xemu_uwp_injected_stick_until) {
+        state->axis[xemu_uwp_injected_stick_axis] = xemu_uwp_injected_stick_value;
     }
     {
         /* for the log: whether the player is playing (a button held or a stick / trigger moved) */
