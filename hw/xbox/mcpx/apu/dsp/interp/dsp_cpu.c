@@ -908,13 +908,26 @@ static void dsp_postexecute_interrupts(dsp_core_t* dsp)
  *  Read/Write memory functions
  **********************************/
 
+#ifdef XEMU_UWP
+static bool dsp_uwp_out_of_range(dsp_core_t *dsp, const char *what, uint32_t address);
+#endif
+
 static uint32_t read_memory_p(dsp_core_t* dsp, uint32_t address)
 {
+#ifdef XEMU_UWP
+    /* a program address outside program memory gives 0 (nop) instead of stopping the emulator: a quick load
+       during start-up left the DSP running a program that was not there (Halo 2, Midnight Club 3) */
+    if (address >= DSP_PRAM_SIZE && dsp_uwp_out_of_range(dsp, "P read", address)) {
+        return 0;
+    }
+    return ldl_le_p(&dsp->pram[address]) & 0x00FFFFFF;
+#else
     assert((address & 0xFF000000) == 0);
     assert(address < DSP_PRAM_SIZE);
     uint32_t r = ldl_le_p(&dsp->pram[address]);
     assert((r & 0xFF000000) == 0);
     return r;
+#endif
 }
 
 #ifdef XEMU_UWP
@@ -926,8 +939,8 @@ static uint32_t read_memory_p(dsp_core_t* dsp, uint32_t address)
  */
 static bool dsp_uwp_out_of_range(dsp_core_t *dsp, const char *what, uint32_t address)
 {
-    static bool seen[4];
-    int k = (what[0] == 'Y') * 2 + (what[2] == 'w');
+    static bool seen[6];
+    int k = (what[0] == 'Y') * 2 + (what[0] == 'P') * 4 + (what[2] == 'w');
     if (!seen[k]) {
         seen[k] = true;
         uwp_log("sound chip: %s at %x is outside its memory; answered (first time only; %s, pc %04x)", what, address,

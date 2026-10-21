@@ -2351,12 +2351,14 @@ static void uwp_state(bool save)
  * for setup screens that wait for a button when nobody is at the console:
  * the launch link takes press=down,down,a (names below; "wait" is a pause of
  * half a second, a number is a pause of that many milliseconds). Each press
- * is held for 150 ms and followed by 350 ms of nothing.
+ * is held for 150 ms and followed by 350 ms of nothing. "qsave" / "qload" make
+ * a quick save / quick load at that point, as View + RB / View + LB do.
  */
 extern uint16_t xemu_uwp_injected_buttons;
 static uint16_t uwp_press_queue[64];
 static uint16_t uwp_press_pause[64];
 static int16_t uwp_press_trigger[64];
+static uint8_t uwp_press_state[64];   /* 1: quick save, 2: quick load at this point */
 static uint16_t uwp_press_hold_mask[64]; /* "<button>=<s>": button held, seconds in uwp_press_trigger */ /* > 0: right trigger seconds, < 0: left */
 static int uwp_press_count, uwp_press_next;
 static uint64_t uwp_press_until, uwp_press_release_at;
@@ -2383,6 +2385,14 @@ static void uwp_press(const char *list)
     for (int i = 0; parts[i] && uwp_press_count < ARRAY_SIZE(uwp_press_queue); i++) {
         uint16_t mask = 0, pause = 0;
         uwp_press_hold_mask[uwp_press_count] = 0;
+        uwp_press_state[uwp_press_count] = 0;
+        if (!g_ascii_strcasecmp(parts[i], "qsave") || !g_ascii_strcasecmp(parts[i], "qload")) {
+            uwp_press_queue[uwp_press_count] = 0;
+            uwp_press_trigger[uwp_press_count] = 0;
+            uwp_press_pause[uwp_press_count] = 0;
+            uwp_press_state[uwp_press_count++] = g_ascii_tolower(parts[i][1]) == 's' ? 1 : 2;
+            continue;
+        }
         for (int n = 0; n < ARRAY_SIZE(names); n++) {
             if (!g_ascii_strcasecmp(parts[i], names[n].name)) {
                 mask = names[n].mask;
@@ -2445,7 +2455,14 @@ static void uwp_press_poll(void)
     int16_t trigger = uwp_press_trigger[uwp_press_next];
     uint16_t pause = uwp_press_pause[uwp_press_next++];
     uint16_t hold = uwp_press_hold_mask[uwp_press_next - 1];
-    if (hold) {
+    if (uwp_press_state[uwp_press_next - 1]) {
+        if (uwp_press_state[uwp_press_next - 1] == 1) {
+            uwp_save_state_wanted = true;
+        } else {
+            uwp_load_state_wanted = true;
+        }
+        uwp_press_until = now + 500;
+    } else if (hold) {
         extern uint16_t xemu_uwp_held_buttons;
         extern uint64_t xemu_uwp_held_until;
         xemu_uwp_held_buttons = hold;
@@ -2493,7 +2510,16 @@ static void uwp_poll_quit_combo(void)
     }
     SDL_free(ids);
     if ((want_save || want_load) && !state_combo_was_down) {
-        uwp_state(want_save);
+        if (want_load) {
+            /* through the main loop, which loads only after the game's first 45 s: a quick load during
+               start-up made the sound chip run a broken program and stop xemu (Midnight Club 3 at 0:05) */
+            uwp_load_state_wanted = true;
+            if (SDL_GetTicks() < 45000) {   /* SDL's clock starts with xemu, just before the main loop */
+                xemu_queue_notification("The quick save loads as soon as the game has started");
+            }
+        } else {
+            uwp_state(true);
+        }
     }
     state_combo_was_down = want_save || want_load;
     if (!held) {

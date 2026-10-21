@@ -20,6 +20,9 @@
  */
 
 #include "hw/xbox/mcpx/apu/apu_int.h"
+#ifdef XEMU_UWP
+#include "qemu/xemu-uwp.h"
+#endif
 
 static const int16_t ep_silence[256][2] = { 0 };
 
@@ -57,7 +60,28 @@ static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
     unsigned int bytes_to_copy = TARGET_PAGE_SIZE - offset_in_page;
 
     while (len > 0) {
+#ifdef XEMU_UWP
+        /*
+         * A transfer outside the scatter-gather list or past the end of RAM is
+         * dropped (a read gives zeros) instead of stopping the emulator: right
+         * after a quick load (View + LB) the DSP can run one transfer from a
+         * list that does not match (Midnight Club 3, Ninja Gaiden Black: xemu
+         * closed 0.25 s after the load). The bounds check itself stays.
+         */
+        if (page_entry > max_sge) {
+            static unsigned logged;
+            if (!logged++) {
+                uwp_log("audio DSP: a transfer past its page list (entry %u of %u) was dropped",
+                        page_entry, max_sge);
+            }
+            if (!dir) {
+                memset(ptr, 0, len);
+            }
+            return;
+        }
+#else
         assert(page_entry <= max_sge);
+#endif
 
         uint32_t prd_address = ldl_le_phys(&address_space_memory,
                                            sge_base + page_entry * 8 + 0);
@@ -70,7 +94,20 @@ static void scatter_gather_rw(MCPXAPUState *d, hwaddr sge_base,
             bytes_to_copy = len;
         }
 
+#ifdef XEMU_UWP
+        if (paddr + bytes_to_copy >= memory_region_size(d->ram)) {
+            static unsigned logged;
+            if (!logged++) {
+                uwp_log("audio DSP: a transfer outside RAM (at %" HWADDR_PRIx ") was dropped", paddr);
+            }
+            if (!dir) {
+                memset(ptr, 0, len);
+            }
+            return;
+        }
+#else
         assert(paddr + bytes_to_copy < memory_region_size(d->ram));
+#endif
 
         if (dir) {
             memcpy(&d->ram_ptr[paddr], ptr, bytes_to_copy);
