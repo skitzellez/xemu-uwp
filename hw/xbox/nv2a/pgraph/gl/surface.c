@@ -486,6 +486,10 @@ static bool surface_to_texture_can_fastpath(SurfaceBinding *surface,
     switch (surface_fmt) {
     case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5: switch (texture_fmt) {
         case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X1R5G5B5: return true;
+#ifdef XEMU_UWP
+        /* the swizzled one too, as for the other formats (Half-Life 2: a 512x256 swizzled target) */
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X1R5G5B5: return true;
+#endif
         default: break;
         }
         break;
@@ -506,6 +510,12 @@ static bool surface_to_texture_can_fastpath(SurfaceBinding *surface,
         case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8: return true;
         case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8: return true;
         case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8: return true;
+#ifdef XEMU_UWP
+        /* the same bytes with the alpha left out (GL_RGB8 reads alpha as 1): Half-Life 2 samples its 640x480
+           target this way, read back through memory up to 40 times a second before (player eb81, 11 GB) */
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8: return true;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X8R8G8B8: return true;
+#endif
         default: break;
         }
         break;
@@ -822,6 +832,10 @@ bool pgraph_gl_check_surface_to_texture_compatibility(
     switch (surface_fmt) {
     case NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5: switch (texture_fmt) {
         case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X1R5G5B5: return true;
+#ifdef XEMU_UWP
+        /* the swizzled one too, as for the other formats (Half-Life 2: a 512x256 swizzled target) */
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X1R5G5B5: return true;
+#endif
         default: break;
         }
         break;
@@ -842,6 +856,12 @@ bool pgraph_gl_check_surface_to_texture_compatibility(
         case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8: return true;
         case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8: return true;
         case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8: return true;
+#ifdef XEMU_UWP
+        /* the same bytes with the alpha left out (GL_RGB8 reads alpha as 1): Half-Life 2 samples its 640x480
+           target this way, read back through memory up to 40 times a second before (player eb81, 11 GB) */
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8: return true;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X8R8G8B8: return true;
+#endif
         default: break;
         }
         break;
