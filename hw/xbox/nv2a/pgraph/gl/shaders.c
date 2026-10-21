@@ -209,10 +209,26 @@ static uint64_t attach_shader_module(PGRAPHGLState *r, GLuint program,
  */
 static void uwp_note_program_source(uint64_t vs, uint64_t gs, uint64_t fs)
 {
-    static GHashTable *seen;
-    static int made, repeats;
+    static GHashTable *seen, *stage_seen[3];
+    static int made, repeats, stage_distinct[3];
     if (!seen) {
         seen = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+        for (int i = 0; i < 3; i++) {
+            stage_seen[i] = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+        }
+    }
+    /* distinct GLSL per stage, to set against the distinct DXIL the driver gets (Mesa's d3d12-unique.txt):
+       more DXIL than GLSL means Mesa makes stage variants by what the stage is linked with */
+    uint64_t texts[3] = { vs, gs, fs };
+    for (int i = 0; i < 3; i++) {
+        gint64 *t = g_new(gint64, 1);
+        *t = (gint64)texts[i];
+        if (texts[i] == 0 || g_hash_table_contains(stage_seen[i], t)) {
+            g_free(t);
+        } else {
+            g_hash_table_add(stage_seen[i], t);
+            stage_distinct[i]++;
+        }
     }
     uint64_t key[3] = { vs, gs, fs };
     gint64 *h = g_new(gint64, 1);
@@ -224,7 +240,9 @@ static void uwp_note_program_source(uint64_t vs, uint64_t gs, uint64_t fs)
         g_hash_table_add(seen, h);
     }
     if (++made % 50 == 0) {
-        uwp_log("shader programs: %d linked, %d of them repeat the source of an earlier one", made, repeats);
+        uwp_log("shader programs: %d linked, %d of them repeat the source of an earlier one; distinct GLSL: "
+                "%d vertex, %d geometry, %d fragment", made, repeats, stage_distinct[0], stage_distinct[1],
+                stage_distinct[2]);
     }
 }
 #endif
