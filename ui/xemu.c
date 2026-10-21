@@ -1591,6 +1591,10 @@ int64_t uwp_prof_ticks[UWP_PROF__COUNT];
 int uwp_prof_calls[UWP_PROF__COUNT];
 int uwp_dl_site;
 int uwp_dl_counts[UWP_DL__COUNT];
+/* read-backs of this report period: bytes at render scale, and the largest one (hw/xbox/nv2a/pgraph/gl/surface.c) */
+uint64_t uwp_dl_bytes;
+unsigned int uwp_dl_big_w, uwp_dl_big_h, uwp_dl_big_n;
+bool uwp_dl_big_color;
 int uwp_trace_budget;
 int uwp_gpu_blits;
 extern int64_t uwp_prof_nv2a_totals[NV2A_PROF__COUNT];
@@ -1838,6 +1842,13 @@ static void uwp_prof_report(double seconds)
         n += snprintf(line + n, sizeof(line) - n, " %d",
                       uwp_dl_counts[i] - last_dl[i]);
         last_dl[i] = uwp_dl_counts[i];
+    }
+    if (uwp_dl_bytes) {
+        n += snprintf(line + n, sizeof(line) - n, " (%.1f MB, largest %ux%u %s x%u)",
+                      uwp_dl_bytes / 1048576.0, uwp_dl_big_w, uwp_dl_big_h,
+                      uwp_dl_big_color ? "colour" : "depth", uwp_dl_big_n);
+        uwp_dl_bytes = 0;
+        uwp_dl_big_w = uwp_dl_big_h = uwp_dl_big_n = 0;
     }
     static int last_gpu_blits;
     n += snprintf(line + n, sizeof(line) - n, " | gpu blits %d",
@@ -2699,20 +2710,34 @@ static void uwp_auto_scale(int fps, int late, int gpu_wait, int vcpu, long shade
  * A start that never shows a picture: no frame at all, not even the Xbox start-up animation (players saw a game
  * sit like that for 10 minutes, 2026-10-16). Counted once a second while xemu is in front: after 25 s with no
  * frame since the start, the emulated console is restarted once by itself; if it is still blank 25 s after that,
- * the log says so and nothing more is done. A frame ends the watch. uwp_watch_start() starts it again when the
- * launcher swaps the disc.
+ * the log says so and the player is told on screen (again every 30 s while it stays blank). On the free BIOS
+ * they are told at the first 25 s already: most games it cannot start look exactly like this (845a: GTA III,
+ * Vice City, San Andreas, Beyond Good & Evil, Morrowind sat black for up to 6 minutes, 2026-10-20). A frame
+ * ends the watch. uwp_watch_start() starts it again when the launcher swaps the disc.
  */
 static void uwp_event(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
 uint64_t uwp_background_since_ms(bool set, bool clear);
 static struct {
-    bool on, restarted;
+    bool on, restarted, gave_up;
     unsigned frames, quiet;
 } uwp_watch = { .on = true };
+
+/* what the player reads on the black screen */
+static void uwp_watch_tell(void)
+{
+    bool free_bios = strstr(g_config.sys.files.flashrom_path ? g_config.sys.files.flashrom_path : "", "SpiritBoot");
+    xemu_queue_notification(free_bios
+        ? "No picture: the free Xbox BIOS cannot start this game yet.\n"
+          "Hold View + Menu, then add your own BIOS in Game Vault: Options, Xbox setup"
+        : "No picture: this game did not start in xemu.\n"
+          "Hold View + Menu to go back to Game Vault");
+}
 
 static void uwp_watch_start(void)
 {
     uwp_watch.on = true;
     uwp_watch.restarted = false;
+    uwp_watch.gave_up = false;
     uwp_watch.frames = g_nv2a_stats.frame_count;
     uwp_watch.quiet = 0;
 }
@@ -2750,10 +2775,20 @@ static void uwp_watch_second(void)
     if (++uwp_watch.quiet < 25) {
         return;
     }
+    if (uwp_watch.gave_up) {
+        if (uwp_watch.quiet % 30 == 25) {
+            uwp_watch_tell();
+        }
+        return;
+    }
     if (uwp_watch.restarted) {
         uwp_event("still no picture 25 s after the restart: this game may not start in xemu yet");
-        uwp_watch.on = false;
+        uwp_watch.gave_up = true;   /* watched on: a late first frame still ends it, and the player is told */
+        uwp_watch_tell();
         return;
+    }
+    if (strstr(g_config.sys.files.flashrom_path ? g_config.sys.files.flashrom_path : "", "SpiritBoot")) {
+        uwp_watch_tell();
     }
     uwp_event("no picture 25 s after the start: restarting the emulated console once");
     xemu_main_loop_lock();

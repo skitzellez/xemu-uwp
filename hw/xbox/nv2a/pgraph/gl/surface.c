@@ -2029,7 +2029,10 @@ static void uwp_prefetch_color(NV2AState *d, SurfaceBinding *surface)
     PGRAPHState *pg = &d->pgraph;
     /* linear ones too, through the GPU path (Power Drome reads a 20x15 target with the CPU every frame) */
     if (!surface || !surface->color || !surface->draw_dirty || (!surface->swizzle && uwp_wb_words_off()) ||
-        surface->size > 16384 || surface->fmt.bytes_per_pixel != 4 || pg->surface_scale_factor != 1 ||
+        surface->size > 16384 || surface->fmt.bytes_per_pixel != 4 ||
+        /* above 1x only through the GPU path, which reads one texel per pixel at any scale (Conker's 32x32 sun
+         * check at 3x: a 96x96 read-back with a GPU wait twice a frame, 27 -> 19 fps in its attract demo) */
+        (pg->surface_scale_factor != 1 && uwp_wb_words_off()) ||
         !surface->width || !surface->height || uwp_color_prefetch_off()) {
         return;
     }
@@ -2199,6 +2202,20 @@ static void surface_download(NV2AState *d, SurfaceBinding *surface, bool force)
 #ifdef XEMU_UWP
     {
         uwp_dl_counts[uwp_dl_site]++;
+        extern uint64_t uwp_dl_bytes;
+        extern unsigned int uwp_dl_big_w, uwp_dl_big_h, uwp_dl_big_n;
+        extern bool uwp_dl_big_color;
+        unsigned int s = d->pgraph.surface_scale_factor;
+        uwp_dl_bytes += (uint64_t)surface->width * surface->height * surface->fmt.bytes_per_pixel * s * s;
+        if (surface->width == uwp_dl_big_w && surface->height == uwp_dl_big_h &&
+            surface->color == uwp_dl_big_color) {
+            uwp_dl_big_n++;
+        } else if ((uint64_t)surface->width * surface->height > (uint64_t)uwp_dl_big_w * uwp_dl_big_h) {
+            uwp_dl_big_w = surface->width;
+            uwp_dl_big_h = surface->height;
+            uwp_dl_big_color = surface->color;
+            uwp_dl_big_n = 1;
+        }
         UWP_TRACE("  readback site %d: %s %ux%u pitch %u swz %d addr %x "
                   "cfmt %d zfmt %d",
                   uwp_dl_site, surface->color ? "color" : "zeta",
