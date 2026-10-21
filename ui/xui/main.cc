@@ -63,6 +63,50 @@ extern "C" void xemu_uwp_shot_save(const char *label, const void *png, size_t si
 extern "C" void xemu_uwp_shot_black(const char *label);
 /* xemu's menu is on screen: the game gets no buttons (ui/xemu-input.c) */
 extern "C" bool xemu_uwp_menu_open;
+/* the start screen while the game's shaders are prepared (ui/xemu.c, uwp_prepare_tick) */
+extern "C" bool xemu_uwp_prep_on;
+extern "C" int xemu_uwp_prep_done, xemu_uwp_prep_total;
+
+static void UwpPrepareScreen(void)
+{
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    float s = g_viewport_mgr.m_scale;
+    ImVec2 size(vp->Size.x * 0.42f, 0);
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(size);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14 * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(36 * s, 30 * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6 * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2 * s);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.07f, 0.07f, 0.08f, 0.96f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.06f, 0.49f, 0.06f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.16f, 0.16f, 0.18f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.06f, 0.49f, 0.06f, 1.0f));
+    ImGui::Begin("##uwp_prepare", NULL,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+    ImGui::PushFont(g_font_mgr.m_menu_font_medium);
+    ImGui::TextUnformatted("Getting the game ready");
+    ImGui::PopFont();
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.72f, 0.74f, 1.0f));
+    ImGui::TextWrapped("Preparing its graphics so it plays smoothly from the first second.");
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 14 * s));
+    int total = xemu_uwp_prep_total > 0 ? xemu_uwp_prep_total : 1;
+    int done = xemu_uwp_prep_done < total ? xemu_uwp_prep_done : total;
+    char label[32];
+    snprintf(label, sizeof(label), "%d%%", done * 100 / total);
+    ImGui::ProgressBar((float)done / total, ImVec2(-1, 22 * s), label);
+    ImGui::Dummy(ImVec2(0, 14 * s));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.72f, 0.74f, 1.0f));
+    ImGui::TextUnformatted("B  Start now");
+    ImGui::PopStyleColor();
+    ImGui::End();
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar(4);
+}
 #endif
 #include "compat.hh"
 #if defined(_WIN32)
@@ -258,6 +302,11 @@ void xemu_hud_update(void)
         uwp_overlay();
     }
 #endif
+#ifdef XEMU_UWP
+    if (xemu_uwp_prep_on) {
+        UwpPrepareScreen();
+    }
+#endif
 
 #if defined(CONFIG_RENDERDOC)
     if (g_capture_renderdoc_frame) {
@@ -266,7 +315,11 @@ void xemu_hud_update(void)
     }
 #endif
 
-    if (g_config.display.ui.show_menubar && !first_boot_window.is_open) {
+    bool menubar = g_config.display.ui.show_menubar && !first_boot_window.is_open;
+#ifdef XEMU_UWP
+    menubar = menubar && !xemu_uwp_prep_on;   /* the start screen stands alone */
+#endif
+    if (menubar) {
         // Auto-hide main menu after 5s of inactivity
         static uint32_t last_check = 0;
         float alpha = 1.0;
