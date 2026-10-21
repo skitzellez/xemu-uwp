@@ -39,6 +39,7 @@ static void uwp_wb_flush_all(NV2AState *d);
 static bool uwp_wb_overlaps(hwaddr addr, hwaddr len);
 static void uwp_prefetch_color(NV2AState *d, SurfaceBinding *surface);
 static bool uwp_zeta_wb_off(void);
+static void uwp_clean_drop(hwaddr addr, hwaddr len);
 static bool uwp_zeta_readpixels(void);
 #endif
 
@@ -136,6 +137,11 @@ void pgraph_gl_set_surface_dirty(PGRAPHState *pg, bool color, bool zeta)
     pg->surface_zeta.draw_dirty |= zeta;
 
     if (r->color_binding) {
+#ifdef XEMU_UWP
+        if (color) {
+            uwp_clean_drop(r->color_binding->vram_addr, r->color_binding->size);
+        }
+#endif
         r->color_binding->draw_dirty |= color;
         r->color_binding->frame_time = pg->frame_time;
         r->color_binding->cleared = false;
@@ -143,6 +149,11 @@ void pgraph_gl_set_surface_dirty(PGRAPHState *pg, bool color, bool zeta)
     }
 
     if (r->zeta_binding) {
+#ifdef XEMU_UWP
+        if (zeta) {
+            uwp_clean_drop(r->zeta_binding->vram_addr, r->zeta_binding->size);
+        }
+#endif
         r->zeta_binding->draw_dirty |= zeta;
         r->zeta_binding->frame_time = pg->frame_time;
         r->zeta_binding->cleared = false;
@@ -183,7 +194,10 @@ static void init_render_to_texture(PGRAPHState *pg)
      * texture (rgba = 1; Conker: Live & Reloaded's glow and fog) the same word
      * gives R, G, B = high, middle, low byte and A = stencil; as a B8G8R8A8
      * texture (rgba = 2; Hot Wheels: Stunt Track Challenge) B, G, R = high,
-     * middle, low byte and A = stencil.
+     * middle, low byte and A = stencil. As an A8B8G8R8 texture (rgba = 3;
+     * Project Gotham Racing 2's 1280x480 depth in races, ~25 read-backs of
+     * 21 MB a second at 3x before) A, B, G = high, middle, low byte and
+     * R = stencil.
      */
     const char *zeta_fs =
         "#version 330\n"
@@ -194,7 +208,10 @@ static void init_render_to_texture(PGRAPHState *pg)
         "{\n"
         "    float d = texelFetch(tex, ivec2(gl_FragCoord.xy), 0).r;\n"
         "    uint v = min(uint(d * 16777215.0 + 0.5), 16777215u);\n"
-        "    if (rgba == 2)\n"
+        "    if (rgba == 3)\n"
+        "        out_Color = vec4(0.0, float(v & 255u), float((v >> 8) & 255u),\n"
+        "                         float(v >> 16)) / 255.0;\n"
+        "    else if (rgba == 2)\n"
         "        out_Color = vec4(float(v & 255u), float((v >> 8) & 255u),\n"
         "                         float(v >> 16), 0.0) / 255.0;\n"
         "    else if (rgba != 0)\n"
@@ -280,14 +297,21 @@ static void init_render_to_texture(PGRAPHState *pg)
         "uniform sampler2D tex;\n"
         "uniform uvec4 dst;\n" /* width, height, pitch, swizzled */
         "uniform uint scale;\n"
-        "uniform uint color;\n" /* 1: an RGBA8 colour surface, stored as B, G, R, A bytes */
+        "uniform uint color;\n" /* 1: an RGBA8 colour surface, stored as B, G, R, A bytes; 2: 8-bit, 4 pixels a word */
         "layout(std430, binding = 0) writeonly buffer Words { uint words[]; };\n"
         "layout(location = 0) out vec4 out_Color;\n"
         "void main()\n"
         "{\n"
         "    uvec2 p = uvec2(gl_FragCoord.xy);\n"
         "    uint word;\n"
-        "    if (color != 0u) {\n"
+        "    if (color == 2u) {\n"
+        "        if (p.x * 4u >= dst.x) return;\n"
+        "        word = 0u;\n"
+        "        for (uint i = 0u; i < 4u; i++) {\n"
+        "            uint x = min(p.x * 4u + i, dst.x - 1u);\n"
+        "            word |= uint(texelFetch(tex, ivec2(uvec2(x, p.y) * scale), 0).r * 255.0 + 0.5) << (8u * i);\n"
+        "        }\n"
+        "    } else if (color != 0u) {\n"
         "        uvec4 c = uvec4(texelFetch(tex, ivec2(p * scale), 0) * 255.0 + 0.5);\n"
         "        word = c.b | (c.g << 8) | (c.r << 16) | (c.a << 24);\n"
         "    } else {\n"
@@ -436,7 +460,9 @@ static bool uwp_zeta_as_color_ok(const SurfaceBinding *surface,
             shape->color_format ==
                 NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8 ||
             shape->color_format ==
-                NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_B8G8R8A8);
+                NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_B8G8R8A8 ||
+            shape->color_format ==
+                NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8);
 }
 #endif
 
@@ -540,6 +566,7 @@ static void render_surface_to(NV2AState *d, SurfaceBinding *surface,
                            texture_unit);
         glProgramUniform1i(
             r->s2t_rndr.zeta_prog, r->s2t_rndr.zeta_rgba_loc,
+            tex_color_format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8 ? 3 :
             tex_color_format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_B8G8R8A8 ? 2 :
             tex_color_format == NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8);
     } else
@@ -850,10 +877,53 @@ static bool check_surface_overlaps_range(const SurfaceBinding *surface,
     return !(surface->vram_addr >= range_end || range_start >= surface_end);
 }
 
+#ifdef XEMU_UWP
+/*
+ * One page of surface memory known to hold its current bytes: no surface there has drawing that is not in
+ * memory yet, and no write-back is on its way there. A read there needs nothing, so it does not take the
+ * graphics lock, which the graphics thread holds while it draws. Power Drome reads its 20x15 8-bit target
+ * byte by byte: ~9,400 calls a second, each waiting for that lock (29% of the time in races). Writes always
+ * take the full path (they mark the surface for upload). Dropped when a surface there is drawn to.
+ * Value: page address + 1, 0 = none.
+ */
+static uint64_t uwp_clean_page;
+
+static void uwp_clean_drop(hwaddr addr, hwaddr len)
+{
+    uint64_t c = qatomic_read(&uwp_clean_page);
+    if (c && addr < (c & ~(uint64_t)0xfff) + 0x1000 && (c & ~(uint64_t)0xfff) < addr + len) {
+        qatomic_set(&uwp_clean_page, 0);
+    }
+}
+
+/* test file clean-page-off.txt: every CPU access to surface memory takes the full path, as before */
+static bool uwp_clean_page_off(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        off = xemu_uwp_test_file_exists("clean-page-off.txt");
+        if (off) {
+            uwp_log("surface test: no clean-page shortcut for CPU reads (clean-page-off.txt)");
+        }
+    }
+    return off;
+}
+#endif
+
 static void surface_access_callback(void *opaque, MemoryRegion *mr, hwaddr addr,
                                     hwaddr len, bool write)
 {
     NV2AState *d = (NV2AState *)opaque;
+#ifdef XEMU_UWP
+    if (!write) {
+        uint64_t c = qatomic_read(&uwp_clean_page);
+        if (c && (addr & ~(hwaddr)0xfff) == (c & ~(uint64_t)0xfff) &&
+            ((addr + len - 1) & ~(hwaddr)0xfff) == (c & ~(uint64_t)0xfff)) {
+            return;
+        }
+    }
+#endif
     UWP_PROF_SCOPE(SURF_CPU_ACCESS);
     qemu_mutex_lock(&d->pgraph.lock);
 
@@ -887,6 +957,19 @@ static void surface_access_callback(void *opaque, MemoryRegion *mr, hwaddr addr,
     /* bytes still on their way there: a read would see old ones, a write would be overwritten */
     if (uwp_wb_overlaps(addr, len)) {
         wait_for_downloads = true;
+    }
+    /* a read that needed nothing: its page is remembered as clean when every surface there is (above) */
+    if (!write && !wait_for_downloads && !uwp_clean_page_off()) {
+        hwaddr page = addr & ~(hwaddr)0xfff;
+        bool clean = ((addr + len - 1) & ~(hwaddr)0xfff) == page && !uwp_wb_overlaps(page, 0x1000);
+        QTAILQ_FOREACH(surface, &r->surfaces, entry) {
+            if (clean && surface->draw_dirty && check_surface_overlaps_range(surface, page, 0x1000)) {
+                clean = false;
+            }
+        }
+        if (clean) {
+            qatomic_set(&uwp_clean_page, (uint64_t)page + 1);
+        }
     }
 #endif
 
@@ -1414,6 +1497,7 @@ bool pgraph_gl_surface_copy_to(NV2AState *d, SurfaceBinding *src,
     pg->draw_time++;
     dest->draw_time = pg->draw_time;
     dest->frame_time = pg->frame_time;
+    uwp_clean_drop(dest->vram_addr, dest->size);
     dest->draw_dirty = true;
     dest->download_pending = false;
     dest->upload_pending = false;
@@ -1435,6 +1519,13 @@ static void surface_evict_old(NV2AState *d)
         if (last_used >= surface_age_limit) {
             trace_nv2a_pgraph_surface_evict_reason("old", s->vram_addr);
             UWP_DL_SITE(EVICT_OLD);
+#ifdef XEMU_UWP
+            /* its bytes reach guest memory in the background, as for surfaces thrown out by an overlap: these
+             * read-backs waited for the GPU (every game's start-up, ~270 MB at 3x, two 1024x1024 targets) */
+            if (s->draw_dirty && uwp_wb_start(d, s)) {
+                s->draw_dirty = false;
+            }
+#endif
             pgraph_gl_surface_download_if_dirty(d, s);
             pgraph_gl_surface_invalidate(d, s);
         }
@@ -1648,8 +1739,10 @@ typedef struct UwpWb {
     hwaddr addr;
     size_t size, pbo_size;
     unsigned int width, height, pitch, scale;
+    unsigned int bpp;   /* bytes per pixel of the words layout: 4, or 1 for an 8-bit (B8) target */
     bool swizzle;
     bool words;   /* the buffer holds guest memory's bytes (uwp_wb_start_words), not a colour image */
+    uint8_t *verify;   /* test file wb-verify.txt: the same bytes read back the old way, compared on landing */
     uint64_t frame;
 } UwpWb;
 static UwpWb uwp_wb[UWP_WB_MAX];
@@ -1715,8 +1808,25 @@ static bool uwp_wb_finish_oldest(NV2AState *d, bool wait)
             } else {
                 for (unsigned int y = 0; y < e->height; y++) {
                     memcpy(d->vram_ptr + e->addr + (size_t)y * e->pitch, src + (size_t)y * e->pitch,
-                           (size_t)e->width * 4);
+                           (size_t)e->width * (e->bpp ? e->bpp : 4));
                 }
+            }
+            if (e->verify) {
+                static unsigned checked, bad;
+                unsigned int rowb = e->width * (e->bpp ? e->bpp : 4), diff = 0;
+                for (unsigned int y = 0; y < e->height && !e->swizzle; y++) {
+                    for (unsigned int x = 0; x < rowb; x++) {
+                        diff += src[(size_t)y * e->pitch + x] != e->verify[(size_t)y * e->pitch + x];
+                    }
+                }
+                checked++;
+                bad += diff != 0;
+                if (diff || checked % 200 == 1) {
+                    uwp_log("wb verify: %ux%u bpp %u at %x: %u bytes differ (%u of %u checked differ)", e->width,
+                            e->height, e->bpp, (unsigned)e->addr, diff, bad, checked);
+                }
+                g_free(e->verify);
+                e->verify = NULL;
             }
             glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
             memory_region_set_client_dirty(d->vram, e->addr, (hwaddr)e->pitch * e->height, DIRTY_MEMORY_VGA);
@@ -1846,8 +1956,12 @@ static bool uwp_wb_start_words(NV2AState *d, SurfaceBinding *surface, UwpWb *e)
     }
     size_t bytes = surface->swizzle ? (size_t)surface->width * surface->height * 4
                                     : (size_t)surface->pitch * surface->height;
+    /* an 8-bit (B8) linear target too, four pixels a word (Power Drome's 20x15 target the CPU reads) */
+    bool b8 = surface->color && !surface->swizzle && surface->fmt.bytes_per_pixel == 1 &&
+              surface->fmt.gl_internal_format == GL_R8;
     if (surface->pitch % 4 || bytes > surface->size || bytes == 0 ||
-        (surface->color && (surface->fmt.bytes_per_pixel != 4 || surface->fmt.gl_internal_format != GL_RGBA8))) {
+        (surface->color && !b8 &&
+         (surface->fmt.bytes_per_pixel != 4 || surface->fmt.gl_internal_format != GL_RGBA8))) {
         return false;
     }
 
@@ -1871,7 +1985,7 @@ static bool uwp_wb_start_words(NV2AState *d, SurfaceBinding *surface, UwpWb *e)
     glProgramUniform4ui(r->s2t_rndr.zeta_wb_prog, r->s2t_rndr.zeta_wb_dst_loc, surface->width, surface->height,
                         surface->pitch, surface->swizzle);
     glProgramUniform1ui(r->s2t_rndr.zeta_wb_prog, r->s2t_rndr.zeta_wb_scale_loc, pg->surface_scale_factor);
-    glProgramUniform1ui(r->s2t_rndr.zeta_wb_prog, r->s2t_rndr.zeta_wb_color_loc, surface->color);
+    glProgramUniform1ui(r->s2t_rndr.zeta_wb_prog, r->s2t_rndr.zeta_wb_color_loc, b8 ? 2 : surface->color);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, r->s2t_rndr.zeta_wb_ssbo);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, 0);
@@ -1944,6 +2058,7 @@ static bool uwp_wb_start(NV2AState *d, SurfaceBinding *surface)
         e->height = surface->height;
         e->pitch = surface->pitch;
         e->scale = pg->surface_scale_factor;
+        e->bpp = 4;
         e->swizzle = surface->swizzle;
         e->frame = pg->frame_time;
         uwp_wb_count++;
@@ -1990,6 +2105,7 @@ static bool uwp_wb_start(NV2AState *d, SurfaceBinding *surface)
     e->height = surface->height;
     e->pitch = surface->pitch;
     e->scale = pg->surface_scale_factor;
+    e->bpp = 4;
     e->swizzle = surface->swizzle;
     e->frame = pg->frame_time;
     uwp_wb_count++;
@@ -2029,7 +2145,8 @@ static void uwp_prefetch_color(NV2AState *d, SurfaceBinding *surface)
     PGRAPHState *pg = &d->pgraph;
     /* linear ones too, through the GPU path (Power Drome reads a 20x15 target with the CPU every frame) */
     if (!surface || !surface->color || !surface->draw_dirty || (!surface->swizzle && uwp_wb_words_off()) ||
-        surface->size > 16384 || surface->fmt.bytes_per_pixel != 4 ||
+        surface->size > 16384 ||
+        (surface->fmt.bytes_per_pixel != 4 && (surface->fmt.bytes_per_pixel != 1 || uwp_wb_words_off())) ||
         /* above 1x only through the GPU path, which reads one texel per pixel at any scale (Conker's 32x32 sun
          * check at 3x: a 96x96 read-back with a GPU wait twice a frame, 27 -> 19 fps in its attract demo) */
         (pg->surface_scale_factor != 1 && uwp_wb_words_off()) ||
@@ -2047,6 +2164,23 @@ static void uwp_prefetch_color(NV2AState *d, SurfaceBinding *surface)
     }
     /* on the GPU into memory order, as depth write-backs (uwp_wb_start_words); glReadPixels waited for the GPU */
     e->words = uwp_wb_start_words(d, surface, e);
+    if (!e->words && (pg->surface_scale_factor != 1 || surface->fmt.bytes_per_pixel != 4)) {
+        return;   /* glReadPixels below reads 32-bit at 1x only: read back when the CPU asks, as before */
+    }
+    static int verify = -1;
+    if (verify < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        verify = xemu_uwp_test_file_exists("wb-verify.txt");
+        if (verify) {
+            uwp_log("wb verify: read-aheads are also read back the old way and compared (wb-verify.txt)");
+        }
+    }
+    g_free(e->verify);
+    e->verify = NULL;
+    if (verify && e->words && !surface->swizzle) {
+        e->verify = g_malloc0(surface->size);
+        surface_download_to_buffer(d, surface, true, false, true, e->verify);
+    }
     if (!e->words) {
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
@@ -2080,6 +2214,7 @@ static void uwp_prefetch_color(NV2AState *d, SurfaceBinding *surface)
     e->height = surface->height;
     e->pitch = surface->pitch;
     e->scale = 1;
+    e->bpp = surface->fmt.bytes_per_pixel;
     e->swizzle = surface->swizzle;
     e->frame = pg->frame_time;
     uwp_wb_count++;
@@ -2192,6 +2327,45 @@ static void surface_download(NV2AState *d, SurfaceBinding *surface, bool force)
     uwp_wb_flush_range(d, surface->vram_addr, surface->size);
     if (!force && !surface->draw_dirty) {
         surface->download_pending = false;   /* its bytes came with a write-back */
+        return;
+    }
+    /*
+     * A 32-bit colour or Z24S8 depth surface: the GPU writes its bytes in guest layout and size
+     * (uwp_wb_start), taken at once. glReadPixels of the whole scaled image plus the shrink on the CPU
+     * was ~9x the data at 3x (Unreal Championship 2 reads its 640x480 frame buffers with the CPU, ~15
+     * read-backs of 10.5 MB a second). Test file sync-words-off.txt: as before.
+     */
+    static int sync_words_off = -1;
+    if (sync_words_off < 0) {
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        sync_words_off = xemu_uwp_test_file_exists("sync-words-off.txt");
+        if (sync_words_off) {
+            uwp_log("surface test: read-backs through glReadPixels as before (sync-words-off.txt)");
+        }
+    }
+    if (surface->draw_dirty && !sync_words_off && uwp_wb_start(d, surface)) {
+        uwp_wb_flush_range(d, surface->vram_addr, surface->size);
+        uwp_dl_counts[uwp_dl_site]++;
+        extern uint64_t uwp_dl_bytes;
+        extern unsigned int uwp_dl_big_w, uwp_dl_big_h, uwp_dl_big_n;
+        extern bool uwp_dl_big_color;
+        uwp_dl_bytes += (uint64_t)surface->width * surface->height * 4;
+        if (surface->width == uwp_dl_big_w && surface->height == uwp_dl_big_h &&
+            surface->color == uwp_dl_big_color) {
+            uwp_dl_big_n++;
+        } else if ((uint64_t)surface->width * surface->height > (uint64_t)uwp_dl_big_w * uwp_dl_big_h) {
+            uwp_dl_big_w = surface->width;
+            uwp_dl_big_h = surface->height;
+            uwp_dl_big_color = surface->color;
+            uwp_dl_big_n = 1;
+        }
+        surface->download_pending = false;
+        surface->draw_dirty = false;
+        static unsigned logged;
+        if (!logged++) {
+            uwp_log("read-backs: %ux%u %s made in guest layout on the GPU", surface->width, surface->height,
+                    surface->color ? "colour" : "depth");
+        }
         return;
     }
 #endif
@@ -2821,6 +2995,7 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
             uwp_parked_valid = false;
             found = surface_put(d, entry.vram_addr, &entry);
             found->upload_pending = false;
+            uwp_clean_drop(found->vram_addr, found->size);
             found->draw_dirty = true;
             found->cleared = false;
             pg->surface_binding_dim.width = entry.width;

@@ -211,6 +211,54 @@ static void apply_texture_parameters(PGRAPHGLState *r,
 
 #ifdef XEMU_UWP
 /*
+ * One cube face from the render target drawn there. At 1x a plain copy; above 1x the target is larger than
+ * the face, so it is scaled down by a blit on the GPU. Before, cubes above 1x went through memory: a
+ * read-back with a GPU wait per face (car reflections in racing games, every frame).
+ */
+static void uwp_cube_face_copy(PGRAPHState *pg, SurfaceBinding *src, TextureBinding *binding, int face,
+                               unsigned int width, unsigned int height)
+{
+    unsigned int s = pg->surface_scale_factor;
+    if (s == 1) {
+        glCopyImageSubData(src->gl_buffer, GL_TEXTURE_2D, 0, 0, 0, 0, binding->gl_texture, GL_TEXTURE_CUBE_MAP,
+                           0, 0, 0, face, width, height, 1);
+        return;
+    }
+    static GLuint fbo[2];
+    if (!fbo[0]) {
+        glGenFramebuffers(2, fbo);
+    }
+    GLint prev_read, prev_draw;
+    GLboolean prev_cmask[4];
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prev_read);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+    glGetBooleanv(GL_COLOR_WRITEMASK, prev_cmask);
+    GLboolean prev_scissor = glIsEnabled(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo[0]);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, src->gl_buffer, 0);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo[1]);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X + face,
+                           binding->gl_texture, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glBlitFramebuffer(0, 0, width * s, height * s, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, 0);
+    glColorMask(prev_cmask[0], prev_cmask[1], prev_cmask[2], prev_cmask[3]);
+    if (prev_scissor) {
+        glEnable(GL_SCISSOR_TEST);
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, prev_read);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prev_draw);
+    static unsigned logged;
+    if (!logged++) {
+        uwp_log("cube map: %ux%u faces scaled down from %ux render targets on the GPU", width, height, s);
+    }
+}
+
+/*
  * A cube map whose six faces are all render targets (a game drawing its own
  * reflections every frame): find the surface behind each face, so the faces
  * can be copied on the GPU instead of being read back and uploaded again.
@@ -236,7 +284,8 @@ static int find_cube_face_surfaces(NV2AState *d, const TextureShape *shape,
     hwaddr face_len = length / 6;
     int count = 0;
 
-    if (pg->surface_scale_factor != 1 || shape->border) {
+    /* above 1x the faces are scaled down by a blit (uwp_cube_face_copy), which takes colour only */
+    if (shape->border || (pg->surface_scale_factor != 1 && f->depth)) {
         return 0;
     }
     *newest = 0;
@@ -254,7 +303,7 @@ static int find_cube_face_surfaces(NV2AState *d, const TextureShape *shape,
             }
             continue;
         }
-        if (s->fmt.gl_internal_format != f->gl_internal_format ||
+        if (s->fmt.gl_internal_format != f->gl_internal_format || (pg->surface_scale_factor != 1 && !s->color) ||
             !pgraph_gl_check_surface_to_texture_compatibility(s, &face_shape)) {
             return 0;
         }
@@ -558,11 +607,7 @@ void pgraph_gl_bind_textures(NV2AState *d)
                     binding->s2t_height = state.height;
                 }
                 for (int face = 0; face < 6; face++) {
-                    glCopyImageSubData(cube_faces[face]->gl_buffer,
-                                       GL_TEXTURE_2D, 0, 0, 0, 0,
-                                       binding->gl_texture, GL_TEXTURE_CUBE_MAP,
-                                       0, 0, 0, face, state.width,
-                                       state.height, 1);
+                    uwp_cube_face_copy(pg, cube_faces[face], binding, face, state.width, state.height);
                 }
                 binding->draw_time = surface_time;
                 binding->scale = 1;
@@ -581,11 +626,7 @@ void pgraph_gl_bind_textures(NV2AState *d)
                         pgraph_gl_upload_surface_data(d, cube_faces[face], false);
                         glBindTexture(binding->gl_target, binding->gl_texture);
                     }
-                    glCopyImageSubData(cube_faces[face]->gl_buffer,
-                                       GL_TEXTURE_2D, 0, 0, 0, 0,
-                                       binding->gl_texture, GL_TEXTURE_CUBE_MAP,
-                                       0, 0, 0, face, state.width,
-                                       state.height, 1);
+                    uwp_cube_face_copy(pg, cube_faces[face], binding, face, state.width, state.height);
                 }
                 binding->draw_time = surface_time;
                 binding->scale = 1;
