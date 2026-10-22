@@ -835,6 +835,12 @@ static void *vblank_timer_thread(void *opaque)
 {
     struct xemu_console *scon = (struct xemu_console *)opaque;
     int64_t next_vblank = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+#ifdef XEMU_UWP
+    /* the guest's display clock: it shares cores with the graphics, sound and warm-up threads, and a vblank
+       woken more than a frame late is dropped (a game waiting on it to flip loses a frame). It sleeps
+       nearly all the time, so it costs the others nothing */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#endif
 
     while (!qatomic_read(&qemu_exiting)) {
         // Schedule next vblank at fixed interval (absolute deadline)
