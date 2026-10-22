@@ -26,6 +26,7 @@
 #include "hw/xbox/nv2a/pgraph/util.h"
 #include "hw/xbox/nv2a/pgraph/texsigns.h"
 #include "hw/xbox/nv2a/pgraph/glsl/psh.h"
+#include "qemu/xemu-uwp.h"
 #include "ui/xemu-settings.h"
 #include "renderer.h"
 
@@ -11271,6 +11272,82 @@ static void precompile_job_finished(PGRAPHD3D12State *r, uint32_t run,
 }
 
 /*
+ * Key version 4 lists lack texture_signs[]; their keys are the version 5
+ * keys with those bytes left out, so they are rewritten with no signed
+ * channels instead of being dropped (players keep their recorded pipelines).
+ */
+static void upgrade_pipeline_list_v4(const char *path,
+                                     const PipelineListHeader *expected)
+{
+    const size_t gap = offsetof(PGRAPHD3D12PipelineKey, texture_signs);
+    const size_t gap_size = sizeof(((PGRAPHD3D12PipelineKey *)0)->texture_signs);
+    const size_t old_size = sizeof(PGRAPHD3D12PipelineKey) - gap_size;
+    PipelineListHeader header;
+    g_autofree uint8_t *old_key = g_malloc(old_size);
+    g_autofree char *tmp_path = g_strdup_printf("%s.v5", path);
+    FILE *in = g_fopen(path, "rb");
+    FILE *out = NULL;
+    unsigned int records = 0;
+
+    if (in == NULL) {
+        return;
+    }
+    if (fread(&header, sizeof(header), 1, in) != 1 ||
+        header.magic != expected->magic || header.key_version != 4 ||
+        header.key_size != old_size || header.title_id != expected->title_id ||
+        header.flags != expected->flags) {
+        fclose(in);
+        return;
+    }
+    out = g_fopen(tmp_path, "wb");
+    if (out == NULL || fwrite(expected, sizeof(*expected), 1, out) != 1) {
+        goto fail;
+    }
+    while (records < PIPELINE_LIST_MAX) {
+        PGRAPHD3D12PipelineKey key;
+        uint64_t check;
+
+        if (fread(old_key, old_size, 1, in) != 1 ||
+            fread(&check, sizeof(check), 1, in) != 1 ||
+            check != fnv1a64_hash(old_key, old_size, 1469598103934665603ull)) {
+            break;
+        }
+        memset(&key, 0, sizeof(key));
+        memcpy(&key, old_key, gap);
+        memcpy((uint8_t *)&key + gap + gap_size, old_key + gap,
+               old_size - gap);
+        check = pipeline_list_check(&key);
+        if (fwrite(&key, sizeof(key), 1, out) != 1 ||
+            fwrite(&check, sizeof(check), 1, out) != 1) {
+            goto fail;
+        }
+        records++;
+    }
+    fclose(in);
+    in = NULL;
+    if (fclose(out) != 0) {
+        out = NULL;
+        goto fail;
+    }
+    out = NULL;
+    if (g_remove(path) != 0 || g_rename(tmp_path, path) != 0) {
+        goto fail;
+    }
+    uwp_log("New graphics: pipeline list %08x kept from the older format "
+            "(%u pipelines)", expected->title_id, records);
+    return;
+
+fail:
+    if (in != NULL) {
+        fclose(in);
+    }
+    if (out != NULL) {
+        fclose(out);
+    }
+    g_remove(tmp_path);
+}
+
+/*
  * Reads a title's list on a worker: queues its keys for precompile and
  * leaves the file open for appending, recreating it when it is stale and
  * cutting off a damaged tail.
@@ -11307,6 +11384,7 @@ static void load_pipeline_list(PGRAPHD3D12State *r,
     unique = g_hash_table_new(pipeline_key_hash, pipeline_key_equal);
     fallback_unique = g_hash_table_new(fallback_key_hash, fallback_key_equal);
     g_mkdir_with_parents(dir, 0755);
+    upgrade_pipeline_list_v4(path, &expected);
     file = g_fopen(path, "r+b");
     if (file != NULL &&
         (fread(&header, sizeof(header), 1, file) != 1 ||
