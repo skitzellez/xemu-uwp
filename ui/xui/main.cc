@@ -266,6 +266,19 @@ void xemu_hud_init_d3d12(SDL_Window *window, void *device,
     init_info.SrvDescriptorHeap = (ID3D12DescriptorHeap *)srv_heap;
     init_info.LegacySingleSrvCpuDescriptor.ptr = (SIZE_T)font_srv_cpu;
     init_info.LegacySingleSrvGpuDescriptor.ptr = (UINT64)font_srv_gpu;
+    /*
+     * The font texture keeps the one descriptor for good. ImGui's legacy single-descriptor wrapper allocates it
+     * once in Init but frees it on every InvalidateDeviceObjects, and the font manager invalidates on each
+     * rebuild: on a 4K screen the menus scale up and rebuild twice at start, the second free hit its assert and
+     * xemu stopped before the first frame (players with New graphics on a 4K TV).
+     */
+    init_info.SrvDescriptorAllocFn = [](ImGui_ImplDX12_InitInfo *info, D3D12_CPU_DESCRIPTOR_HANDLE *cpu,
+                                        D3D12_GPU_DESCRIPTOR_HANDLE *gpu) {
+        *cpu = info->LegacySingleSrvCpuDescriptor;
+        *gpu = info->LegacySingleSrvGpuDescriptor;
+    };
+    init_info.SrvDescriptorFreeFn = [](ImGui_ImplDX12_InitInfo *, D3D12_CPU_DESCRIPTOR_HANDLE,
+                                       D3D12_GPU_DESCRIPTOR_HANDLE) {};
     g_d3d12_srv_heap = (ID3D12DescriptorHeap *)srv_heap;
     g_hud_d3d12 = true;
     if (!ImGui_ImplDX12_Init(&init_info)) {
