@@ -1902,6 +1902,11 @@ static bool download_surface_data_impl(
     g_autofree uint8_t *linear = NULL;
     unsigned int native_y;
 
+    pgraph_d3d12_evlog(r, "dl %c 0x%" HWADDR_PRIx " %ux%u dd=%d dp=%d force=%d reason=%d",
+                       surface->color ? 'c' : 'z', surface->vram_addr,
+                       surface->width, surface->height, surface->draw_dirty,
+                       surface->download_pending, force, (int)reason);
+
     if (!(surface->download_pending || force) || !surface->draw_dirty) {
         return true;
     }
@@ -2251,6 +2256,10 @@ static void complete_stashed_surface(NV2AState *d,
     int64_t start = g_get_monotonic_time();
 
     r->perf.stash_done_by[trigger]++;
+    pgraph_d3d12_evlog(r, "stash-wb %c 0x%" HWADDR_PRIx " %ux%u dd=%d trig=%d",
+                       surface->color ? 'c' : 'z', surface->vram_addr,
+                       surface->width, surface->height, surface->draw_dirty,
+                       (int)trigger);
     unstash_surface(d, surface);
     if (!download_surface_data_impl(
             d, surface, PGRAPH_D3D12_SURFACE_DOWNLOAD_OVERLAP_INVALIDATION,
@@ -2447,6 +2456,11 @@ static void stash_surface(NV2AState *d, PGRAPHD3D12SurfaceBinding *surface,
     PGRAPHD3D12State *r = pg->d3d12_renderer_state;
     PGRAPHD3D12SurfaceBinding *older, *next;
     uint64_t bytes = surface_image_bytes(pg, surface);
+
+    pgraph_d3d12_evlog(r, "stash %c 0x%" HWADDR_PRIx " %ux%u dd=%d reason=%d",
+                       surface->color ? 'c' : 'z', surface->vram_addr,
+                       surface->width, surface->height, surface->draw_dirty,
+                       (int)reason);
 
     if (surface == r->color_binding) {
         unbind_surface(pg, true);
@@ -2785,6 +2799,9 @@ static void restore_surface_from_stash(NV2AState *d,
             exact = false;
         }
     }
+    pgraph_d3d12_evlog(r, "restore %c 0x%" HWADDR_PRIx " %ux%u base=%d exact=%d",
+                       target->color ? 'c' : 'z', target->vram_addr,
+                       target->width, target->height, base != NULL, exact);
     if (base == NULL) {
         r->perf.restore_none++;
         return;
@@ -4296,6 +4313,17 @@ static bool invalidate_overlapping_surfaces(
             surface_guest_writes_cover(target, surface);
         unsigned int alias_x, alias_y;
 
+        if (surfaces_overlap(surface, target)) {
+            pgraph_d3d12_evlog(
+                r, "ovl %c 0x%" HWADDR_PRIx " %ux%u swz=%d dd=%d up=%d clr=%d "
+                "disc=%d over=%d -> %c %ux%u swz=%d",
+                surface->color ? 'c' : 'z', surface->vram_addr,
+                surface->width, surface->height, surface->swizzle,
+                surface->draw_dirty, surface->upload_pending,
+                surface->cleared, surface == discard_surface, overwritten,
+                target->color ? 'c' : 'z', target->width, target->height,
+                target->swizzle);
+        }
         if (surface != discard_surface && !overwritten &&
             surfaces_overlap(surface, target)) {
             if (alias_planned < alias_slots &&
