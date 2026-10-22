@@ -226,7 +226,7 @@ input:
 display:
   renderer:
     type: enum
-    values: ["NULL", OPENGL, VULKAN]
+    values: ["NULL", OPENGL, VULKAN, D3D12]
     default: OPENGL
   vulkan:
     validation_layers: bool
@@ -237,10 +237,25 @@ display:
     surface_scale:
       type: integer
       default: 1
+  custom_textures:
+    load:
+      type: bool
+      default: false
+    prefetch:
+      type: bool
+      default: false
+    dump:
+      type: bool
+      default: false
+    path: string
   filtering:
     type: enum
     values: [linear, nearest]
     default: linear
+  fsr: bool
+  fsr_sharpness:
+    type: number
+    default: 0.8
   window:
     fullscreen_on_startup: bool
     fullscreen_exclusive: bool
@@ -371,5 +386,8 @@ perf:
     type: bool
     default: true
   cache_shaders:
+    type: bool
+    default: true
+  precompile_shaders:
     type: bool
     default: true

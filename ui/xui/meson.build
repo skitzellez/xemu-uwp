@@ -23,6 +23,10 @@ xemu_ss.add(files(
   'widgets.cc',
 ))
 
+if d3d12.found()
+  xemu_ss.add(files('imgui-dx12-backend.cc'))
+endif
+
 if host_os == 'windows'
   xemu_ss.add(files('update.cc', 'win32-dxgi-present.cc'))
 endif

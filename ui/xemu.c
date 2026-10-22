@@ -44,6 +44,9 @@
 #include "block/block.h"
 #include "system/system.h"
 #include "xui/xemu-hud.h"
+#ifdef CONFIG_D3D12
+#include "d3d12-presenter.h"
+#endif
 #include "xemu-input.h"
 #include "xemu-settings.h"
 #include "xemu-snapshots.h"
@@ -104,6 +107,9 @@ struct xemu_console {
     int ignore_hotkeys;
     SDL_GLContext winctx;
     QKbdState *kbd;
+#ifdef CONFIG_D3D12
+    XemuD3D12Presenter *d3d12_presenter;
+#endif
 };
 
 #ifdef _WIN32
@@ -133,6 +139,9 @@ static SDL_Cursor *guest_sprite;
 static Notifier mouse_mode_notifier;
 static SDL_Window *m_window;
 static SDL_GLContext m_context;
+/* New graphics: the Direct3D 12 renderer draws the game and its presenter shows it with the menus; no OpenGL
+ * context is made. Chosen before the window exists (use_d3d12_renderer). */
+static bool m_use_d3d12;
 static QemuSemaphore display_init_sem;
 static QemuSemaphore display_shutdown_sem;
 static QEMUTimer *vblank_timer;
@@ -997,6 +1006,93 @@ static void gl_render_frame(struct xemu_console *scon)
 #endif
 }
 
+#ifdef CONFIG_D3D12
+static void d3d12_report_error(struct xemu_console *scon, const char *operation)
+{
+    static char last_error[512];
+    const char *error = xemu_d3d12_presenter_get_error(scon->d3d12_presenter);
+
+    if (error && g_strcmp0(error, last_error) != 0) {
+        fprintf(stderr, "New graphics presenter: %s failed: %s\n", operation, error);
+        g_strlcpy(last_error, error, sizeof(last_error));
+    }
+}
+
+/* New graphics: one frame through the Direct3D 12 presenter (game picture, then the menus on top) */
+static void d3d12_render_frame(struct xemu_console *scon)
+{
+    static bool rendering;
+    NV2ADisplayFrame frame;
+    char *screenshot_path;
+
+    if (qatomic_xchg(&rendering, true) || qatomic_read(&qemu_exiting)) {
+        return;
+    }
+    if (scon->d3d12_presenter) {
+        /* before taking the frame, so the one shown is the newest */
+        xemu_d3d12_presenter_wait_frame_latency(scon->d3d12_presenter);
+    }
+    UWP_PROF_BEGIN(t_getfb);
+    bool acquired = nv2a_get_display_frame(&frame);
+    UWP_PROF_END(UI_GETFB, t_getfb);
+    if (!acquired) {
+        qatomic_set(&rendering, false);
+        return;
+    }
+    if (scon->d3d12_presenter == NULL) {
+        scon->d3d12_presenter = xemu_d3d12_presenter_create(scon->real_window);
+    }
+    if (!xemu_d3d12_presenter_begin_frame(scon->d3d12_presenter, &frame)) {
+        d3d12_report_error(scon, "begin frame");
+        goto out;
+    }
+    if (!xemu_hud_is_initialized()) {
+        xemu_hud_init_d3d12(scon->real_window,
+                            xemu_d3d12_presenter_get_device(scon->d3d12_presenter),
+                            xemu_d3d12_presenter_get_command_queue(scon->d3d12_presenter),
+                            xemu_d3d12_presenter_get_srv_heap(scon->d3d12_presenter),
+                            xemu_d3d12_presenter_get_font_srv_cpu(scon->d3d12_presenter),
+                            xemu_d3d12_presenter_get_font_srv_gpu(scon->d3d12_presenter));
+    }
+    xemu_main_loop_lock();
+    xemu_hud_update();
+    xemu_main_loop_unlock();
+    UWP_PROF_BEGIN(t_hud);
+    xemu_hud_render_d3d12(xemu_d3d12_presenter_get_command_list(scon->d3d12_presenter));
+    UWP_PROF_END(UI_HUD, t_hud);
+    screenshot_path = xemu_hud_take_screenshot_path();
+    if (screenshot_path) {
+        if (!xemu_d3d12_presenter_request_screenshot(scon->d3d12_presenter, screenshot_path)) {
+            d3d12_report_error(scon, "screenshot");
+        }
+        g_free(screenshot_path);
+    }
+    UWP_PROF_BEGIN(t_swap);
+    if (!xemu_d3d12_presenter_end_frame(scon->d3d12_presenter, g_config.display.window.vsync)) {
+        d3d12_report_error(scon, "end frame");
+    }
+    UWP_PROF_END(UI_SWAP, t_swap);
+out:
+    nv2a_release_display_frame();
+    qatomic_set(&rendering, false);
+    /* no picture from the game yet and no vsync to pace the loop: do not spin */
+    if (frame.type == NV2A_DISPLAY_FRAME_NONE && !g_config.display.window.vsync) {
+        SDL_Delay(16);
+    }
+}
+#endif
+
+static void render_frame(struct xemu_console *scon)
+{
+#ifdef CONFIG_D3D12
+    if (m_use_d3d12) {
+        d3d12_render_frame(scon);
+        return;
+    }
+#endif
+    gl_render_frame(scon);
+}
+
 static bool event_watch_callback(void *userdata, SDL_Event *event)
 {
     struct xemu_console *scon = (struct xemu_console *)userdata;
@@ -1015,9 +1111,9 @@ static bool event_watch_callback(void *userdata, SDL_Event *event)
             }
         }
 #endif
-        gl_render_frame(scon);
+        render_frame(scon);
     } else if (event->type == SDL_EVENT_WINDOW_EXPOSED) {
-        gl_render_frame(scon);
+        render_frame(scon);
     }
 
     return true; // Ignored
@@ -1085,6 +1181,41 @@ static void poll_events(struct xemu_console *scon)
     xemu_main_loop_unlock();
 }
 
+#ifdef CONFIG_D3D12
+/*
+ * New graphics (Direct3D 12 renderer) or Classic (OpenGL through Mesa), fixed for the session. Console: chosen
+ * by use-d3d12.txt next to xemu.toml (Game Vault writes it, per game); elsewhere by the renderer setting.
+ */
+static bool use_d3d12_renderer(void)
+{
+#ifdef XEMU_UWP
+    gchar *dir = g_path_get_dirname(xemu_settings_get_path());
+    gchar *marker = g_build_filename(dir, "use-d3d12.txt", NULL);
+    bool on = g_file_test(marker, G_FILE_TEST_EXISTS);
+    g_free(marker);
+    g_free(dir);
+    /* or the launch link (Game Vault, per game): gfx=new / gfx=classic. The link arrives through the event queue
+     * just after start; it is only looked at here, uwp_startup_disc takes it. */
+    for (int i = 0; i < 200 && !SDL_GetHint("SDL_WINRT_ACTIVATION_URI"); i++) {
+        SDL_PumpEvents();
+        SDL_Delay(10);
+    }
+    const char *uri = SDL_GetHint("SDL_WINRT_ACTIVATION_URI");
+    const char *q = uri ? strchr(uri, '?') : NULL;
+    for (const char *p = q; p && *p; p = strchr(p + 1, '&')) {
+        if (g_str_has_prefix(p + 1, "gfx=new")) {
+            on = true;
+        } else if (g_str_has_prefix(p + 1, "gfx=classic")) {
+            on = false;
+        }
+    }
+    return on;
+#else
+    return g_config.display.renderer == CONFIG_DISPLAY_RENDERER_D3D12;
+#endif
+}
+#endif
+
 static void display_very_early_init(DisplayOptions *o)
 {
 #ifdef __linux__
@@ -1128,6 +1259,15 @@ static void display_very_early_init(DisplayOptions *o)
     SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
 #endif
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
+
+#ifdef CONFIG_D3D12
+    m_use_d3d12 = use_d3d12_renderer();
+    if (m_use_d3d12) {
+        g_config.display.renderer = CONFIG_DISPLAY_RENDERER_D3D12;
+    } else if (g_config.display.renderer == CONFIG_DISPLAY_RENDERER_D3D12) {
+        g_config.display.renderer = CONFIG_DISPLAY_RENDERER_OPENGL;   /* saved by a New graphics session */
+    }
+#endif
 
     // Initialize rendering context
     SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
@@ -1183,7 +1323,10 @@ static void display_very_early_init(DisplayOptions *o)
         window_height = min_window_height;
     }
 
-    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    if (!m_use_d3d12) {
+        window_flags = (SDL_WindowFlags)(window_flags | SDL_WINDOW_OPENGL);
+    }
 
     // Create main window
     m_window = SDL_CreateWindow(
@@ -1201,6 +1344,16 @@ static void display_very_early_init(DisplayOptions *o)
     if (disp_mode && (disp_mode->w < window_width || disp_mode->h < window_height)) {
         SDL_SetWindowSize(m_window, min_window_width, min_window_height);
         SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    }
+
+    if (m_use_d3d12) {
+        fprintf(stderr, "CPU: %s\n", xemu_get_cpu_info());
+        fprintf(stderr, "OS_Version: %s\n", xemu_get_os_info());
+#ifdef XEMU_UWP
+        uwp_log("renderer: New graphics (Direct3D 12)");
+#endif
+        nv2a_context_init();
+        return;
     }
 
     m_context = SDL_GL_CreateContext(m_window);
@@ -1270,6 +1423,9 @@ static void display_very_early_init(DisplayOptions *o)
 static void display_early_init(DisplayOptions *o)
 {
     assert(o->type == DISPLAY_TYPE_XEMU);
+    if (m_use_d3d12) {
+        return;   /* the menus start with the presenter, on the first frame (d3d12_render_frame) */
+    }
     display_opengl = 1;
 
     SDL_GL_MakeCurrent(m_window, m_context);
@@ -1294,7 +1450,9 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     int i;
 
     assert(o->type == DISPLAY_TYPE_XEMU);
-    SDL_GL_MakeCurrent(m_window, m_context);
+    if (!m_use_d3d12) {
+        SDL_GL_MakeCurrent(m_window, m_context);
+    }
 
     gui_fullscreen = o->has_full_screen && o->full_screen;
     gui_fullscreen |= g_config.display.window.fullscreen_on_startup;
@@ -1350,7 +1508,9 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     }
 
     /* Tell main thread to go ahead and create the app and enter the run loop */
-    SDL_GL_MakeCurrent(NULL, NULL);
+    if (!m_use_d3d12) {
+        SDL_GL_MakeCurrent(NULL, NULL);
+    }
     qemu_sem_post(&display_init_sem);
 }
 
@@ -1364,8 +1524,10 @@ static void display_finalize(void)
 #ifdef _WIN32
     win32_dxgi_present_cleanup();
 #endif
-    SDL_GL_MakeCurrent(NULL, NULL);
-    SDL_GL_DestroyContext(m_context);
+    if (!m_use_d3d12) {
+        SDL_GL_MakeCurrent(NULL, NULL);
+        SDL_GL_DestroyContext(m_context);
+    }
     SDL_DestroyWindow(m_window);
     SDL_Quit();
 }
@@ -3212,6 +3374,61 @@ static void uwp_where(uint64_t addr, char *out, size_t n)
     } else {
         snprintf(out, n, "%s+0x%llx", file, (unsigned long long)rva);
     }
+}
+
+/*
+ * Start-up watchdog: when the UI loop has not started 12 s after the window, every thread's stack goes to the
+ * log (a hang there leaves nothing else: the Device Portal refuses live dumps on Dev Mode).
+ */
+#include <tlhelp32.h>
+static bool uwp_ui_loop_started;
+
+static DWORD WINAPI uwp_start_watchdog(void *arg)
+{
+    Sleep(12000);
+    if (qatomic_read(&uwp_ui_loop_started)) {
+        return 0;
+    }
+    uwp_log("START HANG: the UI loop has not started after 12 s; thread stacks follow");
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        uwp_log("START HANG: no thread list (error %lu)", GetLastError());
+        return 0;
+    }
+    THREADENTRY32 te = { .dwSize = sizeof(te) };
+    DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) {
+            continue;
+        }
+        HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
+                              te.th32ThreadID);
+        if (!t) {
+            continue;
+        }
+        uint64_t frames[24];
+        int n = 0;
+        CONTEXT ctx;
+        ctx.ContextFlags = CONTEXT_FULL;
+        if (SuspendThread(t) != (DWORD)-1) {
+            if (GetThreadContext(t, &ctx)) {
+                frames[0] = ctx.Rip;
+                n = 1 + uwp_unwind(&ctx, frames + 1, 23);
+            }
+            ResumeThread(t);
+        }
+        CloseHandle(t);
+        GString *line = g_string_new(NULL);
+        for (int i = 0; i < n; i++) {
+            char w[160];
+            uwp_where(frames[i], w, sizeof(w));
+            g_string_append_printf(line, "%s%s", i ? " < " : "", w);
+        }
+        uwp_log("START HANG thread %lu: %s", te.th32ThreadID, line->str);
+        g_string_free(line, true);
+    }
+    CloseHandle(snap);
+    return 0;
 }
 
 static const char *uwp_thread_role(char *name, size_t n)
@@ -5246,7 +5463,8 @@ static void uwp_fill_system_files(void)
         gchar *dir = g_path_get_dirname(xemu_settings_get_path());
         gchar *marker = g_build_filename(dir, "use-vulkan.txt", NULL);
         bool vulkan = uwp_file_exists(marker);
-        g_config.display.renderer = vulkan ? CONFIG_DISPLAY_RENDERER_VULKAN : CONFIG_DISPLAY_RENDERER_OPENGL;
+        g_config.display.renderer = m_use_d3d12 ? CONFIG_DISPLAY_RENDERER_D3D12
+                                  : vulkan ? CONFIG_DISPLAY_RENDERER_VULKAN : CONFIG_DISPLAY_RENDERER_OPENGL;
         if (vulkan) {
             uwp_log("renderer: Vulkan (use-vulkan.txt)");
         }
@@ -5569,6 +5787,7 @@ int main(int argc, char **argv)
     display_very_early_init(NULL);
 #ifdef XEMU_UWP
     uwp_log("display_very_early_init done");
+    CloseHandle(CreateThread(NULL, 0, uwp_start_watchdog, NULL, 0, NULL));
     /*
      * From here on a failure is logged: an error that ends xemu while it starts (exit, abort, crash) used to
      * leave nothing but "qemu_init start" (games on a 1 TB drive, 2026-10-16).
@@ -5676,6 +5895,7 @@ int main(int argc, char **argv)
     struct xemu_console *scon = &scon_list[0];
 #ifdef XEMU_UWP
     uwp_log("UI loop starting");
+    qatomic_set(&uwp_ui_loop_started, true);
     uwp_machine_running = true;
     setvbuf(stderr, NULL, _IONBF, 0);
     signal(SIGABRT, uwp_on_abort);
@@ -5707,10 +5927,21 @@ int main(int argc, char **argv)
 #endif
     while (!qatomic_read(&qemu_exiting)) {
         poll_events(scon);
-        gl_render_frame(scon);
+        render_frame(scon);
 #ifdef XEMU_UWP
         uwp_frames++;
         uwp_poll_activation();
+#ifdef CONFIG_D3D12
+        if (m_use_d3d12) {
+            /* New graphics: its pipeline list is kept per game (Game Vault's tid=), and built at the start */
+            static char d3d12_title[sizeof(uwp_title_key)];
+            if (strcmp(d3d12_title, uwp_title_key)) {
+                g_strlcpy(d3d12_title, uwp_title_key, sizeof(d3d12_title));
+                nv2a_shader_cache_set_title(uwp_title_id(uwp_title_key));
+                uwp_log("New graphics: pipeline list for %s", uwp_title_key);
+            }
+        }
+#endif
         if ((uwp_frames & 7) == 0) {
             uwp_poll_quit_combo();
         }

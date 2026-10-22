@@ -850,7 +850,9 @@ static inline bool access_callback_address_matches(MemAccessCallback *cb,
     hwaddr watch_end = cb->addr + cb->len - 1;
     hwaddr access_end = addr + len - 1;
 
-    return !(addr > watch_end || cb->addr > access_end);
+    /* a disabled callback (New graphics renderer) stays listed but catches nothing */
+    return qatomic_read(&cb->enabled) &&
+           !(addr > watch_end || cb->addr > access_end);
 }
 
 int mem_access_callback_address_matches(CPUState *cpu, hwaddr addr, hwaddr len)
@@ -891,6 +893,7 @@ MemAccessCallback *mem_access_callback_insert(CPUState *cpu, MemoryRegion *mr,
     cb->len = len;
     cb->func = func;
     cb->opaque = opaque;
+    qatomic_set(&cb->enabled, true);
 
     async_safe_run_on_cpu(cpu, do_mem_access_callback_insert,
                           RUN_ON_CPU_HOST_PTR(cb));
@@ -903,6 +906,56 @@ MemAccessCallback *mem_access_callback_insert(CPUState *cpu, MemoryRegion *mr,
     tlb_flush_all_cpus_synced(cpu);
 
     return cb;
+}
+
+/*
+ * New graphics renderer: callbacks listed but switched off until the renderer
+ * needs to see CPU writes. A switch drops cached translations (they carry the
+ * watchpoint flag); queued, so callers may hold renderer locks.
+ */
+MemAccessCallback *mem_access_callback_insert_disabled(
+    CPUState *cpu, MemoryRegion *mr, hwaddr offset, hwaddr len,
+    MemAccessCallbackFunc func, void *opaque)
+{
+    assert(len > 0);
+
+    MemAccessCallback *cb = g_malloc(sizeof(*cb));
+    cb->mr = mr;
+    cb->addr = memory_region_get_ram_addr(mr) + offset;
+    cb->len = len;
+    cb->func = func;
+    cb->opaque = opaque;
+    qatomic_set(&cb->enabled, false);
+
+    async_safe_run_on_cpu(cpu, do_mem_access_callback_insert,
+                          RUN_ON_CPU_HOST_PTR(cb));
+    return cb;
+}
+
+typedef struct MemAccessCallbackRange {
+    uintptr_t host;
+    hwaddr len;
+} MemAccessCallbackRange;
+
+static void do_mem_access_callback_flush(CPUState *cpu, run_on_cpu_data data)
+{
+    MemAccessCallbackRange *range = data.host_ptr;
+
+    tlb_flush_host_range(cpu, range->host, range->len);
+    g_free(range);
+}
+
+void mem_access_callback_set_enabled(CPUState *cpu, MemAccessCallback *cb,
+                                     bool enabled)
+{
+    if (cb == NULL || qatomic_xchg(&cb->enabled, enabled) == enabled) {
+        return;
+    }
+    /* only the watched pages' translations (they carry the watchpoint flag) */
+    MemAccessCallbackRange *range = g_new(MemAccessCallbackRange, 1);
+    range->host = (uintptr_t)memory_region_get_ram_ptr(cb->mr) + (cb->addr - memory_region_get_ram_addr(cb->mr));
+    range->len = cb->len;
+    async_run_on_cpu(cpu, do_mem_access_callback_flush, RUN_ON_CPU_HOST_PTR(range));
 }
 
 static void do_mem_access_callback_remove_by_ref(CPUState *cpu,

@@ -2428,6 +2428,12 @@ if vulkan.found()
                                      dependencies: vulkan)
 endif
 
+# New graphics: the Direct3D 12 NV2A renderer (hw/xbox/nv2a/pgraph/d3d12), next to OpenGL in the same program
+d3d12 = not_found
+if host_os == 'windows' and not get_option('d3d12').disabled()
+  d3d12 = declare_dependency(link_args: ['-ld3d12', '-ldxgi', '-ldxguid', '-ld3dcompiler'])
+endif
+
 if host_os == 'windows'
   libpcap = declare_dependency(include_directories: 'winpcap-loader/include',
                                link_args: ['-lws2_32'])
@@ -2697,6 +2703,7 @@ if numa.found()
                                        dependencies: numa))
 endif
 config_host_data.set('CONFIG_OPENGL', opengl.found())
+config_host_data.set('CONFIG_D3D12', d3d12.found())
 config_host_data.set('CONFIG_VULKAN', vulkan.found())
 config_host_data.set('CONFIG_PLUGIN', get_option('plugins'))
 config_host_data.set('CONFIG_RBD', rbd.found())

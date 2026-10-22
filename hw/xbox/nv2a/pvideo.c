@@ -58,6 +58,10 @@ void pvideo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     switch (addr) {
     case NV_PVIDEO_BUFFER:
         d->pvideo.regs[addr] = val;
+        /* A BUFFER write submits (and on hardware flips to) a new overlay
+         * buffer, even when the written USE bit is unchanged.  Publish the
+         * submission after the register and preceding guest VRAM writes. */
+        qatomic_inc(&d->pvideo.frame_generation);
         // d->vga.enable_overlay = true;
         pvideo_vga_invalidate(d);
         break;

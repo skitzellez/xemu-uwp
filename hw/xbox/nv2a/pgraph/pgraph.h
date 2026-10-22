@@ -33,11 +33,15 @@
 #include "texture.h"
 #include "util.h"
 #include "vsh_regs.h"
+#include "hw/xbox/nv2a/display_frame.h"
 
 typedef struct NV2AState NV2AState;
 typedef struct PGRAPHNullState PGRAPHNullState;
 typedef struct PGRAPHGLState PGRAPHGLState;
 typedef struct PGRAPHVkState PGRAPHVkState;
+#ifdef CONFIG_D3D12
+typedef struct PGRAPHD3D12State PGRAPHD3D12State;
+#endif
 
 typedef struct VertexAttribute {
     bool dma_select;
@@ -126,11 +130,15 @@ typedef struct PGRAPHRenderer {
         void (*pre_shutdown_wait)(NV2AState *d);
         void (*process_pending)(NV2AState *d);
         void (*process_pending_reports)(NV2AState *d);
+        /* Optional: the FIFO loop's call, made with pfifo.lock held and
+         * pg->lock not held; process_pending_reports is used when unset. */
+        void (*process_pending_reports_fifo)(NV2AState *d);
         void (*surface_flush)(NV2AState *d);
         void (*surface_update)(NV2AState *d, bool upload, bool color_write, bool zeta_write);
         void (*set_surface_scale_factor)(NV2AState *d, unsigned int scale);
         unsigned int (*get_surface_scale_factor)(NV2AState *d);
         int (*get_framebuffer_surface)(NV2AState *d);
+        bool (*get_display_frame)(NV2AState *d, NV2ADisplayFrame *frame);
         GPUProperties *(*get_gpu_properties)(void);
     } ops;
 } PGRAPHRenderer;
@@ -270,6 +278,15 @@ typedef struct PGRAPHState {
     bool framebuffer_in_use;
     QemuCond framebuffer_released;
 
+    /*
+     * A scale change can be requested by the HUD while it owns a borrowed
+     * display resource. Applying it immediately would invalidate that
+     * resource before the presenter submits the frame, so remember the
+     * newest request and apply it before the next frame is acquired.
+     */
+    bool surface_scale_change_pending;
+    unsigned int pending_surface_scale_factor;
+
     enum {
         PGRAPH_RENDERER_SWITCH_PHASE_IDLE,
         PGRAPH_RENDERER_SWITCH_PHASE_STARTED,
@@ -279,12 +296,36 @@ typedef struct PGRAPHState {
 
     unsigned int surface_scale_factor;
     uint8_t *scale_buf;
+    /* Bumped by the UI when the custom textures folder changes. */
+    uint32_t custom_textures_gen;
+
+    /*
+     * Shader cache title requests from the UI and precompile progress from
+     * the renderer, all accessed atomically. The progress fields describe
+     * request status_gen; a renderer that has not caught up with
+     * request_gen is still loading.
+     */
+    struct {
+        uint32_t title_id;
+        uint32_t request_gen;
+        bool foreground;
+        bool supported;
+        uint32_t status_gen;
+        uint32_t state;
+        uint32_t total;
+        uint32_t done;
+        uint32_t failed;
+        uint32_t recorded;
+    } shader_cache;
 
     const PGRAPHRenderer *renderer;
     union {
         PGRAPHNullState *null_renderer_state;
         PGRAPHGLState *gl_renderer_state;
         PGRAPHVkState *vk_renderer_state;
+#ifdef CONFIG_D3D12
+        PGRAPHD3D12State *d3d12_renderer_state;
+#endif
     };
 } PGRAPHState;
 

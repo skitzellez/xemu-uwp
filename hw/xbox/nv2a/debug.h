@@ -114,6 +114,9 @@
     _X(NV2A_PROF_QUEUE_SUBMIT_3) \
     _X(NV2A_PROF_QUEUE_SUBMIT_4) \
     _X(NV2A_PROF_QUEUE_SUBMIT_5) \
+    _X(NV2A_PROF_PSO_COMPILED_ASYNC) \
+    _X(NV2A_PROF_PSO_COMPILE_FAILED) \
+    _X(NV2A_PROF_DRAW_SKIPPED_PSO_PENDING) \
 
 enum NV2A_PROF_COUNTERS_ENUM {
     #define _X(x) x,
@@ -128,6 +131,10 @@ typedef struct NV2AStats {
     int64_t last_flip_time;
     unsigned int frame_count;
     unsigned int increment_fps;
+    /* Guest frame of the last display snapshot, shown with the FPS
+     * counter when show_frame_number is set (renderer diagnostic). */
+    unsigned int snapshot_frame;
+    bool show_frame_number;
     struct {
         int mspf;
         int counters[NV2A_PROF__COUNT];

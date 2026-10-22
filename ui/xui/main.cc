@@ -49,6 +49,10 @@
 #include "debug.hh"
 #include "welcome.hh"
 #include "menubar.hh"
+#ifdef CONFIG_D3D12
+#include <d3d12.h>
+#include <imgui_impl_dx12.h>
+#endif
 
 #if defined(XEMU_UWP) && __has_include("xemu-uwp-overlay.inc")
 /* the overlay */
@@ -123,6 +127,12 @@ static float g_last_scale;
 static int g_vsync;
 static GLuint g_tex;
 static bool g_flip_req;
+static bool g_hud_ready;
+/* New graphics (Direct3D 12 renderer): menus drawn by ImGui's D3D12 backend into the presenter's frame */
+static bool g_hud_d3d12;
+#ifdef CONFIG_D3D12
+static ID3D12DescriptorHeap *g_d3d12_srv_heap;
+#endif
 
 
 static void InitializeStyle()
@@ -225,17 +235,93 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
     InitializeStyle();
     g_main_menu.SetNextViewIndex(g_config.general.last_viewed_menu_index);
     first_boot_window.is_open = g_config.general.show_welcome;
+    g_hud_ready = true;
+}
+
+/* New graphics: same menus, ImGui's D3D12 backend on the presenter's device. The menu pictures drawn with OpenGL
+ * (logo, controllers) are left out: InitCustomRendering is not called, so those helpers draw nothing. */
+void xemu_hud_init_d3d12(SDL_Window *window, void *device,
+                         void *command_queue, void *srv_heap,
+                         uint64_t font_srv_cpu, uint64_t font_srv_gpu)
+{
+#ifdef CONFIG_D3D12
+    xemu_monitor_init();
+    g_vsync = g_config.display.window.vsync;
+    InitCustomRenderingOff();
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    io.IniFilename = NULL;
+
+    ImGui_ImplSDL3_InitForD3D(window);
+    ImGui_ImplDX12_InitInfo init_info;
+    init_info.Device = (ID3D12Device *)device;
+    init_info.CommandQueue = (ID3D12CommandQueue *)command_queue;
+    init_info.NumFramesInFlight = 3;
+    init_info.RTVFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+    init_info.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    init_info.SrvDescriptorHeap = (ID3D12DescriptorHeap *)srv_heap;
+    init_info.LegacySingleSrvCpuDescriptor.ptr = (SIZE_T)font_srv_cpu;
+    init_info.LegacySingleSrvGpuDescriptor.ptr = (UINT64)font_srv_gpu;
+    g_d3d12_srv_heap = (ID3D12DescriptorHeap *)srv_heap;
+    g_hud_d3d12 = true;
+    if (!ImGui_ImplDX12_Init(&init_info)) {
+        fprintf(stderr, "New graphics: the menus could not start (ImGui_ImplDX12_Init)\n");
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
+        g_hud_d3d12 = false;
+        return;
+    }
+    ImPlot::CreateContext();
+#ifdef XEMU_UWP
+    g_viewport_mgr.Update();
+    g_font_mgr.Update();
+#endif
+    g_last_scale = g_viewport_mgr.m_scale;
+    InitializeStyle();
+    g_main_menu.SetNextViewIndex(g_config.general.last_viewed_menu_index);
+    first_boot_window.is_open = g_config.general.show_welcome;
+    if (!ImGui_ImplDX12_CreateDeviceObjects()) {
+        fprintf(stderr, "New graphics: the menus could not start (ImGui_ImplDX12_CreateDeviceObjects)\n");
+    }
+    g_hud_ready = true;
+#endif
+}
+
+bool xemu_hud_is_initialized(void)
+{
+    return g_hud_ready;
+}
+
+bool xemu_hud_uses_d3d12(void)
+{
+    return g_hud_d3d12;
 }
 
 void xemu_hud_cleanup(void)
 {
+    if (!g_hud_ready) {
+        return;
+    }
+#ifdef CONFIG_D3D12
+    if (g_hud_d3d12) {
+        ImGui_ImplDX12_Shutdown();
+    } else
+#endif
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
+    g_hud_ready = false;
 }
 
 void xemu_hud_process_sdl_events(SDL_Event *event)
 {
+    if (!g_hud_ready) {
+        return;   /* New graphics: the menus start with the first frame */
+    }
     // Ignore inputs that are consumed by rebinding
     if (g_main_menu.ConsumeRebindEvent(event)) {
         return;
@@ -246,6 +332,11 @@ void xemu_hud_process_sdl_events(SDL_Event *event)
 
 void xemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse)
 {
+    if (!g_hud_ready) {
+        if (kbd) *kbd = 0;
+        if (mouse) *mouse = 0;
+        return;
+    }
     ImGuiIO& io = ImGui::GetIO();
     if (kbd) *kbd = io.WantCaptureKeyboard;
     if (mouse) *mouse = io.WantCaptureMouse;
@@ -259,6 +350,9 @@ void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip)
 
 void xemu_hud_update(void)
 {
+    if (!g_hud_ready) {
+        return;
+    }
     ImGuiIO& io = ImGui::GetIO();
     uint32_t now = SDL_GetTicks();
 
@@ -271,7 +365,7 @@ void xemu_hud_update(void)
         g_last_scale = g_viewport_mgr.m_scale;
     }
 
-    if (!first_boot_window.is_open) {
+    if (!first_boot_window.is_open && !g_hud_d3d12) {   /* New graphics: the presenter draws the picture */
         int ww, wh;
         SDL_GetWindowSizeInPixels(xemu_get_window(), &ww, &wh);
         RenderFramebuffer(g_tex, ww, wh, g_flip_req);
@@ -287,6 +381,11 @@ void xemu_hud_update(void)
 #endif
     }
 
+#ifdef CONFIG_D3D12
+    if (g_hud_d3d12) {
+        ImGui_ImplDX12_NewFrame();
+    } else
+#endif
     ImGui_ImplOpenGL3_NewFrame();
     io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
     ImGui_ImplSDL3_NewFrame();
@@ -420,6 +519,9 @@ void xemu_hud_update(void)
 
 void xemu_hud_render()
 {
+    if (g_hud_d3d12) {
+        return;   /* xemu_hud_render_d3d12 */
+    }
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
@@ -432,4 +534,54 @@ void xemu_hud_render()
         SaveScreenshot(g_tex, g_flip_req);
         g_screenshot_pending = false;
     }
+}
+
+/* New graphics: the menus into the presenter's command list (ui/xemu.c, d3d12_render_frame) */
+void xemu_hud_render_d3d12(void *command_list)
+{
+#ifdef CONFIG_D3D12
+    ID3D12GraphicsCommandList *cl = (ID3D12GraphicsCommandList *)command_list;
+    if (!g_hud_d3d12 || cl == NULL || g_d3d12_srv_heap == NULL) {
+        return;
+    }
+    ImGui::Render();
+    /* pictures that only exist as OpenGL textures (controller, logo, thumbnails) are 0 here: D3D12 would read
+     * descriptor 0, so those draws are dropped */
+    ImDrawData *dd = ImGui::GetDrawData();
+    for (int i = 0; i < dd->CmdListsCount; i++) {
+        for (ImDrawCmd &cmd : dd->CmdLists[i]->CmdBuffer) {
+            if (cmd.UserCallback == NULL && cmd.GetTexID() == (ImTextureID)0) {
+                cmd.ElemCount = 0;
+            }
+        }
+    }
+    ID3D12DescriptorHeap *heaps[] = { g_d3d12_srv_heap };
+    cl->SetDescriptorHeaps(1, heaps);
+    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl);
+    g_vsync = g_config.display.window.vsync;
+#endif
+}
+
+/* New graphics: the presenter saves the screenshot; this names the file */
+char *xemu_hud_take_screenshot_path(void)
+{
+    char fname[128];
+
+    if (!g_screenshot_pending) {
+        return NULL;
+    }
+    g_screenshot_pending = false;
+
+    time_t t = time(NULL);
+    struct tm *tmp = localtime(&t);
+    if (tmp) {
+        strftime(fname, sizeof(fname), "xemu-%Y-%m-%d-%H-%M-%S.png", tmp);
+    } else {
+        strcpy(fname, "xemu.png");
+    }
+    const char *output_dir = g_config.general.screenshot_dir;
+    if (!strlen(output_dir)) {
+        output_dir = ".";
+    }
+    return g_strdup_printf("%s/%s", output_dir, fname);
 }

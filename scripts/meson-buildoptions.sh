@@ -67,9 +67,10 @@ meson_options_help() {
   printf "%s\n" '  --libdir=VALUE           Library directory [system default]'
   printf "%s\n" '  --libexecdir=VALUE       Library executable directory [libexec]'
   printf "%s\n" '  --localedir=VALUE        Locale data directory [share/locale]'
-  printf "%s\n" '  --localstatedir=VALUE    Localstate data directory [/var/local]'
+  printf "%s\n" '  --localstatedir=VALUE    Localstate data directory [var]'
   printf "%s\n" '  --mandir=VALUE           Manual page directory [share/man]'
-  printf "%s\n" '  --prefix=VALUE           Installation prefix [/usr/local]'
+  printf "%s\n" '  --prefix=VALUE           Installation prefix [C:/Users/GamerDad/XboxEmu/xe'
+  printf "%s\n" '                           mu-d3d12/build-d3d12/pyvenv]'
   printf "%s\n" '  --qemu-ga-distro=VALUE   second path element in qemu-ga registry entries'
   printf "%s\n" '                           [Linux]'
   printf "%s\n" '  --qemu-ga-manufacturer=VALUE'
@@ -115,6 +116,7 @@ meson_options_help() {
   printf "%s\n" '  crypto-afalg    Linux AF_ALG crypto backend driver'
   printf "%s\n" '  curl            CURL block device driver'
   printf "%s\n" '  curses          curses UI'
+  printf "%s\n" '  d3d12           Direct3D 12 NV2A renderer (New graphics)'
   printf "%s\n" '  dbus-display    -display dbus support'
   printf "%s\n" '  dmg             dmg image format support'
   printf "%s\n" '  docs            Documentations build support'
@@ -295,6 +297,8 @@ _meson_option_parse() {
     --disable-curl) printf "%s" -Dcurl=disabled ;;
     --enable-curses) printf "%s" -Dcurses=enabled ;;
     --disable-curses) printf "%s" -Dcurses=disabled ;;
+    --enable-d3d12) printf "%s" -Dd3d12=enabled ;;
+    --disable-d3d12) printf "%s" -Dd3d12=disabled ;;
     --datadir=*) quote_sh "-Ddatadir=$2" ;;
     --enable-dbus-display) printf "%s" -Ddbus_display=enabled ;;
     --disable-dbus-display) printf "%s" -Ddbus_display=disabled ;;

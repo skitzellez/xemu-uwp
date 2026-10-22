@@ -57,6 +57,8 @@
 
 #include "hw/xbox/xbox.h"
 #include "smbus.h"
+#include "exec/cputlb.h"
+#include "system/tcg.h"
 
 #define MAX_IDE_BUS 2
 
@@ -203,6 +205,9 @@ static void xbox_memory_init(PCMachineState *pcms,
 
     *ram_memory = ram;
     memory_region_add_subregion(system_memory, 0, ram);
+    if (tcg_enabled()) {
+        tlb_set_dirty_filter_ram(memory_region_get_ram_ptr(ram), machine->ram_size);
+    }
 
     xbox_flash_init(machine, rom_memory);
     pc_system_flash_cleanup_unused(pcms);

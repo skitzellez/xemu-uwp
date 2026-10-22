@@ -315,6 +315,7 @@ static void nv2a_reset(NV2AState *d)
     memset(d->pfifo.regs, 0, sizeof(d->pfifo.regs));
     memset(d->pgraph.regs_, 0, sizeof(d->pgraph.regs_));
     memset(d->pvideo.regs, 0, sizeof(d->pvideo.regs));
+    qatomic_inc(&d->pvideo.frame_generation);
 
     d->pcrtc.start = 0;
     d->pramdac.core_clock_coeff = 0x00011C01; /* 189MHz...? */
@@ -443,6 +444,10 @@ static int nv2a_pre_load(void *opaque)
 static int nv2a_post_load(void *opaque, int version_id)
 {
     NV2AState *d = opaque;
+    /* frame_generation is runtime cache coherency state, not migrated state.
+     * Invalidate any renderer-local PVIDEO conversion after VRAM/registers
+     * have been restored. */
+    qatomic_inc(&d->pvideo.frame_generation);
     qatomic_set(&d->pgraph.flush_pending, true);
     nv2a_unlock_fifo(d);
     return 0;

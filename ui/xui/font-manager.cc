@@ -18,6 +18,10 @@
 //
 #include "font-manager.hh"
 #include "viewport-manager.hh"
+#include "xemu-hud.h"
+#ifdef CONFIG_D3D12
+#include <imgui_impl_dx12.h>
+#endif
 
 #include "data/Roboto-Medium.ttf.h"
 #include "data/RobotoCondensed-Regular.ttf.h"
@@ -99,6 +103,13 @@ void FontManager::Rebuild()
         m_fixed_width_font = io.Fonts->AddFontDefault(&config);
     }
 
+#ifdef CONFIG_D3D12
+    if (xemu_hud_uses_d3d12()) {
+        /* New graphics: the font texture is a device object; ImGui_ImplDX12_NewFrame makes it again */
+        ImGui_ImplDX12_InvalidateDeviceObjects();
+        return;
+    }
+#endif
     ImGui_ImplOpenGL3_DestroyFontsTexture();
     ImGui_ImplOpenGL3_CreateFontsTexture();
 }

@@ -361,6 +361,7 @@ typedef struct MemAccessCallback {
     hwaddr len;
     MemAccessCallbackFunc func;
     void *opaque;
+    bool enabled;
     QTAILQ_ENTRY(MemAccessCallback) entry;
 } MemAccessCallback;
 #endif
@@ -1197,6 +1198,11 @@ MemAccessCallback *mem_access_callback_insert(CPUState *cpu, MemoryRegion *mr,
                                               hwaddr offset, hwaddr len,
                                               MemAccessCallbackFunc func,
                                               void *opaque);
+MemAccessCallback *mem_access_callback_insert_disabled(
+    CPUState *cpu, MemoryRegion *mr, hwaddr offset, hwaddr len,
+    MemAccessCallbackFunc func, void *opaque);
+void mem_access_callback_set_enabled(CPUState *cpu, MemAccessCallback *cb,
+                                     bool enabled);
 void mem_access_callback_remove_by_ref(CPUState *cpu, MemAccessCallback *cb);
 int mem_access_callback_address_matches(CPUState *cpu, hwaddr addr, hwaddr len);
 void mem_check_access_callback_ramaddr(CPUState *cpu,

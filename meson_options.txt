@@ -210,6 +210,8 @@ option('pvg', type: 'feature', value: 'auto',
        description: 'macOS paravirtualized graphics support')
 option('rbd', type : 'feature', value : 'auto',
        description: 'Ceph block device driver')
+option('d3d12', type : 'feature', value : 'auto',
+       description: 'Direct3D 12 NV2A renderer (New graphics)')
 option('opengl', type : 'feature', value : 'enabled',
        description: 'OpenGL support')
 option('rdma', type : 'feature', value : 'auto',

@@ -64,6 +64,9 @@ elif host_os == 'windows'
 elif host_os == 'darwin'
   xemu_ss.add(files('xemu-os-utils-macos.m'))
 endif
+if d3d12.found()
+  xemu_ss.add(files('d3d12-presenter.cc', 'xemu-image.cc'), d3d12)
+endif
 xemu_ss.add(imgui, implot, stb_image, sdl, opengl, fa, fpng, json, fatx, tomlplusplus, genconfig)
 system_ss.add_all(xemu_ss)
 

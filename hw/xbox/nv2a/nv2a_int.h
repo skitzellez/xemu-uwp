@@ -103,10 +103,39 @@ typedef struct NV2AState {
         QemuCond fifo_idle_cond;
         bool fifo_kick;
         bool halt;
+        /* Time the FIFO thread spent waiting for work. */
+        int64_t idle_us;
     } pfifo;
+
+    /*
+     * PGRAPH register reads without side effects skip pg->lock, which the
+     * FIFO thread holds for the whole of each method (diagnostic switch).
+     */
+    bool pgraph_read_unlocked;
+
+    /* Guest register reads, for host-side profiling. */
+    struct {
+        uint32_t pfifo;
+        uint32_t pgraph;
+        uint32_t user;
+        uint32_t ptimer;
+        /* vCPU time blocked on the FIFO/graph locks in these reads. */
+        int64_t pfifo_wait_us;
+        int64_t pgraph_wait_us;
+        int64_t user_wait_us;
+        /* Per PGRAPH register: reads and lock wait, cleared when reported. */
+        uint32_t pgraph_addr_reads[0x800];
+        uint32_t pgraph_addr_wait_us[0x800];
+    } mmio_reads;
 
     struct {
         uint32_t regs[0x1000];
+        /*
+         * NV_PVIDEO_BUFFER is the overlay flip/submit register.  Keep a
+         * renderer-independent generation so display backends can cache a
+         * converted frame without polling or hashing the guest YUY2 buffer.
+         */
+        uint64_t frame_generation;
     } pvideo;
 
     struct {

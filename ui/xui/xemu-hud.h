@@ -41,6 +41,13 @@ void xemu_main_loop_unlock(void);
 
 // Implemented in xemu_hud.cc
 void xemu_hud_init(SDL_Window *window, void *sdl_gl_context);
+void xemu_hud_init_d3d12(SDL_Window *window, void *device,
+                         void *command_queue, void *srv_heap,
+                         uint64_t font_srv_cpu, uint64_t font_srv_gpu);
+void xemu_hud_render_d3d12(void *command_list);
+char *xemu_hud_take_screenshot_path(void);
+bool xemu_hud_uses_d3d12(void);
+bool xemu_hud_is_initialized(void);
 void xemu_hud_cleanup(void);
 void xemu_hud_update(void);
 void xemu_hud_render(void);

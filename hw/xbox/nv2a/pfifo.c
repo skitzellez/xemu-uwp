@@ -498,6 +498,10 @@ void *pfifo_thread(void *arg)
          * Only this thread touches the report queue and its GL context, so wait without the lock,
          * as the puller does around pgraph_method; a kick meanwhile sets fifo_kick, checked below. */
         extern bool xemu_uwp_reports_nowait, xemu_uwp_reports_left;   /* gl/reports.c */
+        if (d->pgraph.renderer->ops.process_pending_reports_fifo) {
+            /* New graphics renderer: its own report handling, called with pfifo.lock held */
+            pgraph_process_pending_reports(d);
+        } else {
         qemu_mutex_unlock(&d->pfifo.lock);
         /* test file reports-wait.txt: every result waited for, as upstream does */
         static int uwp_reports_wait = -1;
@@ -546,6 +550,7 @@ void *pfifo_thread(void *arg)
             pgraph_process_pending_reports(d);
         }
         qemu_mutex_lock(&d->pfifo.lock);
+        }
 #else
         pgraph_process_pending_reports(d);
 #endif

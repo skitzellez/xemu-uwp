@@ -283,4 +283,9 @@ static inline void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *cpu,
 {
 }
 #endif /* CONFIG_TCG && !CONFIG_USER_ONLY */
+#ifdef XBOX
+void tlb_flush_host_range(CPUState *cpu, uintptr_t start, uintptr_t length);
+/* the guest RAM block whose writable TLB entries tlb_reset_dirty() keeps notes of */
+void tlb_set_dirty_filter_ram(void *host, uint64_t size);
+#endif
 #endif /* CPUTLB_H */

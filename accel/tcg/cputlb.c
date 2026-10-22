@@ -424,6 +424,54 @@ void tlb_flush(CPUState *cpu)
     tlb_flush_by_mmuidx(cpu, ALL_MMUIDX_BITS);
 }
 
+#ifdef XBOX
+/* whether a TLB entry maps a page whose host address lies in [start, start + length) */
+static bool tlb_entry_in_host_range(const CPUTLBEntry *ent, uintptr_t start, uintptr_t length)
+{
+    uint64_t cmp[3] = { ent->addr_read, ent->addr_write, ent->addr_code };
+
+    for (int i = 0; i < 3; i++) {
+        if (cmp[i] != (uint64_t)-1) {
+            uintptr_t host = (cmp[i] & TARGET_PAGE_MASK) + ent->addend;
+            return host - start < length;
+        }
+    }
+    return false;
+}
+
+/*
+ * Drops only the translations of a host memory range (a surface the New graphics renderer starts or stops
+ * watching), not the whole TLB: a full flush on every watch switch made the emulated CPU refill its TLB all the
+ * time (Mortal Kombat crowds ran in slow motion). Runs on the vCPU thread.
+ */
+void tlb_flush_host_range(CPUState *cpu, uintptr_t start, uintptr_t length)
+{
+    uintptr_t first = start & TARGET_PAGE_MASK;
+    uintptr_t span = ROUND_UP(start + length, TARGET_PAGE_SIZE) - first;
+
+    assert_cpu_is_self(cpu);
+    qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    for (MMUIdxMap work = cpu->neg.tlb.c.dirty; work != 0; work &= work - 1) {
+        int mmu_idx = ctz32(work);
+        CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
+        CPUTLBDescFast *fast = cpu_tlb_fast(cpu, mmu_idx);
+        size_t n = tlb_n_entries(fast);
+
+        for (size_t i = 0; i < n; i++) {
+            if (tlb_entry_in_host_range(&fast->table[i], first, span)) {
+                memset(&fast->table[i], -1, sizeof(fast->table[i]));
+            }
+        }
+        for (size_t i = 0; i < CPU_VTLB_SIZE; i++) {
+            if (tlb_entry_in_host_range(&desc->vtable[i], first, span)) {
+                memset(&desc->vtable[i], -1, sizeof(desc->vtable[i]));
+            }
+        }
+    }
+    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+}
+#endif
+
 void tlb_flush_by_mmuidx_all_cpus_synced(CPUState *src_cpu, MMUIdxMap idxmap)
 {
     const run_on_cpu_func fn = tlb_flush_by_mmuidx_async_work;
@@ -918,11 +966,115 @@ static inline void copy_tlb_helper_locked(CPUTLBEntry *d, const CPUTLBEntry *s)
  * We must take tlb_c.lock to avoid racing with another vCPU update. The only
  * thing actually updated is the target TLB entry ->addr_write flags.
  */
+#ifdef XBOX
+/*
+ * Which virtual page last made each guest RAM page writable in the TLB without TLB_NOTDIRTY: 0 for none, the page
+ * number plus one, or TLB_WR_MANY. tlb_reset_dirty() then resets those entries (and the victim TLBs) instead of
+ * walking every entry of every mode: the graphics renderers check and clear written memory per draw, and each
+ * reset walked the whole TLB (New graphics: a fifth of the FIFO thread in Mortal Kombat crowds, the game in slow
+ * motion). A stale note only costs a lookup. Single vCPU only (the Xbox). Idea from another Xbox port of xemu.
+ */
+#define TLB_WR_MANY UINT32_MAX
+static uintptr_t tlb_wr_base;
+static uintptr_t tlb_wr_pages;
+static uint32_t *tlb_wr_vpage;
+
+void tlb_set_dirty_filter_ram(void *host, uint64_t size)
+{
+    tlb_wr_vpage = g_new0(uint32_t, size >> TARGET_PAGE_BITS);
+    tlb_wr_pages = size >> TARGET_PAGE_BITS;
+    tlb_wr_base = (uintptr_t)host;
+}
+
+/* Called with tlb_c.lock held. */
+static inline void tlb_wr_note(uintptr_t host_page, vaddr addr_page)
+{
+    uintptr_t p = (host_page - tlb_wr_base) >> TARGET_PAGE_BITS;
+    vaddr vpage = addr_page >> TARGET_PAGE_BITS;
+    uint32_t v;
+
+    if (tlb_wr_vpage == NULL || p >= tlb_wr_pages) {
+        return;
+    }
+    v = vpage < TLB_WR_MANY - 1 ? (uint32_t)vpage + 1 : TLB_WR_MANY;
+    if (tlb_wr_vpage[p] == 0) {
+        tlb_wr_vpage[p] = v;
+    } else if (tlb_wr_vpage[p] != v) {
+        tlb_wr_vpage[p] = TLB_WR_MANY;
+    }
+}
+
+/* Page index range of [start, start + length) in the RAM block, or false. */
+static bool tlb_wr_range(uintptr_t start, uintptr_t length, uintptr_t *first, uintptr_t *last)
+{
+    uintptr_t off = start - tlb_wr_base;
+
+    if (tlb_wr_vpage == NULL || length == 0 || off >= (tlb_wr_pages << TARGET_PAGE_BITS) ||
+        length > (tlb_wr_pages << TARGET_PAGE_BITS) - off) {
+        return false;
+    }
+    *first = off >> TARGET_PAGE_BITS;
+    *last = (off + length - 1) >> TARGET_PAGE_BITS;
+    return true;
+}
+
+static void tlb_reset_dirty_range_locked(CPUTLBEntryFull *full, CPUTLBEntry *ent,
+                                         uintptr_t start, uintptr_t length);
+
+/*
+ * Called with tlb_c.lock held. Resets the entries noted for the pages of the range plus the victim TLBs; false
+ * when a page has several writable mappings and the range needs the full walk.
+ */
+static bool tlb_reset_dirty_mapped(CPUState *cpu, uintptr_t start, uintptr_t length)
+{
+    uintptr_t first, last;
+    MMUIdxMap work;
+
+    if (cpu != first_cpu || CPU_NEXT(cpu) != NULL || !tlb_wr_range(start, length, &first, &last)) {
+        return false;
+    }
+    for (uintptr_t p = first; p <= last; p++) {
+        if (tlb_wr_vpage[p] == TLB_WR_MANY) {
+            return false;
+        }
+    }
+    for (uintptr_t p = first; p <= last; p++) {
+        if (tlb_wr_vpage[p] == 0) {
+            continue;
+        }
+        vaddr addr_page = (vaddr)(tlb_wr_vpage[p] - 1) << TARGET_PAGE_BITS;
+        tlb_wr_vpage[p] = 0;
+        for (work = cpu->neg.tlb.c.dirty; work != 0; work &= work - 1) {
+            int mmu_idx = ctz32(work);
+            uintptr_t i = tlb_index(cpu, mmu_idx, addr_page);
+
+            tlb_reset_dirty_range_locked(&cpu->neg.tlb.d[mmu_idx].fulltlb[i], tlb_entry(cpu, mmu_idx, addr_page),
+                                         start, length);
+        }
+    }
+    /* evicted entries keep their state in the victim TLBs */
+    for (work = cpu->neg.tlb.c.dirty; work != 0; work &= work - 1) {
+        CPUTLBDesc *desc = &cpu->neg.tlb.d[ctz32(work)];
+
+        for (int i = 0; i < CPU_VTLB_SIZE; i++) {
+            tlb_reset_dirty_range_locked(&desc->vfulltlb[i], &desc->vtable[i], start, length);
+        }
+    }
+    return true;
+}
+#endif
+
 void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length)
 {
     int mmu_idx;
 
     qemu_spin_lock(&cpu->neg.tlb.c.lock);
+#ifdef XBOX
+    if (tlb_reset_dirty_mapped(cpu, start, length)) {
+        qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+        return;
+    }
+#endif
     for (mmu_idx = 0; mmu_idx < NB_MMU_MODES; mmu_idx++) {
         CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
         CPUTLBDescFast *fast = cpu_tlb_fast(cpu, mmu_idx);
@@ -939,6 +1091,15 @@ void tlb_reset_dirty(CPUState *cpu, uintptr_t start, uintptr_t length)
                                          start, length);
         }
     }
+#ifdef XBOX
+    {
+        /* every entry of the range was visited: its notes are done with */
+        uintptr_t first, last;
+        if (tlb_wr_range(start, length, &first, &last)) {
+            memset(&tlb_wr_vpage[first], 0, (last - first + 1) * sizeof(*tlb_wr_vpage));
+        }
+    }
+#endif
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 }
 
@@ -1185,6 +1346,12 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     }
     tlb_set_compare(full, &tn, addr_page, write_flags,
                     MMU_DATA_STORE, prot & PAGE_WRITE);
+#ifdef XBOX
+    if (is_ram && (prot & PAGE_WRITE) &&
+        !(write_flags & (TLB_INVALID_MASK | TLB_MMIO | TLB_DISCARD_WRITE | TLB_NOTDIRTY))) {
+        tlb_wr_note(addend, addr_page);
+    }
+#endif
 
     copy_tlb_helper_locked(te, &tn);
     tlb_n_used_entries_inc(cpu, mmu_idx);

@@ -34,6 +34,8 @@
 #include "ui/shader/xemu-logo-frag.h"
 
 Fbo *controller_fbo, *xmu_fbo, *logo_fbo;
+/* New graphics (Direct3D 12 menus): no OpenGL context, so these helpers draw nothing and textures stay 0 */
+static bool g_gl_helpers_off;
 GLuint g_controller_duke_tex, g_controller_s_tex, g_logo_tex, g_icon_tex, g_xmu_tex;
 
 enum class ShaderType {
@@ -83,6 +85,11 @@ Fbo::Fbo(int width, int height)
 {
     w = width;
     h = height;
+    tex = 0;
+    fbo = 0;
+    if (g_gl_helpers_off) {
+        return;
+    }
 
     // Allocate the texture
     glGenTextures(1, &tex);
@@ -110,12 +117,18 @@ Fbo::Fbo(int width, int height)
 
 Fbo::~Fbo()
 {
+    if (g_gl_helpers_off) {
+        return;
+    }
     glDeleteTextures(1, &tex);
     glDeleteFramebuffers(1, &fbo);
 }
 
 void Fbo::Target()
 {
+    if (g_gl_helpers_off) {
+        return;
+    }
     GLint vp[4];
     glGetIntegerv(GL_VIEWPORT, vp);
 
@@ -132,6 +145,9 @@ void Fbo::Target()
 
 void Fbo::Restore()
 {
+    if (g_gl_helpers_off) {
+        return;
+    }
     if (!blend) {
         glDisable(GL_BLEND);
     }
@@ -436,6 +452,14 @@ enum tex_item_names {
     obj_port_lbl_4,
     obj_xmu
 };
+
+void InitCustomRenderingOff(void)
+{
+    g_gl_helpers_off = true;
+    controller_fbo = new Fbo(512, 512);
+    xmu_fbo = new Fbo(512, 256);
+    logo_fbo = new Fbo(512, 512);
+}
 
 void InitCustomRendering(void)
 {
@@ -796,6 +820,9 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
 void RenderController(float frame_x, float frame_y, uint32_t primary_color,
                       uint32_t secondary_color, ControllerState *state)
 {
+    if (g_gl_helpers_off) {
+        return;
+    }
     if (strcmp(bound_drivers[state->bound], DRIVER_S) == 0)
         RenderControllerS(frame_x, frame_y, primary_color, secondary_color,
                           state);
@@ -807,6 +834,9 @@ void RenderController(float frame_x, float frame_y, uint32_t primary_color,
 void RenderControllerPort(float frame_x, float frame_y, int i,
                           uint32_t port_color)
 {
+    if (g_gl_helpers_off) {
+        return;
+    }
     glUseProgram(g_decal_shader->prog);
     glBindVertexArray(g_decal_shader->vao);
     glActiveTexture(GL_TEXTURE0);
@@ -836,6 +866,9 @@ void RenderControllerPort(float frame_x, float frame_y, int i,
 void RenderXmu(float frame_x, float frame_y, uint32_t primary_color,
                uint32_t secondary_color)
 {
+    if (g_gl_helpers_off) {
+        return;
+    }
     glUseProgram(g_decal_shader->prog);
     glBindVertexArray(g_decal_shader->vao);
     glActiveTexture(GL_TEXTURE0);
@@ -855,6 +888,9 @@ void RenderXmu(float frame_x, float frame_y, uint32_t primary_color,
 
 void RenderLogo(uint32_t time)
 {
+    if (g_gl_helpers_off) {
+        return;
+    }
     uint32_t color = 0x62ca13ff;
 
     g_logo_shader->time = time;
@@ -886,6 +922,9 @@ void ScaleDimensions(int src_width, int src_height, int max_width, int max_heigh
 
 void RenderFramebuffer(GLint tex, int width, int height, bool flip, float scale[2])
 {
+    if (g_gl_helpers_off) {
+        return;
+    }
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
     
@@ -942,6 +981,9 @@ static float GetDisplayAspectRatio(int width, int height)
 
 void RenderFramebuffer(GLint tex, int width, int height, bool flip)
 {
+    if (g_gl_helpers_off) {
+        return;
+    }
     int tw, th;
     float scale[2];
 
@@ -988,6 +1030,9 @@ void RenderFramebuffer(GLint tex, int width, int height, bool flip)
 
 bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, int max_width, int max_height)
 {
+    if (g_gl_helpers_off) {
+        return false;
+    }
     int width, height;
 
     glActiveTexture(GL_TEXTURE0);
@@ -1035,6 +1080,9 @@ bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, in
 
 void SaveScreenshot(GLuint tex, bool flip)
 {
+    if (g_gl_helpers_off) {
+        return;
+    }
     Error *err = NULL;
     char fname[128];
     std::vector<uint8_t> png;
