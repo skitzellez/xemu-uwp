@@ -235,6 +235,7 @@ typedef struct DisasContext {
 
     /* Floating point */
     bool flcr_set;
+    bool mmx_entered; /* tags/fpstt already zeroed for MMX in this TB */
     int fpstt_delta;
     TCGv_fp fpregs[8];
     TCGv_fp ft0;
@@ -1816,16 +1817,23 @@ static void gen_fxchg_ST0_STN(DisasContext *s, int st_index)
 
 static void gen_enter_mmx(DisasContext *s)
 {
+    /*
+     * MMX instructions only zero fpstt and the tags, so after the first one
+     * in a TB nothing changes them until an x87 op, EMMS or a state restore
+     * (those clear mmx_entered).
+     */
+    if (s->mmx_entered) {
+        return;
+    }
+    s->mmx_entered = true;
+
     GEN_HELPER_FALLBACK_v_v(enter_mmx);
 
     gen_flush_fp((DisasContext *)tcg_ctx->disas_ctx);
 
     tcg_gen_movi_i32(fpstt, 0);
-
-    TCGv_i32 v = tcg_constant_i32(0);
-    for (int i = 0; i < 8; i++) {
-        tcg_gen_st8_i32(v, tcg_env, offsetof(CPUX86State, fptags[0]) + i);
-    }
+    tcg_gen_st_i64(tcg_constant_i64(0), tcg_env,
+                   offsetof(CPUX86State, fptags[0]));
 }
 
 static void gen_flds_FT0(DisasContext *s, TCGv_i32 arg)
@@ -2936,6 +2944,8 @@ static void gen_x87(DisasContext *s, X86DecodedInsn *decode)
     int b = decode->b;
     int modrm = s->modrm;
     int mod, rm, op;
+
+    s->mmx_entered = false;
 
     if (s->flags & (HF_EM_MASK | HF_TS_MASK)) {
         /* if CR0.EM or CR0.TS are set, generate an FPU exception */
@@ -4291,6 +4301,7 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->fpstt_delta = 0;
     dc->ft0 = NULL;
     dc->flcr_set = false;
+    dc->mmx_entered = false;
 }
 
 static void i386_tr_tb_start(DisasContextBase *db, CPUState *cpu)
