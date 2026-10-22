@@ -27,6 +27,9 @@
 #include "xemu-hud.h"
 #include "misc.hh"
 #include "gl-helpers.hh"
+#ifdef CONFIG_D3D12
+#include "d3d12-textures.hh"
+#endif
 #include "reporting.hh"
 #include "qapi/error.h"
 #include "actions.hh"
@@ -1196,14 +1199,20 @@ bool MainMenuSnapshotsView::BigSnapshotButton(QEMUSnapshotInfo *snapshot,
     draw_list->PushClipRect(p0, p1, true);
 
     // Snapshot thumbnail
-    GLuint thumbnail = data->gl_thumbnail ? data->gl_thumbnail : g_icon_tex;
     int thumbnail_width, thumbnail_height;
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, thumbnail);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
-                             &thumbnail_width);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
-                             &thumbnail_height);
+    ImTextureID thumbnail;
+    if (data->gl_thumbnail && !xemu_hud_uses_d3d12()) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, data->gl_thumbnail);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
+                                 &thumbnail_width);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
+                                 &thumbnail_height);
+        thumbnail = (ImTextureID)(uint64_t)data->gl_thumbnail;
+    } else {
+        /* New graphics: no OpenGL here, the xemu icon stands in */
+        thumbnail = IconTexture(&thumbnail_width, &thumbnail_height);
+    }
 
     // Draw black background behind thumbnail
     ImVec2 thumbnail_min(p0.x + thumbnail_pos.x, p0.y + thumbnail_pos.y);
@@ -1220,7 +1229,7 @@ bool MainMenuSnapshotsView::BigSnapshotButton(QEMUSnapshotInfo *snapshot,
                thumbnail_min.y + (thumbnail_size.y - scaled_height) / 2);
     ImVec2 img_max =
         ImVec2(img_min.x + scaled_width, img_min.y + scaled_height);
-    draw_list->AddImage((ImTextureID)(uint64_t)thumbnail, img_min, img_max);
+    draw_list->AddImage(thumbnail, img_min, img_max);
 
     // Snapshot title
     ImGui::PushFont(g_font_mgr.m_menu_font_medium);
@@ -1623,11 +1632,23 @@ void MainMenuAboutView::Draw()
 
     static const char *sys_info_text = NULL;
     if (sys_info_text == NULL) {
-        const char *gl_shader_version =
-            (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
-        const char *gl_version = (const char *)glGetString(GL_VERSION);
-        const char *gl_renderer = (const char *)glGetString(GL_RENDERER);
-        const char *gl_vendor = (const char *)glGetString(GL_VENDOR);
+        const char *gl_shader_version, *gl_version, *gl_renderer, *gl_vendor;
+#ifdef CONFIG_D3D12
+        if (xemu_hud_uses_d3d12()) {
+            /* New graphics: no OpenGL context to ask */
+            gl_vendor = "Direct3D 12";
+            gl_renderer = XuiD3D12AdapterName();
+            gl_version = "New graphics";
+            gl_shader_version = "HLSL (DXC)";
+        } else
+#endif
+        {
+            gl_shader_version =
+                (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
+            gl_version = (const char *)glGetString(GL_VERSION);
+            gl_renderer = (const char *)glGetString(GL_RENDERER);
+            gl_vendor = (const char *)glGetString(GL_VENDOR);
+        }
         sys_info_text = g_strdup_printf(
             "CPU:          %s\nOS Platform:  %s\nOS Version:   "
             "%s\nManufacturer: %s\n"

@@ -35,10 +35,13 @@ void InputManager::Update()
         }
     }
 
-    // If the mouse is moved, wake the ui
+    // If the mouse is moved, wake the ui. No mouse at all (Xbox) is no move: ImGui then reports -FLT_MAX, which
+    // differed from the starting (0, 0) and woke the menu bar on the first frame.
     ImVec2 current_mouse_pos = ImGui::GetMousePos();
     m_mouse_moved = false;
-    if ((current_mouse_pos.x != m_last_mouse_pos.x) ||
+    if (!ImGui::IsMousePosValid(&current_mouse_pos) && !ImGui::IsAnyMouseDown()) {
+        // nothing to compare
+    } else if ((current_mouse_pos.x != m_last_mouse_pos.x) ||
         (current_mouse_pos.y != m_last_mouse_pos.y) ||
         ImGui::IsMouseDown(0) || ImGui::IsMouseDown(1) || ImGui::IsMouseDown(2)) {
         m_mouse_moved = true;

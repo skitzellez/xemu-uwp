@@ -32,9 +32,13 @@
 #include <vector>
 
 #include "ui/shader/xemu-logo-frag.h"
+#ifdef CONFIG_D3D12
+#include "d3d12-textures.hh"
+#endif
 
 Fbo *controller_fbo, *xmu_fbo, *logo_fbo;
-/* New graphics (Direct3D 12 menus): no OpenGL context, so these helpers draw nothing and textures stay 0 */
+/* New graphics (Direct3D 12 menus): no OpenGL context. The decals below are drawn by the CPU with the same shader
+ * and blend math into each Fbo's own pixels (RenderDecalCpu), which become a Direct3D 12 texture. */
 static bool g_gl_helpers_off;
 GLuint g_controller_duke_tex, g_controller_s_tex, g_logo_tex, g_icon_tex, g_xmu_tex;
 
@@ -45,8 +49,29 @@ enum class ShaderType {
     Logo,
 };
 
+/* A decal texture as the CPU path samples it: RGBA8, row 0 at the bottom (loaded flipped like the GL ones) */
+struct CpuImage {
+    int w = 0, h = 0;
+    std::vector<uint8_t> px;
+};
+
+enum class CpuBlend {
+    Replace,       // GL_ONE, GL_ZERO
+    BehindCutouts, // GL_ONE_MINUS_DST_ALPHA, GL_ONE
+    Alpha,         // GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA
+};
+
+static CpuImage g_cpu_duke, g_cpu_s, g_cpu_xmu, g_cpu_logo;
+static const CpuImage *g_cpu_bound;
+static CpuBlend g_cpu_blend;
+static Fbo *g_cpu_target;
+#ifdef CONFIG_D3D12
+static XuiD3D12Texture *g_d3d12_icon;
+#endif
+
 typedef struct DecalShader_
 {
+    ShaderType type;
     int flip;
     float scale;
     uint32_t time;
@@ -87,7 +112,9 @@ Fbo::Fbo(int width, int height)
     h = height;
     tex = 0;
     fbo = 0;
+    d3d12_tex = NULL;
     if (g_gl_helpers_off) {
+        cpu.assign((size_t)w * h * 4, 0);
         return;
     }
 
@@ -118,15 +145,35 @@ Fbo::Fbo(int width, int height)
 Fbo::~Fbo()
 {
     if (g_gl_helpers_off) {
+#ifdef CONFIG_D3D12
+        XuiD3D12TextureFree(d3d12_tex);
+#endif
         return;
     }
     glDeleteTextures(1, &tex);
     glDeleteFramebuffers(1, &fbo);
 }
 
+ImTextureID Fbo::Texture()
+{
+    if (!g_gl_helpers_off) {
+        return (ImTextureID)(intptr_t)tex;
+    }
+#ifdef CONFIG_D3D12
+    if (d3d12_tex == NULL) {
+        d3d12_tex = XuiD3D12TextureNew(w, h);
+    }
+    return XuiD3D12TextureId(d3d12_tex);
+#else
+    return (ImTextureID)0;
+#endif
+}
+
 void Fbo::Target()
 {
     if (g_gl_helpers_off) {
+        std::fill(cpu.begin(), cpu.end(), 0);
+        g_cpu_target = this;
         return;
     }
     GLint vp[4];
@@ -146,6 +193,17 @@ void Fbo::Target()
 void Fbo::Restore()
 {
     if (g_gl_helpers_off) {
+        g_cpu_target = NULL;
+#ifdef CONFIG_D3D12
+        /* copied to the GPU only when the picture changed (sticks at rest, logo between sweeps) */
+        if (cpu != shown) {
+            shown = cpu;
+            if (d3d12_tex == NULL) {
+                d3d12_tex = XuiD3D12TextureNew(w, h);
+            }
+            XuiD3D12TextureUpdate(d3d12_tex, cpu.data());
+        }
+#endif
         return;
     }
     if (!blend) {
@@ -366,10 +424,100 @@ void main() {
     return s;
 }
 
+struct Vec4 {
+    float r, g, b, a;
+};
+
+static Vec4 ColorVec(uint32_t c)
+{
+    return { ((c >> 24) & 0xff) / 255.0f, ((c >> 16) & 0xff) / 255.0f, ((c >> 8) & 0xff) / 255.0f,
+             (c & 0xff) / 255.0f };
+}
+
+static inline float Clamp01(float v)
+{
+    return v < 0 ? 0 : (v > 1 ? 1 : v);
+}
+
+static inline const uint8_t *CpuTexel(const CpuImage *img, int x, int y)
+{
+    static const uint8_t border[4] = { 0, 0, 0, 0 };   // GL_CLAMP_TO_BORDER, default border colour
+    if (x < 0 || y < 0 || x >= img->w || y >= img->h) {
+        return border;
+    }
+    return &img->px[((size_t)y * img->w + x) * 4];
+}
+
+/* GL_LINEAR at texel coordinates (tx, ty) (texel centres at .5) */
+static Vec4 CpuSample(const CpuImage *img, float tx, float ty)
+{
+    float fx = tx - 0.5f, fy = ty - 0.5f;
+    int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
+    float ax = fx - x0, ay = fy - y0;
+    const uint8_t *t00 = CpuTexel(img, x0, y0), *t10 = CpuTexel(img, x0 + 1, y0);
+    const uint8_t *t01 = CpuTexel(img, x0, y0 + 1), *t11 = CpuTexel(img, x0 + 1, y0 + 1);
+    float c[4];
+    for (int i = 0; i < 4; i++) {
+        float top = t00[i] + (t10[i] - t00[i]) * ax;
+        float bot = t01[i] + (t11[i] - t01[i]) * ax;
+        c[i] = (top + (bot - top) * ay) / 255.0f;
+    }
+    return { c[0], c[1], c[2], c[3] };
+}
+
+static inline void CpuWrite(uint8_t *d, Vec4 src)
+{
+    // A UNORM target clamps the fragment colour before blending
+    float s[4] = { Clamp01(src.r), Clamp01(src.g), Clamp01(src.b), Clamp01(src.a) };
+    float da = d[3] / 255.0f;
+    for (int i = 0; i < 4; i++) {
+        float dst = d[i] / 255.0f, out;
+        switch (g_cpu_blend) {
+        case CpuBlend::BehindCutouts: out = s[i] * (1 - da) + dst; break;
+        case CpuBlend::Alpha: out = s[i] * s[3] + dst * (1 - s[3]); break;
+        default: out = s[i]; break;
+        }
+        d[i] = (uint8_t)(Clamp01(out) * 255.0f + 0.5f);
+    }
+}
+
+/* The mask decal shader (mask_frag_src) on the CPU, into the targeted Fbo */
+static void RenderDecalCpu(int x, int y, int w, int h, int tex_x, int tex_y, int tex_w, int tex_h, uint32_t primary,
+                           uint32_t secondary, uint32_t fill)
+{
+    Fbo *f = g_cpu_target;
+    const CpuImage *img = g_cpu_bound;
+    if (f == NULL || img == NULL || w <= 0 || h <= 0) {
+        return;
+    }
+    Vec4 p = ColorVec(primary), s = ColorVec(secondary), fl = ColorVec(fill);
+    // Drawn at the texture's own size (all but the memory unit): each pixel centre lands on a texel centre
+    bool one_to_one = w == tex_w && h == tex_h;
+    for (int py = y > 0 ? y : 0; py < y + h && py < f->h; py++) {
+        for (int px = x > 0 ? x : 0; px < x + w && px < f->w; px++) {
+            Vec4 t;
+            if (one_to_one) {
+                const uint8_t *tx = CpuTexel(img, tex_x + (px - x), tex_y + (py - y));
+                t = { tx[0] / 255.0f, tx[1] / 255.0f, tx[2] / 255.0f, tx[3] / 255.0f };
+            } else {
+                t = CpuSample(img, tex_x + (px - x + 0.5f) * tex_w / w, tex_y + (py - y + 0.5f) * tex_h / h);
+            }
+            Vec4 o = { fl.r + s.r + (p.r - s.r) * t.r, fl.g + s.g + (p.g - s.g) * t.r,
+                       fl.b + s.b + (p.b - s.b) * t.r, fl.a + t.a - t.b };
+            CpuWrite(&f->cpu[((size_t)py * f->w + px) * 4], o);
+        }
+    }
+}
+
 static void RenderDecal(DecalShader *s, float x, float y, float w, float h,
                         float tex_x, float tex_y, float tex_w, float tex_h,
                         uint32_t primary, uint32_t secondary, uint32_t fill)
 {
+    if (g_gl_helpers_off) {
+        RenderDecalCpu((int)x, (int)y, (int)w, (int)h, (int)tex_x, (int)tex_y, (int)tex_w, (int)tex_h, primary,
+                       secondary, fill);
+        return;
+    }
     GLint vp[4];
     glGetIntegerv(GL_VIEWPORT, vp);
     float ww = vp[2], wh = vp[3];
@@ -453,12 +601,82 @@ enum tex_item_names {
     obj_xmu
 };
 
+static void LoadCpuImage(CpuImage *img, const unsigned char *buf, unsigned int size, bool flip = true)
+{
+    stbi_set_flip_vertically_on_load(flip);
+    int n;
+    unsigned char *data = stbi_load_from_memory(buf, size, &img->w, &img->h, &n, 4);
+    assert(data != NULL);
+    img->px.assign(data, data + (size_t)img->w * img->h * 4);
+    stbi_image_free(data);
+}
+
 void InitCustomRenderingOff(void)
 {
     g_gl_helpers_off = true;
+    LoadCpuImage(&g_cpu_duke, controller_mask_data, controller_mask_size);
+    LoadCpuImage(&g_cpu_s, controller_mask_s_data, controller_mask_s_size);
+    LoadCpuImage(&g_cpu_xmu, xmu_mask_data, xmu_mask_size);
+    LoadCpuImage(&g_cpu_logo, logo_sdf_data, logo_sdf_size);
     controller_fbo = new Fbo(512, 512);
     xmu_fbo = new Fbo(512, 256);
     logo_fbo = new Fbo(512, 512);
+#ifdef CONFIG_D3D12
+    CpuImage icon;
+    LoadCpuImage(&icon, xemu_64x64_data, xemu_64x64_size, false);
+    g_d3d12_icon = XuiD3D12TextureNew(icon.w, icon.h);
+    XuiD3D12TextureUpdate(g_d3d12_icon, icon.px.data());
+#endif
+}
+
+ImTextureID IconTexture(int *width, int *height)
+{
+#ifdef CONFIG_D3D12
+    if (g_gl_helpers_off) {
+        *width = XuiD3D12TextureWidth(g_d3d12_icon);
+        *height = XuiD3D12TextureHeight(g_d3d12_icon);
+        return XuiD3D12TextureId(g_d3d12_icon);
+    }
+#endif
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_icon_tex);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, width);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, height);
+    return (ImTextureID)(intptr_t)g_icon_tex;
+}
+
+/* Decal drawing state: OpenGL, or the CPU path's bound image and blend mode */
+static void DecalBegin(DecalShader *s, GLuint tex, const CpuImage *img)
+{
+    if (g_gl_helpers_off) {
+        g_cpu_bound = img;
+        return;
+    }
+    glUseProgram(s->prog);
+    glBindVertexArray(g_decal_shader->vao);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+}
+
+static void DecalBlend(GLenum sfactor, GLenum dfactor)
+{
+    if (g_gl_helpers_off) {
+        g_cpu_blend = sfactor == GL_ONE_MINUS_DST_ALPHA ? CpuBlend::BehindCutouts :
+                      sfactor == GL_SRC_ALPHA           ? CpuBlend::Alpha :
+                                                          CpuBlend::Replace;
+        return;
+    }
+    glBlendFunc(sfactor, dfactor);
+}
+
+static void DecalEnd(void)
+{
+    if (g_gl_helpers_off) {
+        g_cpu_bound = NULL;
+        return;
+    }
+    glBindVertexArray(0);
+    glUseProgram(0);
 }
 
 void InitCustomRendering(void)
@@ -518,10 +736,7 @@ static void RenderDukeController(float frame_x, float frame_y, uint32_t primary_
     uint32_t now = SDL_GetTicks();
     float t;
 
-    glUseProgram(g_decal_shader->prog);
-    glBindVertexArray(g_decal_shader->vao);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_controller_duke_tex);
+    DecalBegin(g_decal_shader, g_controller_duke_tex, &g_cpu_duke);
 
     // Add a 5 pixel space around the controller so we can wiggle the controller
     // around to visualize rumble in action
@@ -534,8 +749,10 @@ static void RenderDukeController(float frame_x, float frame_y, uint32_t primary_
     float rumble_l = 0;
     float rumble_r = 0;
 
-    glBlendEquation(GL_FUNC_ADD);
-    glBlendFunc(GL_ONE, GL_ZERO);
+    if (!g_gl_helpers_off) {
+        glBlendEquation(GL_FUNC_ADD);
+    }
+    DecalBlend(GL_ONE, GL_ZERO);
 
     uint32_t jewel_color = secondary_color;
 
@@ -566,7 +783,7 @@ static void RenderDukeController(float frame_x, float frame_y, uint32_t primary_
                 tex_items[obj_controller].w, tex_items[obj_controller].h,
                 primary_color, secondary_color, 0);
 
-    glBlendFunc(GL_ONE_MINUS_DST_ALPHA, GL_ONE); // Blend with controller cutouts
+    DecalBlend(GL_ONE_MINUS_DST_ALPHA, GL_ONE); // Blend with controller cutouts
     RenderDecal(g_decal_shader, frame_x + jewel.x, frame_y + jewel.y, jewel.w,
                 jewel.h, 0, 0, 1, 1, 0, 0, jewel_color);
 
@@ -580,7 +797,7 @@ static void RenderDukeController(float frame_x, float frame_y, uint32_t primary_
         }
     }
 
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); // Blend with controller
+    DecalBlend(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); // Blend with controller
 
     // Render left thumbstick
     float w = tex_items[obj_lstick].w;
@@ -614,7 +831,7 @@ static void RenderDukeController(float frame_x, float frame_y, uint32_t primary_
                                                               secondary_color,
                 0);
 
-    glBlendFunc(GL_ONE, GL_ZERO); // Don't blend, just overwrite values in buffer
+    DecalBlend(GL_ONE, GL_ZERO); // Don't blend, just overwrite values in buffer
 
     // Render trigger bars
     float ltrig = state->axis[CONTROLLER_AXIS_LTRIG] / 32767.0;
@@ -646,8 +863,7 @@ static void RenderDukeController(float frame_x, float frame_y, uint32_t primary_
     state->rumble_l = (int)(rumble_l * (float)0xffff);
     state->rumble_r = (int)(rumble_r * (float)0xffff);
 
-    glBindVertexArray(0);
-    glUseProgram(0);
+    DecalEnd();
 }
 
 static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_color,
@@ -677,10 +893,7 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
     uint32_t now = SDL_GetTicks();
     float t;
 
-    glUseProgram(g_decal_shader->prog);
-    glBindVertexArray(g_decal_shader->vao);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_controller_s_tex);
+    DecalBegin(g_decal_shader, g_controller_s_tex, &g_cpu_s);
 
     // Add a 5 pixel space around the controller so we can wiggle the controller
     // around to visualize rumble in action
@@ -693,8 +906,10 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
     float rumble_l = 0;
     float rumble_r = 0;
 
-    glBlendEquation(GL_FUNC_ADD);
-    glBlendFunc(GL_ONE, GL_ZERO);
+    if (!g_gl_helpers_off) {
+        glBlendEquation(GL_FUNC_ADD);
+    }
+    DecalBlend(GL_ONE, GL_ZERO);
 
     uint32_t jewel_color = secondary_color;
 
@@ -728,8 +943,8 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
                 tex_items[obj_controller].w, tex_items[obj_controller].h,
                 primary_color, secondary_color, 0);
 
-    glBlendFunc(GL_ONE_MINUS_DST_ALPHA,
-                GL_ONE); // Blend with controller cutouts
+    DecalBlend(GL_ONE_MINUS_DST_ALPHA,
+               GL_ONE); // Blend with controller cutouts
     RenderDecal(g_decal_shader, frame_x + jewel.x, frame_y + jewel.y, jewel.w,
                 jewel.h, 0, 0, 1, 1, 0, 0, jewel_color);
 
@@ -743,7 +958,7 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
         }
     }
 
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); // Blend with controller
+    DecalBlend(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); // Blend with controller
 
     // Render left thumbstick
     float w = tex_items[obj_lstick].w;
@@ -779,8 +994,8 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
                                                          secondary_color,
         0);
 
-    glBlendFunc(GL_ONE,
-                GL_ZERO); // Don't blend, just overwrite values in buffer
+    DecalBlend(GL_ONE,
+               GL_ZERO); // Don't blend, just overwrite values in buffer
 
     // Render trigger bars
     float ltrig = state->axis[CONTROLLER_AXIS_LTRIG] / 32767.0;
@@ -813,16 +1028,12 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
     state->rumble_l = (int)(rumble_l * (float)0xffff);
     state->rumble_r = (int)(rumble_r * (float)0xffff);
 
-    glBindVertexArray(0);
-    glUseProgram(0);
+    DecalEnd();
 }
 
 void RenderController(float frame_x, float frame_y, uint32_t primary_color,
                       uint32_t secondary_color, ControllerState *state)
 {
-    if (g_gl_helpers_off) {
-        return;
-    }
     if (strcmp(bound_drivers[state->bound], DRIVER_S) == 0)
         RenderControllerS(frame_x, frame_y, primary_color, secondary_color,
                           state);
@@ -834,14 +1045,8 @@ void RenderController(float frame_x, float frame_y, uint32_t primary_color,
 void RenderControllerPort(float frame_x, float frame_y, int i,
                           uint32_t port_color)
 {
-    if (g_gl_helpers_off) {
-        return;
-    }
-    glUseProgram(g_decal_shader->prog);
-    glBindVertexArray(g_decal_shader->vao);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_controller_duke_tex);
-    glBlendFunc(GL_ONE, GL_ZERO);
+    DecalBegin(g_decal_shader, g_controller_duke_tex, &g_cpu_duke);
+    DecalBlend(GL_ONE, GL_ZERO);
 
     // Render port socket
     RenderDecal(g_decal_shader, frame_x, frame_y, tex_items[obj_port_socket].w,
@@ -859,22 +1064,17 @@ void RenderControllerPort(float frame_x, float frame_y, int i,
         tex_items[obj_port_lbl_1 + i].y, tex_items[obj_port_lbl_1 + i].w,
         tex_items[obj_port_lbl_1 + i].h, port_color, port_color, 0);
 
-    glBindVertexArray(0);
-    glUseProgram(0);
+    DecalEnd();
 }
 
 void RenderXmu(float frame_x, float frame_y, uint32_t primary_color,
                uint32_t secondary_color)
 {
-    if (g_gl_helpers_off) {
-        return;
+    DecalBegin(g_decal_shader, g_xmu_tex, &g_cpu_xmu);
+    if (!g_gl_helpers_off) {
+        glBlendEquation(GL_FUNC_ADD);
     }
-    glUseProgram(g_decal_shader->prog);
-    glBindVertexArray(g_decal_shader->vao);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_xmu_tex);
-    glBlendEquation(GL_FUNC_ADD);
-    glBlendFunc(GL_ONE, GL_ZERO);
+    DecalBlend(GL_ONE, GL_ZERO);
 
     // Render xmu
     RenderDecal(g_decal_shader, frame_x, frame_y, 256, 256,
@@ -882,13 +1082,146 @@ void RenderXmu(float frame_x, float frame_y, uint32_t primary_color,
                 tex_items[obj_xmu].w, tex_items[obj_xmu].h, primary_color,
                 secondary_color, 0);
 
-    glBindVertexArray(0);
-    glUseProgram(0);
+    DecalEnd();
+}
+
+/*
+ * The logo shader (ui/shader/xemu-logo.frag) on the CPU, at the same 512x512. Particle and spotlight positions
+ * depend only on the time, so they are worked out once per frame. After the sweep and the last particle
+ * (normalised time 3.75 of 5.8) the picture stays the same until the loop restarts: drawn once, then copied.
+ */
+static float LogoRandom(float co)
+{
+    float v = fabsf(sinf(co * 12.989f)) * 43758.545f;
+    return v - floorf(v);
+}
+
+static inline float SignF(float v)
+{
+    return v > 0 ? 1.0f : (v < 0 ? -1.0f : 0.0f);
+}
+
+static inline float SmoothStep(float e0, float e1, float x)
+{
+    float t = Clamp01((x - e0) / (e1 - e0));
+    return t * t * (3 - 2 * t);
+}
+
+static inline float LogoBox(float uv_x, float x, float width)
+{
+    return SignF(Clamp01(x - uv_x + width)) - SignF(Clamp01(x - uv_x));
+}
+
+static void RenderLogoCpu(uint32_t time)
+{
+    const int n_particles = 35, n_spots = 5;
+    const float line_width = 0.175f, text_x = 0.01f, text_w = 0.98f, text_h = 0.125f, pi = 3.14159265359f;
+    static std::vector<uint8_t> still;
+    Fbo *f = g_cpu_target;
+    if (f == NULL || f->w != 512 || f->h != 512) {
+        return;
+    }
+
+    float t = fmodf(time / 1000.0f, 1.25f + 6.0f) / 1.25f;
+    bool is_still = t >= 3.75f;
+    if (is_still && !still.empty()) {
+        f->cpu = still;
+        return;
+    }
+
+    Vec4 fg = ColorVec(0x62ca13ff);   // bgColor (in_ColorFill) is 0
+    float line_pos = t - line_width + text_x;
+
+    float spot_x[n_spots], spot_y[n_spots];
+    for (int j = 0; j < n_spots; j++) {
+        float ix = text_w * j / (n_spots - 1);
+        float iy = text_h * SignF(LogoRandom(j + 62) - 0.6f) * 2;
+        float vx = SignF(LogoRandom(j + 63) - 0.5f) * 0.7f * (0.3f + 0.6f * LogoRandom(j + 100));
+        float vy = -SignF(iy) * 0.8f * (0.1f + 0.9f * LogoRandom(j + 62));
+        spot_x[j] = ix + vx * t + text_x;
+        spot_y[j] = iy + vy * t + 0.5f;
+    }
+
+    int n_live = 0;
+    float part_x[n_particles], part_y[n_particles], part_i[n_particles];
+    for (int i = 0; i < n_particles; i++) {
+        float ix = text_w * i / (n_particles - 1);
+        float iy = text_h * SignF(LogoRandom(i) - 0.2f);
+        float pt = t - ix;
+        float alive = Clamp01(SignF(pt));
+        float prob = SignF(Clamp01(LogoRandom(i * 30) - 0.7f));
+        float lifespan = 1 + 1.25f * expf(-10 * LogoRandom(i * 30)) + 0.5f * prob;
+        float intensity = alive * Clamp01(lifespan - pt);
+        if (intensity <= 0) {
+            continue;
+        }
+        float k = 20, x = pt * 0.25f + 0.05f + 0.4f * LogoRandom(i + 30);
+        float impulse = 2 * sqrtf(k) * x / (1 + k * x * x);
+        float vx = 0.4f * impulse * SignF(LogoRandom(i + 66) - 0.1f) * (0.3f + 0.6f * LogoRandom(i + 100));
+        float vy = 0.8f * impulse * SignF(iy) * (0.1f + 0.9f * LogoRandom(i + 62));
+        part_x[n_live] = ix + alive * vx * pt + text_x;
+        part_y[n_live] = iy + alive * vy * pt + 0.5f;
+        part_i[n_live] = intensity;
+        n_live++;
+    }
+
+    float l_s = fabsf(cosf(t * pi * 2)), r_s = fabsf(sinf(t * pi * 2));
+    const float scale = 1.4f;
+    for (int py = 0; py < 512; py++) {
+        float uv_y = ((py + 0.5f) / 512 - 0.5f * (1 - 1 / scale)) * scale;
+        float gradient_y = SmoothStep(0.55f, 1, 1 - fabsf(0.5f - uv_y));
+        for (int px = 0; px < 512; px++) {
+            float uv_x = ((px + 0.5f) / 512 - 0.5f * (1 - 1 / scale)) * scale;
+            Vec4 msd = CpuSample(&g_cpu_logo, uv_x * g_cpu_logo.w, uv_y * g_cpu_logo.h);
+            float sd = fmaxf(fminf(msd.r, msd.g), fminf(fmaxf(msd.r, msd.g), msd.b));
+            float dist = 6.0f * (sd - 0.5f);
+            float opacity = Clamp01(dist + 0.5f);
+            float outline = SmoothStep(0.5f, 1, Clamp01(dist + 1.6f) - Clamp01(dist - 1.6f));
+            float sweep = LogoBox(uv_x, line_pos, line_width);
+            /* fill_color = fg * opacity, line_color = fg * outline */
+            float k = opacity + (outline - opacity) * sweep;
+
+            float mask_rhs = Clamp01(SignF(uv_x - line_width - line_pos));
+            if (mask_rhs > 0 && opacity > 0) {
+                float right = SmoothStep(0.3f, 0.7f, 0.8f - 8 * fabsf(t - uv_x + text_x + 0.05f));
+                float c = 0;
+                for (int j = 0; j < n_spots; j++) {
+                    float dx = uv_x - spot_x[j], dy = uv_y - spot_y[j];
+                    c += 1 - SmoothStep(0.04f, 0.07835f, sqrtf(dx * dx + dy * dy));
+                }
+                k += opacity * (0.6f * right + 0.4f * c);
+            }
+
+            for (int i = 0; i < n_live; i++) {
+                float dx = uv_x - part_x[i], dy = uv_y - part_y[i];
+                if (fabsf(dx) < 0.00835f && fabsf(dy) < 0.00835f) {
+                    k += (1 - SmoothStep(0.004f, 0.00835f, sqrtf(dx * dx + dy * dy))) * part_i[i];
+                }
+            }
+
+            if (gradient_y > 0) {
+                float pos = t - uv_x + text_x;
+                float left = l_s * SmoothStep(0, 1, 0.5f - fabsf(pos - line_width) * (20 + 80 * (1 - l_s)));
+                float rgt = r_s * SmoothStep(0, 1, 0.5f - fabsf(pos) * (20 + 80 * (1 - r_s)));
+                k += 2 * LogoBox(uv_x, text_x, text_w) * (left + rgt) * gradient_y;
+            }
+
+            uint8_t *d = &f->cpu[((size_t)py * 512 + px) * 4];
+            d[0] = (uint8_t)(Clamp01(fg.r * k) * 255.0f + 0.5f);
+            d[1] = (uint8_t)(Clamp01(fg.g * k) * 255.0f + 0.5f);
+            d[2] = (uint8_t)(Clamp01(fg.b * k) * 255.0f + 0.5f);
+            d[3] = (uint8_t)(Clamp01(fg.a * k) * 255.0f + 0.5f);
+        }
+    }
+    if (is_still) {
+        still = f->cpu;
+    }
 }
 
 void RenderLogo(uint32_t time)
 {
     if (g_gl_helpers_off) {
+        RenderLogoCpu(time);
         return;
     }
     uint32_t color = 0x62ca13ff;

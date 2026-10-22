@@ -24,7 +24,7 @@ xemu_ss.add(files(
 ))
 
 if d3d12.found()
-  xemu_ss.add(files('imgui-dx12-backend.cc'))
+  xemu_ss.add(files('imgui-dx12-backend.cc', 'd3d12-textures.cc'))
 endif
 
 if host_os == 'windows'

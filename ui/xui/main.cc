@@ -52,6 +52,7 @@
 #ifdef CONFIG_D3D12
 #include <d3d12.h>
 #include <imgui_impl_dx12.h>
+#include "d3d12-textures.hh"
 #endif
 
 #if defined(XEMU_UWP) && __has_include("xemu-uwp-overlay.inc")
@@ -358,8 +359,8 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
     g_hud_ready = true;
 }
 
-/* New graphics: same menus, ImGui's D3D12 backend on the presenter's device. The menu pictures drawn with OpenGL
- * (logo, controllers) are left out: InitCustomRendering is not called, so those helpers draw nothing. */
+/* New graphics: same menus, ImGui's D3D12 backend on the presenter's device. The menu pictures (logo, controllers,
+ * memory units) are drawn by the CPU and copied into D3D12 textures (gl-helpers.cc, d3d12-textures.cc). */
 void xemu_hud_init_d3d12(SDL_Window *window, void *device,
                          void *command_queue, void *srv_heap,
                          uint64_t font_srv_cpu, uint64_t font_srv_gpu)
@@ -367,6 +368,7 @@ void xemu_hud_init_d3d12(SDL_Window *window, void *device,
 #ifdef CONFIG_D3D12
     xemu_monitor_init();
     g_vsync = g_config.display.window.vsync;
+    XuiD3D12TexturesInit(device, srv_heap);
     InitCustomRenderingOff();
 
     IMGUI_CHECKVERSION();
@@ -552,14 +554,20 @@ void xemu_hud_update(void)
     if (menubar) {
         // Auto-hide main menu after 5s of inactivity
         static uint32_t last_check = 0;
+        static bool woken = false;
         float alpha = 1.0;
         const uint32_t timeout = 5000;
         const float fade_duration = 1000.0;
         bool menu_wakeup = g_input_mgr.MouseMoved();
         if (menu_wakeup) {
             last_check = now;
+            woken = true;
         }
-        if ((now-last_check) > timeout) {
+        if (!woken) {
+            // Hidden until the mouse first moves. The timer counted from 0, so a first frame inside 5 s of start
+            // (New graphics: ~1 s, no long shader preparation in front) showed the bar, then faded it.
+            alpha = 0;
+        } else if ((now-last_check) > timeout) {
             if (g_config.display.ui.use_animations) {
                 float t = fmin((float)((now-last_check)-timeout)/fade_duration, 1);
                 alpha = 1-t;
@@ -676,8 +684,8 @@ void xemu_hud_render_d3d12(void *command_list)
         return;
     }
     ImGui::Render();
-    /* pictures that only exist as OpenGL textures (controller, logo, thumbnails) are 0 here: D3D12 would read
-     * descriptor 0, so those draws are dropped */
+    /* a picture that could not be made has texture 0: D3D12 would read descriptor 0 (the font), so those draws
+     * are dropped */
     ImDrawData *dd = ImGui::GetDrawData();
     for (int i = 0; i < dd->CmdListsCount; i++) {
         for (ImDrawCmd &cmd : dd->CmdLists[i]->CmdBuffer) {
@@ -686,6 +694,7 @@ void xemu_hud_render_d3d12(void *command_list)
             }
         }
     }
+    XuiD3D12TexturesUpload(cl);
     ID3D12DescriptorHeap *heaps[] = { g_d3d12_srv_heap };
     cl->SetDescriptorHeaps(1, heaps);
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl);

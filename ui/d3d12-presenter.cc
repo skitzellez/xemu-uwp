@@ -34,7 +34,9 @@ extern "C" {
 #include "ui/xemu-widescreen.h"
 
 #define XEMU_D3D12_BACKBUFFER_COUNT 3
-#define XEMU_D3D12_MAX_FRAME_LATENCY 2
+/* One present waiting at most, as with Mesa (2 buffers, glFinish before each swap): with 2 the controller
+ * answered a frame later. "max_latency=2" in d3d12_tune.txt brings the old queue back for comparison. */
+#define XEMU_D3D12_MAX_FRAME_LATENCY 1
 #define XEMU_D3D12_STREAM_CAPTURES 3
 #define XEMU_D3D12_SRV_COUNT 1024
 #define XEMU_D3D12_FONT_SRV_INDEX 0
@@ -1105,6 +1107,24 @@ static bool prime_swapchain_black(XemuD3D12Presenter *p)
     return wait_for_gpu(p);
 }
 
+static UINT presenter_max_frame_latency(void)
+{
+    g_autofree char *path = g_strdup_printf("%sd3d12_tune.txt",
+                                            xemu_settings_get_base_path());
+    g_autofree gchar *text = NULL;
+    const char *v;
+    UINT latency = XEMU_D3D12_MAX_FRAME_LATENCY;
+
+    if (g_file_get_contents(path, &text, NULL, NULL) &&
+        (v = strstr(text, "max_latency=")) != NULL) {
+        int n = atoi(v + strlen("max_latency="));
+        if (n >= 1 && n <= 3) {
+            latency = (UINT)n;
+        }
+    }
+    return latency;
+}
+
 static bool create_or_resize_swapchain(XemuD3D12Presenter *p)
 {
     UINT width;
@@ -1162,14 +1182,16 @@ static bool create_or_resize_swapchain(XemuD3D12Presenter *p)
             return set_hresult_error(p, hr, "QueryInterface(IDXGISwapChain3)");
         }
 
-        /* The renderer and the swapchain share one queue: at most two
-         * presents wait there, so renderer work never queues behind a
-         * third that waits for a free back buffer. */
-        if (SUCCEEDED(p->swapchain->SetMaximumFrameLatency(
-                XEMU_D3D12_MAX_FRAME_LATENCY))) {
+        /* The renderer and the swapchain share one queue: with one present
+         * waiting there, renderer work never queues behind one that waits
+         * for a free back buffer, and the newest game frame is shown. */
+        UINT latency = presenter_max_frame_latency();
+        if (SUCCEEDED(p->swapchain->SetMaximumFrameLatency(latency))) {
             p->frame_latency_waitable =
                 p->swapchain->GetFrameLatencyWaitableObject();
         }
+        fprintf(stderr, "Direct3D 12 presenter: %u frame(s) queued at most\n",
+                latency);
 
 #ifndef XEMU_UWP
         p->factory->MakeWindowAssociation(p->hwnd, DXGI_MWA_NO_ALT_ENTER);

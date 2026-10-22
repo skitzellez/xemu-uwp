@@ -30,10 +30,14 @@ public:
 
     int w, h;
     GLuint fbo, tex;
+    /* New graphics: drawn by the CPU into these pixels (RGBA8, row 0 at the bottom as in OpenGL), then copied
+     * to a Direct3D 12 texture when they change */
+    std::vector<uint8_t> cpu, shown;
+    struct XuiD3D12Texture *d3d12_tex;
 
     Fbo(int width, int height);
     ~Fbo();
-    inline GLuint Texture() { return tex; }
+    ImTextureID Texture();
     void Target();
     void Restore();
 };
@@ -42,7 +46,10 @@ extern Fbo *controller_fbo, *xmu_fbo, *logo_fbo;
 extern GLuint g_icon_tex;
 
 void InitCustomRendering(void);
+/* New graphics: no OpenGL; the pictures are drawn by the CPU (InitCustomRendering's job for Direct3D 12) */
 void InitCustomRenderingOff(void);
+/* the xemu icon (snapshots without a picture), OpenGL or Direct3D 12 */
+ImTextureID IconTexture(int *width, int *height);
 void RenderLogo(uint32_t time);
 void RenderController(float frame_x, float frame_y, uint32_t primary_color,
                       uint32_t secondary_color, ControllerState *state);
