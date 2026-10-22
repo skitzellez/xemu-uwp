@@ -39,6 +39,11 @@ static int g_use_hard_fpu;
 
 #if defined(XBOX) && defined(__x86_64__)
 #include "ui/xemu-settings.h"
+#include "qemu/xemu-uwp.h"
+
+#ifdef XEMU_UWP
+uint32_t xemu_uwp_flcr_shadow;
+#endif
 #define MAP_GEN_HELPER_SOFT_HARD(name) \
     (g_use_hard_fpu ? gen_helper_##name##__hard : gen_helper_##name##__soft)
 #define gen_helper_flds_FT0       MAP_GEN_HELPER_SOFT_HARD(flds_FT0)
@@ -1649,7 +1654,6 @@ static void gen_movi_f64(DisasContext *s, TCGv_f64 ret, double arg)
 
 static void gen_flcr(DisasContext *s)
 {
-    /* TODO: Oversynchronized */
     if (s->flcr_set) {
         return;
     }
@@ -1659,7 +1663,24 @@ static void gen_flcr(DisasContext *s)
     tcg_gen_andi_i32(v, v, 0xc00);
     tcg_gen_shli_i32(v, v, 3);
     tcg_gen_ori_i32(v, v, 0x1f80);
+#ifdef XEMU_UWP
+    /*
+     * flcr_set is dropped at every helper call and block end, so x87 code ran LDMXCSR (15-20 cycles on Zen 2)
+     * every few instructions, nearly always with the value already there. Load it only when it differs from
+     * the last one loaded (include/qemu/xemu-uwp.h). The branch ends a TCG basic block, which flushes the
+     * x87 register cache: it is empty here (flcr_set is only false after a flush).
+     */
+    TCGLabel *same = gen_new_label();
+    TCGv_ptr shadow = tcg_constant_ptr(&xemu_uwp_flcr_shadow);
+    TCGv_i32 cur = tcg_temp_new_i32();
+    tcg_gen_ld_i32(cur, shadow, 0);
+    tcg_gen_brcond_i32(TCG_COND_EQ, v, cur, same);
+    tcg_gen_st_i32(v, shadow, 0);
     tcg_gen_flcr(v);
+    gen_set_label(same);
+#else
+    tcg_gen_flcr(v);
+#endif
     s->flcr_set = true;
 }
 

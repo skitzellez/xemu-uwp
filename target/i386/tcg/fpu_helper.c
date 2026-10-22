@@ -27,6 +27,7 @@
 #include "fpu/softfloat.h"
 #include "fpu/softfloat-macros.h"
 #include "helper-tcg.h"
+#include "qemu/xemu-uwp.h"
 #include "access.h"
 
 /* float macros */
@@ -3471,6 +3472,7 @@ void update_mxcsr_status(CPUX86State *env)
 #if defined(XEMU_UWP) && defined(__x86_64__)
     /* the native SSE helpers (ops_sse.h) collect flags in the host's MXCSR */
     __builtin_ia32_ldmxcsr(0x1f80);
+    xemu_uwp_flcr_shadow = 0;
 #endif
 }
 

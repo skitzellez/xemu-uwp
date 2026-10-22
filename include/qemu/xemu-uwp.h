@@ -65,6 +65,12 @@ enum {
 };
 extern unsigned int xemu_uwp_counters[UWP_CNT_MAX];
 
+/*
+ * The host MXCSR value the x87 code last loaded (target/i386/tcg/translate.c gen_flcr), 0 = unknown.
+ * Anything else that changes the vCPU thread's host MXCSR sets it to 0.
+ */
+extern uint32_t xemu_uwp_flcr_shadow;
+
 /* ui/xemu.c: the disc image Game Vault shared through a token, when the normal open is refused */
 HANDLE xemu_uwp_shared_file(LPCWSTR name, DWORD access);
 /* one log line about opening a file the normal way failed (ui/xemu.c) */

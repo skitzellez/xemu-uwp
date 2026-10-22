@@ -53,6 +53,7 @@ static inline void uwp_sse_begin(CPUX86State *env)
         unsigned cur = _mm_getcsr();
         if ((cur & 0xffc0) != want) {
             _mm_setcsr(want | (cur & 0x3f));
+            xemu_uwp_flcr_shadow = 0;
         }
     }
 }

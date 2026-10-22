@@ -1034,6 +1034,11 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 {
     int ret;
 
+#ifdef XEMU_UWP
+    /* entered anew or after a longjmp, which restores the host MXCSR saved by setjmp */
+    xemu_uwp_flcr_shadow = 0;
+#endif
+
     /* if an exception is pending, we execute it here */
     while (!cpu_handle_exception(cpu, &ret)) {
         TranslationBlock *last_tb = NULL;
