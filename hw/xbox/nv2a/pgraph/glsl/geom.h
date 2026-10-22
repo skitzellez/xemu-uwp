@@ -44,6 +44,9 @@ typedef struct GenGeomGlslOptions {
 void pgraph_glsl_set_geom_state(PGRAPHState *pg, GeomState *geom);
 
 bool pgraph_glsl_need_geom(const GeomState *state);
+#ifdef XEMU_UWP
+extern bool pgraph_glsl_uwp_skip_geom; /* geom.c: GL renderer draws smooth filled triangles without one */
+#endif
 
 MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts);
 

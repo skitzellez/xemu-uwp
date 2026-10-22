@@ -684,6 +684,13 @@ void pgraph_gl_init_shaders(PGRAPHState *pg)
 {
     PGRAPHGLState *r = pg->gl_renderer_state;
 
+#ifdef XEMU_UWP
+    {
+        /* test switch geom-always.txt: a geometry shader on every triangle draw again, as before 0.9.969 */
+        extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+        pgraph_glsl_uwp_skip_geom = !xemu_uwp_test_file_exists("geom-always.txt");
+    }
+#endif
     qemu_mutex_init(&r->shader_cache_lock);
     qemu_mutex_init(&r->shader_module_lock);
     qemu_event_init(&r->shader_cache_writeback_complete, false);
@@ -1012,6 +1019,16 @@ static void update_shader_uniforms(PGRAPHState *pg, ShaderBinding *binding)
         }
     }
 #ifdef XEMU_UWP
+    {
+        /* interpolated depth for every filled draw, with or without a geometry shader: a surface drawn twice
+           (a quad pass over a triangle pass, shadow volumes) must get the same depth both times, and the
+           three-corner sums and the GPU's interpolation differ in the last bits (JSRF's shadows, 0.9.970).
+           Lines and points-mode polygons keep the geometry shader's depth and slope. */
+        const GeomState *g = &binding->state.geom;
+        bool lines = g->primitive_mode == PRIM_TYPE_LINES || g->primitive_mode == PRIM_TYPE_LINE_LOOP ||
+                     g->primitive_mode == PRIM_TYPE_LINE_STRIP || g->polygon_front_mode != POLY_MODE_FILL;
+        psh_values.uwpNoGeom[0] = pgraph_glsl_uwp_skip_geom && !lines;
+    }
     if (fresh) {
         memcpy(binding->uwp_psh_last, &psh_values, sizeof(psh_values));
     }

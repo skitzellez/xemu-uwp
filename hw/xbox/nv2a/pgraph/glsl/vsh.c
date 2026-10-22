@@ -303,6 +303,9 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
                        "#define vtxPos1 v_vtxPos1\n"
                        "#define vtxPos2 v_vtxPos2\n"
                        "#define triMZ v_triMZ\n"
+#ifdef XEMU_UWP
+                       "#define vtxZW v_vtxZW\n"
+#endif
                        );
     }
     mstring_append(header, "\n");
@@ -488,6 +491,9 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
                    "  vtxPos1 = vtxPos;\n"
                    "  vtxPos2 = vtxPos;\n"
                    "  triMZ = 0.0;\n"
+#ifdef XEMU_UWP
+                   "  vtxZW = vtxPos.z * vtxPos.w;\n"
+#endif
                    "  gl_PointSize = oPts.x;\n"
     );
 

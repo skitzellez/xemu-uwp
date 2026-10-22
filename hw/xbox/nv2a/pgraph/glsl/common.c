@@ -52,6 +52,12 @@ MString *pgraph_glsl_get_vtx_header(MString *out, bool location, bool smooth,
         { flat_s,      vec4_s,  "vtxPos1" },
         { flat_s,      vec4_s,  "vtxPos2" },
         { flat_s,      float_s, "triMZ"  },
+#ifdef XEMU_UWP
+        /* the pixel shader's depth from the GPU's own interpolation instead of the triangle's three corners
+           (geom.c): z * w, perspective-correct, times gl_FragCoord.w = z linear on screen, and clipped right
+           when a triangle reaches behind the camera (JSRF's shadow volumes broke with a noperspective z) */
+        { smooth_s, float_s, "vtxZW" },
+#endif
     };
 
     for (int i = 0; i < ARRAY_SIZE(attr); i++) {

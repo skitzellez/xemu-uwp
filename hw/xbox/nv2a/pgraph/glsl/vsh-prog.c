@@ -570,6 +570,14 @@ static const char* vsh_header =
     "#define MUL(dest, mask, src0, src1) dest.mask = _MUL(_in(src0), _in(src1)).mask\n"
     "vec4 _MUL(vec4 src0, vec4 src1)\n"
     "{\n"
+#ifdef XEMU_UWP
+    /* anything * 0 must == 0 (also inf * 0), as on the hardware. The same result as the per-component
+       sign(NaNToOne()) tests below (a component is zeroed when either input is +-0; NaN is never 0), in a
+       few vector instructions: matrix transforms run every MUL/MAD through here, and the console's driver
+       charges ~30 ms per KB of vertex shader when it builds a pipeline */
+    "  bvec4 zero = bvec4(vec4(equal(src0, vec4(0.0))) + vec4(equal(src1, vec4(0.0))));\n"
+    "  return mix(src0 * src1, vec4(0.0), zero);\n"
+#else
     // Unfortunately mix() falls victim to the same handling of exceptional
     // (inf/NaN) handling as a multiply, so per-component comparisons are used
     // to guarantee HW behavior (anything * 0 must == 0).
@@ -580,6 +588,7 @@ static const char* vsh_header =
     "  if (zero_components.z == 0.0) { ret.z = 0.0; }\n"
     "  if (zero_components.w == 0.0) { ret.w = 0.0; }\n"
     "  return ret;\n"
+#endif
     "}\n"
     "\n"
     "#define ADD(dest, mask, src0, src1) dest.mask = _ADD(_in(src0), _in(src1)).mask\n"

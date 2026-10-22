@@ -80,11 +80,30 @@ static const char *get_vertex_order(int rot)
     }
 }
 
+#ifdef XEMU_UWP
+/*
+ * Set by the GL renderer. On the Xbox the console's driver charges ~4.5x more for a pipeline that has a
+ * geometry shader (PSO probe 7: a new vertex shader 33 ms alone, 145 ms with one; a known vertex shader newly
+ * paired with one 143 ms), and xemu put one on every triangle draw: Mortal Kombat's start spent ~16 of 17 s
+ * in such pipelines. Smooth-shaded filled triangles need it only to hand the pixel shader the triangle's three
+ * corners for its depth; without it the pixel shader takes depth from the GPU's interpolation (vtxZW, gl_FragCoord.w,
+ * uniform uwpNoGeom). Flat shading (provoking vertex), lines, points-as-polygons and quads keep it.
+ */
+bool pgraph_glsl_uwp_skip_geom;
+#endif
+
 bool pgraph_glsl_need_geom(const GeomState *state)
 {
     /* FIXME: Missing support for 2-sided-poly mode */
     assert(state->polygon_front_mode == state->polygon_back_mode);
     enum ShaderPolygonMode polygon_mode = state->polygon_front_mode;
+#ifdef XEMU_UWP
+    if (pgraph_glsl_uwp_skip_geom && state->smooth_shading && polygon_mode == POLY_MODE_FILL &&
+        (state->primitive_mode == PRIM_TYPE_TRIANGLES || state->primitive_mode == PRIM_TYPE_TRIANGLE_STRIP ||
+         state->primitive_mode == PRIM_TYPE_TRIANGLE_FAN || state->primitive_mode == PRIM_TYPE_POLYGON)) {
+        return false;
+    }
+#endif
 
     switch (state->primitive_mode) {
     case PRIM_TYPE_POINTS:
@@ -356,6 +375,9 @@ MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts)
         "  vtxPos1 = pz[1];\n"
         "  vtxPos2 = pz[2];\n"
         "  triMZ = (isnan(pz[3].x) || isinf(pz[3].x)) ? 0.0 : pz[3].x;\n"
+#ifdef XEMU_UWP
+        "  vtxZW = v_vtxZW[index];\n"
+#endif
         "  EmitVertex();\n"
         "}\n",
         opts.no_point_size ? "" : "  gl_PointSize = gl_in[index].gl_PointSize;\n",

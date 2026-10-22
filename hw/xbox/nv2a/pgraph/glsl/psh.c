@@ -1085,6 +1085,18 @@ static MString* psh_convert(struct PixelShader *ps)
         );
 
     MString *clip = mstring_new();
+#ifdef XEMU_UWP
+    /* drawn without a geometry shader (geom.c, uniform uwpNoGeom): vtxPos0-2 and triMZ are this vertex's own,
+       so the depth comes from the GPU's interpolation instead: z (or 1/w with z_perspective) interpolated
+       linearly on screen, which is what the three-corner sums below work out, and the depth slope from the
+       screen derivatives (in unscaled pixels, as the geometry shader's). Derivatives taken here, before any
+       discard. */
+    mstring_append_fmt(clip,
+                       "float uwpZ = %s;\n"
+                       "vec2 uwpDz = vec2(dFdx(uwpZ), dFdy(uwpZ)) * vec2(surfaceScale);\n"
+                       "float uwpMZ = uwpNoGeom != 0 ? max(abs(uwpDz.x), abs(uwpDz.y)) : triMZ;\n",
+                       ps->state->z_perspective ? "gl_FragCoord.w" : "vtxZW * gl_FragCoord.w");
+#endif
     mstring_append_fmt(clip, "/*  Window-clip (%slusive) */\n",
                        ps->state->window_clip_exclusive ? "Exc" : "Inc");
     if (!ps->state->window_clip_exclusive) {
@@ -1129,13 +1141,22 @@ static MString* psh_convert(struct PixelShader *ps)
             "bc1 *= inv_bcsum;\n"
             "bc2 *= inv_bcsum;\n"
             "precise float zvalue = vtxPos0.w + (bc1*(vtxPos1.w - vtxPos0.w) + bc2*(vtxPos2.w - vtxPos0.w));\n"
+#ifdef XEMU_UWP
+            "if (uwpNoGeom != 0) {\n"
+            "  zvalue = 1.0 / uwpZ;\n"
+            "}\n"
+#endif
             // If GPU clipping is inaccurate, the point gl_FragCoord.xy might
             // be above the horizon of the plane of a rasterized triangle
             // making the interpolated w-coordinate above zero or negative. We
             // should prevent such wrapping through infinity by clamping to
             // infinity.
             "if (zvalue > 0.0) {\n"
+#ifdef XEMU_UWP
+            "  float zslopeofs = depthFactor*uwpMZ*zvalue*zvalue;\n"
+#else
             "  float zslopeofs = depthFactor*triMZ*zvalue*zvalue;\n"
+#endif
             "  zvalue += depthOffset;\n"
             "  zvalue += zslopeofs;\n"
             "} else {\n"
@@ -1160,8 +1181,16 @@ static MString* psh_convert(struct PixelShader *ps)
             "bc1 *= inv_bcsum;\n"
             "bc2 *= inv_bcsum;\n"
             "precise float zvalue = vtxPos0.z + (bc1*(vtxPos1.z - vtxPos0.z) + bc2*(vtxPos2.z - vtxPos0.z));\n"
+#ifdef XEMU_UWP
+            "if (uwpNoGeom != 0) {\n"
+            "  zvalue = uwpZ;\n"
+            "}\n"
+            "zvalue += depthOffset;\n"
+            "zvalue += depthFactor*uwpMZ;\n");
+#else
             "zvalue += depthOffset;\n"
             "zvalue += depthFactor*triMZ;\n");
+#endif
     }
 
     /* Depth clipping */
@@ -1788,6 +1817,7 @@ void pgraph_glsl_set_psh_uniform_values(PGRAPHState *pg,
             }
         }
     }
+    values->uwpNoGeom[0] = 0; /* set by the GL renderer for programs without a geometry shader */
     if (locs[PshUniform_alphaRef] != -1) {
         int alpha_ref = GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0),
                                  NV_PGRAPH_CONTROL_0_ALPHAREF);
