@@ -3581,6 +3581,29 @@ static bool texture_stage_unchanged(NV2AState *d, unsigned int stage)
                                          NULL);
 }
 
+/*
+ * vCPU writes to a surface's guest bytes since the last look, from the
+ * DIRTY_MEMORY_NV2A bitmap (also read when the surface is bound as a
+ * target). Only whole pages inside the surface count: the first and last
+ * page may hold other data that is written while the surface stays put.
+ */
+static bool surface_guest_bytes_written(NV2AState *d,
+                                        PGRAPHD3D12SurfaceBinding *surface)
+{
+    hwaddr start = TARGET_PAGE_ALIGN(surface->vram_addr);
+    hwaddr end = (surface->vram_addr + surface->size) & TARGET_PAGE_MASK;
+
+    if (!tcg_enabled() || surface->size == 0) {
+        return false;
+    }
+    if (end <= start) {
+        start = surface->vram_addr;
+        end = surface->vram_addr + surface->size;
+    }
+    return memory_region_test_and_clear_dirty(d->vram, start, end - start,
+                                              DIRTY_MEMORY_NV2A);
+}
+
 static bool bind_texture_stage(NV2AState *d, unsigned int stage, Error **errp)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -3778,6 +3801,13 @@ static bool bind_texture_stage(NV2AState *d, unsigned int stage, Error **errp)
     for (unsigned int level = 0; level < level_surface_count; level++) {
         PGRAPHD3D12SurfaceBinding *level_surface = level_surfaces[level];
 
+        /* A clean surface has its watchpoint off, so vCPU writes to it (a
+         * movie frame written into a surface-backed texture) only show in
+         * the dirty bitmap. Its guest bytes are current, so take them. */
+        if (!level_surface->upload_pending && !level_surface->draw_dirty &&
+            surface_guest_bytes_written(d, level_surface)) {
+            level_surface->upload_pending = true;
+        }
         if (!level_surface->upload_pending) {
             continue;
         }
