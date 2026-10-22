@@ -1109,6 +1109,10 @@ static inline void tlb_set_dirty1_locked(CPUTLBEntry *tlb_entry,
 {
     if (tlb_entry->addr_write == (addr | TLB_NOTDIRTY)) {
         tlb_entry->addr_write = addr;
+#ifdef XBOX
+        /* now writable without the dirty callback: tlb_reset_dirty_mapped() must find it */
+        tlb_wr_note(addr + tlb_entry->addend, addr);
+#endif
     }
 }
 
