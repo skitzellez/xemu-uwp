@@ -12450,9 +12450,19 @@ static void adopt_fallback_pso(PGRAPHD3D12State *r, PGRAPHD3D12PsoJob *job)
         r->fallback_keys++;
     }
     entry->queued = false;
+    if (job->pipeline_state != NULL && entry->pipeline_state != NULL) {
+        /* A draw built it meanwhile (build_fallback_now); the current PSO
+         * may point at that one, so it stays. */
+        D3D12_RELEASE(job->pipeline_state);
+        return;
+    }
     if (job->pipeline_state != NULL) {
         entry->pipeline_state = job->pipeline_state;
         job->pipeline_state = NULL;
+        entry->failed = false;
+        return;
+    }
+    if (entry->pipeline_state != NULL) {
         return;
     }
     entry->failed = true;
@@ -12988,6 +12998,127 @@ static FallbackPipelineEntry *get_fallback_pipeline(
 }
 
 /*
+ * Builds key's interpreter pipeline on the FIFO thread when no worker has
+ * it ready. The console driver recompiles only for new bytecode, a new
+ * render-target format or blend on/off (PSO probe, 2026-10-21), and the
+ * interpreter bytecode is shared, so after prewarm_fallback_pipelines()
+ * this costs about the driver's 0.02 ms instead of a full pipeline build.
+ */
+static bool build_fallback_now(PGRAPHD3D12State *r,
+                               const PGRAPHD3D12PipelineKey *key)
+{
+    PGRAPHD3D12FallbackKey fb;
+    FallbackPipelineEntry *entry;
+    ID3D12PipelineState *pso = NULL;
+    Error *err = NULL;
+    int64_t start = g_get_monotonic_time();
+    int64_t us;
+
+    if (!fill_fallback_key(key, &fb)) {
+        return false;
+    }
+    entry = get_fallback_pipeline(r, &fb, false);
+    if (entry->pipeline_state != NULL) {
+        return true;
+    }
+    if (entry->failed || !build_fallback_pso(r, &fb, &pso, &err)) {
+        error_free(err);
+        return false;
+    }
+    entry->pipeline_state = pso;
+    us = g_get_monotonic_time() - start;
+    r->perf.fallback_now++;
+    r->perf.fallback_now_us += us;
+    if (us > 50000 && r->fallback_now_slow_logged++ < 8) {
+        fprintf(stderr, "Direct3D 12 renderer: interpreter pipeline built "
+                        "at the draw in %" PRId64 " ms (new driver compile)\n",
+                us / 1000);
+    }
+    return true;
+}
+
+/*
+ * Queues the interpreter pipelines of the common target, depth and blend
+ * combinations once per run, at the first draw (the boot animation), so
+ * the driver has compiled every interpreter bytecode and format before a
+ * game needs it; later interpreter pipelines then reuse those compiles.
+ * Game independent: no list or earlier play is needed. FIFO thread.
+ */
+static void prewarm_fallback_pipelines(PGRAPHD3D12State *r)
+{
+    static const DXGI_FORMAT rtvs[] = {
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B5G6R5_UNORM,
+        DXGI_FORMAT_B5G5R5A1_UNORM, DXGI_FORMAT_R8_UNORM,
+        DXGI_FORMAT_R8G8_UNORM,     DXGI_FORMAT_UNKNOWN,
+    };
+    static const DXGI_FORMAT dsvs[] = {
+        DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_D16_UNORM,
+        DXGI_FORMAT_D24_UNORM_S8_UINT,
+    };
+    unsigned int queued = 0;
+
+    if (r->fallback_prewarmed || !r->pso_workers_running ||
+        !pgraph_d3d12_vertex_pulling() ||
+        !fallback_mode_draws(pgraph_d3d12_fallback_mode(r->tune_flags))) {
+        return;
+    }
+    r->fallback_prewarmed = true;
+    for (unsigned int c = 0; c < ARRAY_SIZE(rtvs); c++) {
+        for (unsigned int z = 0; z < ARRAY_SIZE(dsvs); z++) {
+            if (rtvs[c] == DXGI_FORMAT_UNKNOWN &&
+                dsvs[z] == DXGI_FORMAT_UNKNOWN) {
+                continue;
+            }
+            for (unsigned int bits = 0; bits < 32; bits++) {
+                bool blend = bits & 1;
+                bool depth = bits & 2;
+                bool clip = bits & 4;
+                PGRAPHD3D12FallbackKey fb;
+
+                if ((depth && dsvs[z] == DXGI_FORMAT_UNKNOWN) ||
+                    (blend && rtvs[c] == DXGI_FORMAT_UNKNOWN) ||
+                    (clip && depth)) {
+                    continue;
+                }
+                memset(&fb, 0, sizeof(fb));
+                fb.primitive_topology_type =
+                    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+                fb.rtv_format = rtvs[c];
+                fb.dsv_format = dsvs[z];
+                fb.color_write_mask =
+                    rtvs[c] != DXGI_FORMAT_UNKNOWN ? 0xf : 0;
+                fb.blend_enable = blend;
+                fb.src_blend = blend ? D3D12_BLEND_SRC_ALPHA : D3D12_BLEND_ONE;
+                fb.dest_blend =
+                    blend ? D3D12_BLEND_INV_SRC_ALPHA : D3D12_BLEND_ZERO;
+                fb.blend_op = D3D12_BLEND_OP_ADD;
+                fb.src_blend_alpha = fb.src_blend;
+                fb.dest_blend_alpha = fb.dest_blend;
+                fb.blend_op_alpha = D3D12_BLEND_OP_ADD;
+                fb.logic_op = D3D12_LOGIC_OP_NOOP;
+                fb.depth_enable = depth;
+                fb.depth_write = depth;
+                fb.depth_func = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+                fb.cull_mode = D3D12_CULL_MODE_NONE;
+                fb.depth_output = depth;
+                fb.depth_clip = clip;
+                fb.vs_class = (bits & 8) ? PGRAPH_D3D12_FALLBACK_VS_PROGRAM :
+                                           PGRAPH_D3D12_FALLBACK_VS_FIXED;
+                fb.ps_class = (bits & 16) ? PGRAPH_D3D12_FALLBACK_PS_FULL :
+                                            PGRAPH_D3D12_FALLBACK_PS_COMMON;
+                if (g_hash_table_contains(r->fallback_pipelines, &fb)) {
+                    continue;
+                }
+                get_fallback_pipeline(r, &fb, true);
+                queued++;
+            }
+        }
+    }
+    fprintf(stderr, "Direct3D 12 renderer: %u interpreter pipelines queued "
+                    "at start\n", queued);
+}
+
+/*
  * Workers build without an input layout, framebuffer-fetch draws stay
  * synchronous, so do keys whose demand build failed, and a skipped draw
  * would drop its pixels from an occlusion count.
@@ -13124,6 +13255,7 @@ static bool ensure_draw_pipeline_state(PGRAPHState *pg, bool *pending,
         return false;
     }
     canonicalize_pipeline_key(&key);
+    prewarm_fallback_pipelines(r);
     if (pgraph_d3d12_fallback_mode(r->tune_flags) ==
         PGRAPH_D3D12_FALLBACK_PS) {
         if (mark_uber_ps_key(&key)) {
@@ -13186,7 +13318,14 @@ static bool ensure_draw_pipeline_state(PGRAPHState *pg, bool *pending,
         if (use_fallback_pipeline(r, &key, true)) {
             return true;
         }
-        /* Not built yet, or no fallback key: the synchronous build. */
+        /* Not built by a worker yet: the interpreter pipeline here, which
+         * is cheap once its bytecode is compiled, rather than the key's
+         * own full build. */
+        if (build_fallback_now(r, &key) &&
+            use_fallback_pipeline(r, &key, true)) {
+            return true;
+        }
+        /* No fallback key: the synchronous build. */
         r->perf.fallback_sync++;
     }
 

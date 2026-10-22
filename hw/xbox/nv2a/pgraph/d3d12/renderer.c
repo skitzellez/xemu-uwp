@@ -1016,7 +1016,8 @@ static void pgraph_d3d12_perf_report(NV2AState *d)
                      " fallback={mode=%s demand=%u skipped=%u "
                      "ready_ms_avg=%.1f ready_ms_max=%.1f fbkeys=%u "
                      "ps=%u nops=%u draws=%u sync=%u nokey=%u builds=%u "
-                     "build_ms_avg=%.1f build_ms_max=%.1f}",
+                     "build_ms_avg=%.1f build_ms_max=%.1f now=%u "
+                     "now_ms_avg=%.1f}",
                      pgraph_d3d12_fallback_mode_name(mode),
                      r->perf.fallback_demand, r->perf.fallback_skipped,
                      r->perf.fallback_ready ?
@@ -1030,7 +1031,11 @@ static void pgraph_d3d12_perf_report(NV2AState *d)
                      r->perf.fallback_builds ?
                          r->perf.fallback_build_us / 1000.0 /
                              r->perf.fallback_builds : 0.0,
-                     r->perf.fallback_build_max_us / 1000.0);
+                     r->perf.fallback_build_max_us / 1000.0,
+                     r->perf.fallback_now,
+                     r->perf.fallback_now ?
+                         r->perf.fallback_now_us / 1000.0 /
+                             r->perf.fallback_now : 0.0);
         }
     }
 

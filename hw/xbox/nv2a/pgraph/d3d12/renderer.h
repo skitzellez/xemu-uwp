@@ -860,6 +860,9 @@ typedef struct PGRAPHD3D12State {
     GHashTable *fallback_queued;
     unsigned int fallback_keys;
     unsigned int fallback_build_failures;
+    /* interpreter pipelines of the common combinations queued this run */
+    bool fallback_prewarmed;
+    unsigned int fallback_now_slow_logged;
     /* Null Texture2D view for the stages an interpreter pixel shader
      * declares but the draw leaves unbound. */
     D3D12_GPU_DESCRIPTOR_HANDLE uber_null_srv_gpu;
@@ -977,6 +980,8 @@ typedef struct PGRAPHD3D12State {
          * longest worker time. */
         uint32_t fallback_draws;
         uint32_t fallback_sync;
+        uint32_t fallback_now;     /* interpreter pipelines built at the draw */
+        uint64_t fallback_now_us;
         uint32_t fallback_nokey;
         uint32_t fallback_builds;
         uint64_t fallback_build_us;
