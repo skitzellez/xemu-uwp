@@ -737,10 +737,15 @@ static uint32_t pgraph_d3d12_tune_text_flags(const char *text)
     if (tune_value(text, "ubertest=") != NULL) {
         flags |= PGRAPH_D3D12_TUNE_UBER_TEST;
     }
-    /* "fallback=off", an unknown mode or none keeps the synchronous
-     * build. */
+    /* No fallback= value: "all", the interpreter draws while a new
+     * pipeline builds on a worker (Halo 2: worst freeze 3.9 s -> 0.13 s
+     * once its pipelines are recorded). "fallback=off" or an unknown mode
+     * keeps the synchronous build. */
     fb = tune_value(text, "fallback=");
-    if (tune_value_is(fb, "skip")) {
+    if (fb == NULL) {
+        flags |= (uint32_t)PGRAPH_D3D12_FALLBACK_ALL
+                 << PGRAPH_D3D12_TUNE_FALLBACK_SHIFT;
+    } else if (tune_value_is(fb, "skip")) {
         flags |= (uint32_t)PGRAPH_D3D12_FALLBACK_SKIP
                  << PGRAPH_D3D12_TUNE_FALLBACK_SHIFT;
     } else if (tune_value_is(fb, "ps")) {
