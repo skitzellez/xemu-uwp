@@ -102,6 +102,18 @@ void FontManager::Rebuild()
         config.SizePixels = 13.0f * scale;
         m_fixed_width_font = io.Fonts->AddFontDefault(&config);
     }
+#ifdef XEMU_UWP
+    {
+        /* the big XEMU name on the start screen (main.cc); letters only, so the atlas stays small */
+        ImFontConfig config;
+        config.FontDataOwnedByAtlas = false;
+        config.RasterizerDensity = pixel_density;
+        static const ImWchar title_ranges[] = { 0x20, 0x5a, 0 };
+        m_title_font = io.Fonts->AddFontFromMemoryTTF(
+            (void *)Roboto_Medium_data, Roboto_Medium_size,
+            84.0f * scale, &config, title_ranges);
+    }
+#endif
 
 #ifdef CONFIG_D3D12
     if (xemu_hud_uses_d3d12()) {

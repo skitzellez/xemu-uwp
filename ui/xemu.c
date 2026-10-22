@@ -3019,6 +3019,31 @@ static bool uwp_watch_no_picture(void)
     return uwp_watch.on && g_nv2a_stats.frame_count == uwp_watch.frames && uwp_watch.quiet >= 5;
 }
 
+/*
+ * The start screen (ui/xui/main.cc) stays up until the game's own code runs, or until the player is told it has
+ * no picture. Frames don't tell (the BIOS sends black ones at once), nor does the XBE header (the kernel reads it
+ * in the first second, before its start-up animation): the CPU running below 0x80000000 does
+ * (hw/xbox/uwp-eipsampler.c). Seconds counted in uwp_box_sample; 90 s at most.
+ */
+bool xemu_uwp_game_code_seen(void);
+static bool uwp_game_ran;
+static unsigned uwp_start_seconds;
+bool xemu_uwp_starting(void)
+{
+    if (!uwp_game_ran && xemu_uwp_game_code_seen()) {
+        uwp_game_ran = true;
+        uwp_log("start screen: the game's own code runs, %u s after the start", uwp_start_seconds);
+    }
+    return !uwp_game_ran && !uwp_watch.gave_up && uwp_start_seconds < 90;
+}
+
+static void uwp_start_screen_second(void)
+{
+    if (!uwp_game_ran && runstate_is_running()) {
+        uwp_start_seconds++;
+    }
+}
+
 static void uwp_watch_second(void)
 {
     /* testing: watch-test.txt next to xemu.toml makes the watch ignore the frames, as if nothing were shown */
@@ -3156,6 +3181,7 @@ static bool uwp_file_exists(const char *path);
 
 static void uwp_box_sample(void)
 {
+    uwp_start_screen_second();
     uwp_watch_second();
     {
         /*

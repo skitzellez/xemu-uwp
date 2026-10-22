@@ -33,6 +33,7 @@ public:
     ImFont *m_menu_font;
     ImFont *m_menu_font_small;
     ImFont *m_menu_font_medium;
+    ImFont *m_title_font;   /* start screen name, UWP only */
     // ImFont *m_big_state_icon_font;
     float m_last_viewport_scale;
     float m_last_pixel_density;

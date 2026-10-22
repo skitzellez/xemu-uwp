@@ -71,46 +71,165 @@ extern "C" bool xemu_uwp_menu_open;
 extern "C" bool xemu_uwp_prep_on;
 extern "C" int xemu_uwp_prep_done, xemu_uwp_prep_total;
 
-static void UwpPrepareScreen(void)
+/* waiting for the game's first picture (ui/xemu.c, start watch) */
+extern "C" bool xemu_uwp_starting(void);
+
+/* the game's name from the disc file Game Vault passed: no folder, no extensions, no "(USA, Japan)" tags */
+static std::string UwpGameName(void)
 {
-    const ImGuiViewport *vp = ImGui::GetMainViewport();
-    float s = g_viewport_mgr.m_scale;
-    ImVec2 size(vp->Size.x * 0.42f, 0);
-    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f),
-                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(size);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14 * s);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(36 * s, 30 * s));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6 * s);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2 * s);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.07f, 0.07f, 0.08f, 0.96f));
-    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.06f, 0.49f, 0.06f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.16f, 0.16f, 0.18f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.06f, 0.49f, 0.06f, 1.0f));
-    ImGui::Begin("##uwp_prepare", NULL,
-                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings |
-                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
-    ImGui::PushFont(g_font_mgr.m_menu_font_medium);
-    ImGui::TextUnformatted("Getting the game ready");
-    ImGui::PopFont();
-    ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.72f, 0.74f, 1.0f));
-    ImGui::TextWrapped("Preparing its graphics so it plays smoothly from the first second.");
-    ImGui::PopStyleColor();
-    ImGui::Dummy(ImVec2(0, 14 * s));
-    int total = xemu_uwp_prep_total > 0 ? xemu_uwp_prep_total : 1;
-    int done = xemu_uwp_prep_done < total ? xemu_uwp_prep_done : total;
-    char label[32];
-    snprintf(label, sizeof(label), "%d%%", done * 100 / total);
-    ImGui::ProgressBar((float)done / total, ImVec2(-1, 22 * s), label);
-    ImGui::Dummy(ImVec2(0, 14 * s));
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.72f, 0.74f, 1.0f));
-    ImGui::TextUnformatted("B  Start now");
-    ImGui::PopStyleColor();
-    ImGui::End();
-    ImGui::PopStyleColor(4);
-    ImGui::PopStyleVar(4);
+    const char *path = g_config.sys.files.dvd_path ? g_config.sys.files.dvd_path : "";
+    const char *slash = strrchr(path, '/'), *back = strrchr(path, '\\');
+    const char *base = slash > back ? slash + 1 : back ? back + 1 : path;
+    std::string name;
+    int depth = 0;
+    for (const char *c = base; *c; c++) {
+        if (*c == '(' || *c == '[') {
+            depth++;
+        } else if ((*c == ')' || *c == ']') && depth > 0) {
+            depth--;
+        } else if (!depth) {
+            name += *c;
+        }
+    }
+    for (const char *ext : { ".7z", ".zip", ".iso", ".cso", ".xiso", ".xbe" }) {
+        size_t n = strlen(ext);
+        if (name.size() > n && !strcasecmp(name.c_str() + name.size() - n, ext)) {
+            name.resize(name.size() - n);
+        }
+    }
+    while (!name.empty() && (name.back() == ' ' || name.back() == '.')) {
+        name.pop_back();
+    }
+    return name;
 }
+
+/*
+ * The green start screen (the Game Vault style logo, user's pick 2026-10-22): from the start until the game's first
+ * picture, and while the game's graphics are prepared (xemu_uwp_prep_on). Drawn with shapes, no picture file, so it
+ * looks the same on old and New graphics. Few shapes on purpose: it stays cheap on the console.
+ */
+static bool UwpStartScreen(void)
+{
+    static float alpha;
+    static double since;
+    const char *disc = g_config.sys.files.dvd_path;
+    bool want = xemu_uwp_prep_on || (xemu_uwp_starting() && disc && *disc);
+    double now = ImGui::GetTime();
+    if (want && alpha == 0) {
+        since = now;
+    }
+    float step = ImGui::GetIO().DeltaTime / 0.35f;   /* fades in and out in about a third of a second */
+    alpha = want ? 1.0f : fmaxf(0.0f, alpha - step);
+    if (alpha <= 0) {
+        return false;
+    }
+    static std::string name;
+    if (want) {
+        name = UwpGameName();
+    }
+
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImDrawList *dl = ImGui::GetBackgroundDrawList();
+    float W = vp->Size.x, H = vp->Size.y, k = H / 1080.0f;
+    ImVec2 o = vp->Pos;
+    auto col = [&](int r, int g, int b, float a) { return IM_COL32(r, g, b, (int)(255 * a * alpha)); };
+    auto at = [&](float x, float y) { return ImVec2(o.x + x, o.y + y); };
+
+    /* background: dark green, lighter behind the logo */
+    dl->AddRectFilled(o, at(W, H), col(3, 9, 4, 1));
+    for (int i = 0; i < 16; i++) {   /* many faint steps read as one smooth light */
+        dl->AddCircleFilled(at(W / 2, H * 0.40f), H * (0.85f - i * 0.05f), col(17, 48, 26, 0.10f), 64);
+    }
+    for (int i = 0; i < 8; i++) {
+        dl->AddCircleFilled(at(W / 2, 372 * k), (240 - i * 26) * k, col(108, 255, 58, 0.018f), 48);
+    }
+
+    /* the cartridge with the X: art units 0-100 (GameVault/art/xemu-logo/make_xemu_logo.py), m pixels each */
+    float m = 3.2f * k, mx = W / 2 - 50 * m, my = 213 * k;
+    auto p = [&](float x, float y) { return at(mx + x * m, my + y * m); };
+    auto cart = [&]() {
+        dl->PathLineTo(p(24, 10));
+        dl->PathLineTo(p(76, 10));
+        dl->PathBezierQuadraticCurveTo(p(84, 10), p(84, 18));
+        for (ImVec2 v : { ImVec2(84, 74), ImVec2(78, 74), ImVec2(78, 90), ImVec2(22, 90), ImVec2(22, 74),
+                          ImVec2(16, 74), ImVec2(16, 18) }) {
+            dl->PathLineTo(p(v.x, v.y));
+        }
+        dl->PathBezierQuadraticCurveTo(p(16, 10), p(24, 10));
+    };
+    for (int i = 4; i >= 1; i--) {   /* glow: soft rounded blocks behind the rim (thick lines would spike at the corners) */
+        float g = i * 2.5f;
+        dl->AddRectFilled(p(16 - g, 10 - g), p(84 + g, 74 + g), col(108, 255, 58, 0.06f), (8 + g) * m);
+        dl->AddRectFilled(p(22 - g, 70), p(78 + g, 90 + g), col(108, 255, 58, 0.06f), (2 + g) * m);
+    }
+    cart();
+    dl->PathFillConcave(col(20, 46, 24, 1));
+    cart();
+    dl->PathStroke(col(70, 194, 26, 1), ImDrawFlags_Closed, 6 * m);
+    cart();
+    dl->PathStroke(col(212, 255, 176, 0.55f), ImDrawFlags_Closed, 1.6f * m);
+    for (int x = 30; x <= 66; x += 9) {
+        dl->AddRectFilled(p(x, 80), p(x + 5, 87), col(120, 220, 70, 1), 1 * m);
+    }
+    dl->AddCircleFilled(p(50, 44), 21 * m, col(12, 16, 26, 1), 48);
+    dl->AddCircle(p(50, 44), 21 * m, col(108, 200, 70, 0.55f), 48, 3 * m);
+    for (float deg : { 45.0f, -45.0f }) {   /* two blades, each a light and a dark facet */
+        float a = deg * (float)M_PI / 180, ux = cosf(a), uy = sinf(a);
+        ImVec2 t1 = p(50 + ux * 30, 44 + uy * 30), t2 = p(50 - ux * 30, 44 - uy * 30);
+        ImVec2 s1 = p(50 - uy * 7, 44 + ux * 7), s2 = p(50 + uy * 7, 44 - ux * 7);
+        dl->AddTriangleFilled(t1, s1, t2, col(150, 236, 100, 1));
+        dl->AddTriangleFilled(t1, s2, t2, col(38, 120, 16, 1));
+    }
+    dl->AddCircleFilled(p(50, 44), 5 * m, col(12, 16, 26, 1), 24);
+    dl->AddCircle(p(50, 44), 5 * m, col(180, 250, 140, 1), 24, 2 * m);
+
+    /* XEMU / FOR GAME VAULT, letter-spaced */
+    auto spaced = [&](ImFont *f, float size, float y, float gap, ImU32 c, const char *text) {
+        float w = -gap;
+        for (const char *t = text; *t; t++) {
+            w += f->CalcTextSizeA(size, FLT_MAX, 0, t, t + 1).x + gap;
+        }
+        float x = W / 2 - w / 2;
+        for (const char *t = text; *t; t++) {
+            dl->AddText(f, size, at(x, y), c, t, t + 1);
+            x += f->CalcTextSizeA(size, FLT_MAX, 0, t, t + 1).x + gap;
+        }
+    };
+    ImFont *big = g_font_mgr.m_title_font, *small = g_font_mgr.m_menu_font_small;
+    spaced(big, 84 * k, 560 * k, 26 * k, col(0, 0, 0, 0.6f), "XEMU");   /* shadow under the name */
+    spaced(big, 84 * k, 556 * k, 26 * k, col(140, 240, 90, 1), "XEMU");
+    spaced(small, 24 * k, 652 * k, 10 * k, col(159, 179, 200, 1), "FOR GAME VAULT");
+
+    /* progress: the warm-up's real count, else an even fill that slows near the end until the first picture */
+    float frac;
+    if (xemu_uwp_prep_on) {
+        int total = xemu_uwp_prep_total > 0 ? xemu_uwp_prep_total : 1;
+        frac = (float)(xemu_uwp_prep_done < total ? xemu_uwp_prep_done : total) / total;
+    } else {
+        frac = want ? 0.92f * (1 - expf(-(float)(now - since) / 6.0f)) : 1.0f;
+    }
+    float bw = 400 * k, bx = W / 2 - bw / 2, by = 830 * k;
+    dl->AddRectFilled(at(bx, by), at(bx + bw, by + 8 * k), col(255, 255, 255, 0.12f), 4 * k);
+    dl->AddRectFilled(at(bx, by), at(bx + bw * frac, by + 8 * k), col(108, 255, 58, 1), 4 * k);
+
+    std::string line = (xemu_uwp_prep_on ? "Getting " : "Starting ") + (name.empty() ? std::string("the game") : name) +
+                       (xemu_uwp_prep_on ? " ready..." : "...");
+    ImFont *mid = g_font_mgr.m_menu_font;
+    float size = 34 * k;
+    ImVec2 ts = mid->CalcTextSizeA(size, FLT_MAX, 0, line.c_str());
+    if (ts.x > W * 0.8f) {   /* very long names get a smaller line, not a cut one */
+        size *= W * 0.8f / ts.x;
+        ts = mid->CalcTextSizeA(size, FLT_MAX, 0, line.c_str());
+    }
+    dl->AddText(mid, size, at(W / 2 - ts.x / 2, 868 * k), col(207, 216, 227, 1), line.c_str());
+    if (xemu_uwp_prep_on) {
+        const char *b = "B  Start now";
+        ImVec2 bs = small->CalcTextSizeA(24 * k, FLT_MAX, 0, b);
+        dl->AddText(small, 24 * k, at(W / 2 - bs.x / 2, 930 * k), col(159, 179, 200, 1), b);
+    }
+    return true;
+}
+static bool g_uwp_start_shown;
 #endif
 #include "compat.hh"
 #if defined(_WIN32)
@@ -415,9 +534,7 @@ void xemu_hud_update(void)
     }
 #endif
 #ifdef XEMU_UWP
-    if (xemu_uwp_prep_on) {
-        UwpPrepareScreen();
-    }
+    g_uwp_start_shown = UwpStartScreen();
 #endif
 
 #if defined(CONFIG_RENDERDOC)
@@ -429,7 +546,7 @@ void xemu_hud_update(void)
 
     bool menubar = g_config.display.ui.show_menubar && !first_boot_window.is_open;
 #ifdef XEMU_UWP
-    menubar = menubar && !xemu_uwp_prep_on;   /* the start screen stands alone */
+    menubar = menubar && !g_uwp_start_shown;   /* the start screen stands alone */
 #endif
     if (menubar) {
         // Auto-hide main menu after 5s of inactivity

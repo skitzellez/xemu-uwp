@@ -166,6 +166,36 @@ static void *sampler_thread(void *opaque)
     return NULL;
 }
 
+/*
+ * For the start screen (ui/xui/main.cc, every player): has the game's own code run yet? The BIOS, its start-up
+ * animation and the kernel all run at 0x80000000 and up; a game's code sits below. One look per call, only while
+ * the start screen asks (once a screen frame), so it costs nothing once the game runs.
+ */
+static int game_code_pending, game_code_seen;
+
+static void look_for_game_code(CPUState *cs, run_on_cpu_data data)
+{
+    CPUX86State *env = cpu_env(cs);
+    uint32_t pc = (uint32_t)(env->segs[R_CS].base + env->eip);
+    if (!cs->halted && pc >= 0x10000 && pc < 0x80000000u) {
+        qatomic_set(&game_code_seen, 1);
+    }
+    qatomic_set(&game_code_pending, 0);
+}
+
+bool xemu_uwp_game_code_seen(void)
+{
+    if (qatomic_read(&game_code_seen)) {
+        return true;
+    }
+    CPUState *cs = first_cpu;
+    if (cs && runstate_is_running() && !qatomic_read(&game_code_pending)) {
+        qatomic_set(&game_code_pending, 1);
+        async_run_on_cpu(cs, look_for_game_code, RUN_ON_CPU_NULL);
+    }
+    return false;
+}
+
 void xemu_uwp_eip_sampler_start(void)
 {
     static QemuThread thread;
