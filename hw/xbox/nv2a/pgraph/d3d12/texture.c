@@ -22,6 +22,8 @@
 #include "qapi/error.h"
 #include "hw/xbox/nv2a/pgraph/s3tc.h"
 #include "hw/xbox/nv2a/pgraph/swizzle.h"
+#include "hw/xbox/nv2a/pgraph/texsigns.h"
+#include "hw/xbox/nv2a/pgraph/glsl/psh.h"
 #include "renderer.h"
 
 #define TEXTURE_SKIP_INVALID_FORMAT   (1u << 1)
@@ -262,6 +264,40 @@ static void report_texture_shape_skip(NV2AState *d, unsigned int stage,
         pgraph_reg_r(pg, NV_PGRAPH_SHADERPROG), stage);
 }
 
+static bool texture_format_is_dxt(unsigned int color_format)
+{
+    return color_format == NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT1_A1R5G5B5 ||
+           color_format == NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT23_A8R8G8B8 ||
+           color_format == NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT45_A8R8G8B8;
+}
+
+/*
+ * Signed channels (NV_PGRAPH_TEXFILTER0_*SIGNED, upstream xemu #996/#587)
+ * this renderer stores offset by 128 as the GL renderer does: the formats
+ * the shared conversion turns into RGBA8 (texsigns.c), and DXT after the CPU
+ * decode. R6G5B5 stays this renderer's own SNORM conversion; 16-bit, YUV and
+ * depth formats are read as unsigned, as before.
+ */
+static uint8_t texture_effective_signs(const TextureShape *shape)
+{
+    uint8_t signs = shape->channel_signs & TEX_CHANNEL_SIGNED_MASK;
+
+    if (signs == 0) {
+        return 0;
+    }
+    if (texture_format_is_dxt(shape->color_format)) {
+        return signs;
+    }
+    switch (shape->color_format) {
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R6G5B5:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LC_IMAGE_CR8YB8CB8YA8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LC_IMAGE_YB8CR8YA8CB8:
+        return 0;
+    default:
+        return pgraph_get_converted_bit_depth(shape) == 8 ? signs : 0;
+    }
+}
+
 static bool texture_format_for_shape(const TextureShape *shape,
                                      PGRAPHD3D12TextureFormatInfo *info)
 {
@@ -270,6 +306,16 @@ static bool texture_format_for_shape(const TextureShape *shape,
 
     memset(info, 0, sizeof(*info));
     info->depth = basic.depth;
+
+    if (shape->channel_signs) {
+        /* texture_effective_signs() kept them: RGBA8 from the shared
+         * conversion (or the DXT CPU decode), channels offset by 128 */
+        info->dxgi_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        info->upload_bytes_per_pixel = 4;
+        info->converted = true;
+        info->compressed = texture_format_is_dxt(shape->color_format);
+        return true;
+    }
 
     switch (shape->color_format) {
     case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y8:
@@ -1023,6 +1069,11 @@ static uint8_t *decode_texture_level(
         }
         decoded = s3tc_decompress_3d(texture_s3tc_format(shape->color_format),
                                      src, width, height, depth);
+        if (decoded != NULL) {
+            texsigns_inplace_to_unsigned_rgba(
+                decoded, (int)((size_t)width * height * depth * 4),
+                shape->channel_signs);
+        }
         if (decoded == NULL) {
             error_setg(errp,
                        "Direct3D 12 stage %u texture mip %u S3TC decode "
@@ -3708,6 +3759,12 @@ static bool bind_texture_stage(NV2AState *d, unsigned int stage, Error **errp)
     shape = pgraph_get_texture_shape(pg, stage);
     vram_addr = pgraph_get_texture_phys_addr(pg, stage);
     length = texture_source_length(pg, &shape);
+    shape.channel_signs = texture_effective_signs(&shape);
+    if (shape.channel_signs &&
+        texture_source_surface(d, vram_addr, &shape) != NULL) {
+        /* a render target copied on the GPU keeps its own bytes */
+        shape.channel_signs = 0;
+    }
     if (!texture_palette_range(d, stage, &shape, &palette_vram_addr,
                                &palette_length, errp)) {
         report_texture_shape_skip(
@@ -3771,9 +3828,11 @@ static bool bind_texture_stage(NV2AState *d, unsigned int stage, Error **errp)
         level_x[0] = 0;
         level_y[0] = 0;
         level_surface_count = 1;
-    } else if (source_surface == NULL &&
+    } else if (source_surface == NULL && !shape.channel_signs &&
                !(r->tune_flags & (PGRAPH_D3D12_TUNE_S2T_OFF |
                                   PGRAPH_D3D12_TUNE_S2T_LEVELS_OFF))) {
+        /* signed channels are offset on the CPU, so their levels come
+         * from guest memory */
         level_surface_count = texture_level_surfaces(
             d, vram_addr, &shape, &info, level_surfaces, level_x, level_y,
             ARRAY_SIZE(level_surfaces));

@@ -24,6 +24,8 @@
 #include <io.h>
 #include "hw/xbox/nv2a/pgraph/psh_regs.h"
 #include "hw/xbox/nv2a/pgraph/util.h"
+#include "hw/xbox/nv2a/pgraph/texsigns.h"
+#include "hw/xbox/nv2a/pgraph/glsl/psh.h"
 #include "ui/xemu-settings.h"
 #include "renderer.h"
 
@@ -957,6 +959,7 @@ static bool fill_blend_key(PGRAPHState *pg, PGRAPHD3D12PipelineKey *key)
     uint32_t equation = GET_MASK(blend, NV_PGRAPH_BLEND_EQN);
     bool constant_color;
     bool constant_alpha;
+    bool signed_rgb = false;
 
     key->blend_enable = false;
     key->logic_op_enable = false;
@@ -995,6 +998,9 @@ static bool fill_blend_key(PGRAPHState *pg, PGRAPHD3D12PipelineKey *key)
             "by the GL/Vulkan renderers.");
         return false;
     }
+    /* ADD_SIGNED / REVERSE_SUBTRACT_SIGNED as the GL and Vulkan renderers
+     * (texsigns.c): swapped, RGB factors ONE_MINUS_SRC_COLOR / ONE. */
+    equation = texsigns_blend_equation(equation, &signed_rgb);
     key->blend_op = d3d12_blend_equation_map[equation];
     key->blend_op_alpha = key->blend_op;
     if (key->blend_op == D3D12_BLEND_OP_MIN ||
@@ -1066,6 +1072,10 @@ static bool fill_blend_key(PGRAPHState *pg, PGRAPHD3D12PipelineKey *key)
     key->src_blend_alpha = key->shader_src_blend_factor_enable ?
         D3D12_BLEND_ONE : d3d12_alpha_blend_factor_map[sfactor];
     key->dest_blend_alpha = d3d12_alpha_blend_factor_map[dfactor];
+    if (signed_rgb && !key->shader_src_blend_factor_enable) {
+        key->src_blend = D3D12_BLEND_INV_SRC_COLOR;
+        key->dest_blend = D3D12_BLEND_ONE;
+    }
 
     return true;
 }
@@ -4298,7 +4308,45 @@ static void append_texture_common_helpers(GString *source)
         "{\n"
         "    float4 m = bumpMat[stage];\n"
         "    return float2(dot(m.xz, value), dot(m.yw, value));\n"
+        "}\n"
+        /* Signed channels (m = 1) are stored offset by 128, as the GL
+         * renderer's signed_channel(); signed_raw gives the guest byte back
+         * for the stages that read a texel as raw bytes (dot mapping, bump
+         * and dependent reads, it%d in the GLSL). */
+        "float4 signed_decode(float4 u, float4 m)\n"
+        "{\n"
+        "    return lerp(u, clamp((u * 255.0 - 128.0) / 127.0, -1.0, 1.0), "
+        "m);\n"
+        "}\n"
+        "float4 signed_raw(float4 s, float4 m)\n"
+        "{\n"
+        "    float4 x = round(s * 127.0);\n"
+        "    x += 256.0 * (float4)(x < 0.0);\n"
+        "    return lerp(s, x / 255.0, m);\n"
         "}\n");
+}
+
+/* float4 mask of a TEX_CHANNEL_* sign set, in r, g, b, a order. */
+static char *texture_signs_mask_expr(uint8_t signs)
+{
+    return g_strdup_printf("float4(%d.0, %d.0, %d.0, %d.0)",
+                           !!(signs & TEX_CHANNEL_RSIGNED),
+                           !!(signs & TEX_CHANNEL_GSIGNED),
+                           !!(signs & TEX_CHANNEL_BSIGNED),
+                           !!(signs & TEX_CHANNEL_ASIGNED));
+}
+
+/* Name of the value a dot-mapping, bump or dependent stage reads from
+ * stage input: the raw bytes when that texture has signed channels. */
+static const char *texture_stage_raw_name(const PGRAPHD3D12PipelineKey *key,
+                                          int input, char *buf, size_t size)
+{
+    if (input >= 0 && input < NV2A_MAX_TEXTURES && key->texture_signs[input]) {
+        snprintf(buf, size, "traw%d", input);
+    } else {
+        snprintf(buf, size, "t%d", input);
+    }
+    return buf;
 }
 
 /*
@@ -4372,8 +4420,18 @@ static void append_texture_sampling_helpers(
         }
         bool cubemap = key->texture_cubemap_mask & (1u << i);
         bool texture3d = key->texture_3d_mask & (1u << i);
+        g_autofree char *signed_swizzle = NULL;
         const char *swizzle =
             texture_swizzle_expression(key->texture_color_format[i]);
+
+        if (key->texture_signs[i]) {
+            /* stored as R, G, B, A by the shared conversion, so no format
+             * swizzle */
+            g_autofree char *mask =
+                texture_signs_mask_expr(key->texture_signs[i]);
+            signed_swizzle = g_strdup_printf("signed_decode(t, %s)", mask);
+            swizzle = signed_swizzle;
+        }
 
         g_string_append_printf(source, "float4 sample_tex%u(float2 coord)\n",
                                i);
@@ -4557,6 +4615,13 @@ static void append_texture_sample_epilogue(
         return;
     }
 
+    if (key->texture_signs[stage]) {
+        g_autofree char *mask = texture_signs_mask_expr(key->texture_signs[stage]);
+
+        g_string_append_printf(source, "    traw%u = signed_raw(t%u, %s);\n",
+                               stage, stage, mask);
+    }
+
     /* Alpha kill stages come from pixel constants. */
     if (key->alpha_test_enable) {
         g_string_append_printf(
@@ -4720,6 +4785,8 @@ static void append_texture_shader_stage(
     /* Also decides whether the key may discard; see
      * canonicalize_pipeline_key(). */
     bool sampled = texture_stage_samples(key, stage);
+    char in_buf[16];
+    const char *in = texture_stage_raw_name(key, input, in_buf, sizeof(in_buf));
 
     if (!(texture_stage_execution_mask(key) & (1u << stage))) {
         return;
@@ -4809,9 +4876,9 @@ static void append_texture_shader_stage(
             } else {
                 g_string_append_printf(
                     source,
-                    "    float2 dsdt%u = float2(sign3(t%d.b), "
-                    "sign3(t%d.g));\n",
-                    stage, input, input);
+                    "    float2 dsdt%u = float2(sign3(%s.b), "
+                    "sign3(%s.g));\n",
+                    stage, in, in);
             }
             g_string_append_printf(
                 source,
@@ -4839,9 +4906,9 @@ static void append_texture_shader_stage(
             } else {
                 g_string_append_printf(
                     source,
-                    "    float3 dsdtl%u = float3(sign3(t%d.b), "
-                    "sign3(t%d.g), t%d.r);\n",
-                    stage, input, input, input);
+                    "    float3 dsdtl%u = float3(sign3(%s.b), "
+                    "sign3(%s.g), %s.r);\n",
+                    stage, in, in, in);
             }
             g_string_append_printf(
                 source,
@@ -4884,17 +4951,17 @@ static void append_texture_shader_stage(
         }
         g_string_append_printf(
             source,
-            "    dot%u = dot(input.tex%u.xyz, dotmap(%uu, t%d));\n"
+            "    dot%u = dot(input.tex%u.xyz, dotmap(%uu, %s));\n"
             "    t%u = sample_tex%u(float2(dot%u, dot%u));\n",
-            stage, stage, dot_map, input, stage, stage,
+            stage, stage, dot_map, in, stage, stage,
             stage > 0 ? stage - 1 : stage, stage);
         break;
     case PS_TEXTUREMODES_DOT_ZW:
         if (input >= 0 && input < NV2A_MAX_TEXTURES) {
             g_string_append_printf(
                 source,
-                "    dot%u = dot(input.tex%u.xyz, dotmap(%uu, t%d));\n",
-                stage, stage, dot_map, input);
+                "    dot%u = dot(input.tex%u.xyz, dotmap(%uu, %s));\n",
+                stage, stage, dot_map, in);
         }
         g_string_append_printf(
             source,
@@ -4913,18 +4980,21 @@ static void append_texture_shader_stage(
         {
             int next_input = texture_stage_input(key, 3);
             unsigned int next_dot_map = texture_stage_dot_map(key, 3);
+            char next_buf[16];
 
             if (next_input < 0 || next_input >= NV2A_MAX_TEXTURES) {
                 next_input = input;
             }
             g_string_append_printf(
                 source,
-                "    dot2 = dot(input.tex2.xyz, dotmap(%uu, t%d));\n"
+                "    dot2 = dot(input.tex2.xyz, dotmap(%uu, %s));\n"
                 "    float dot2_n = dot(input.tex3.xyz, "
-                "dotmap(%uu, t%d));\n"
+                "dotmap(%uu, %s));\n"
                 "    float3 n_2 = float3(dot1, dot2, dot2_n);\n"
                 "    t2 = sample_tex_cube2(n_2);\n",
-                dot_map, input, next_dot_map, next_input);
+                dot_map, in, next_dot_map,
+                texture_stage_raw_name(key, next_input, next_buf,
+                                       sizeof(next_buf)));
         }
         break;
     case PS_TEXTUREMODES_DOT_RFLCT_SPEC:
@@ -4938,7 +5008,7 @@ static void append_texture_shader_stage(
         }
         g_string_append_printf(
             source,
-            "    dot3 = dot(input.tex3.xyz, dotmap(%uu, t%d));\n"
+            "    dot3 = dot(input.tex3.xyz, dotmap(%uu, %s));\n"
             "    float3 n_3 = float3(dot1, dot2, dot3);\n"
             "    float3 e_3 = float3(input.tex1.w, input.tex2.w, "
             "input.tex3.w);\n"
@@ -4946,7 +5016,7 @@ static void append_texture_shader_stage(
             "    float3 rv_3 = 2.0 * n_3 * dot(n_3, e_3) / "
             "n_3_len2 - e_3;\n"
             "    t3 = sample_tex_cube3(rv_3);\n",
-            dot_map, input);
+            dot_map, in);
         break;
     case PS_TEXTUREMODES_DOT_STR_3D:
         if (!sampled) {
@@ -4960,15 +5030,15 @@ static void append_texture_shader_stage(
         if (key->texture_3d_mask & (1u << stage)) {
             g_string_append_printf(
                 source,
-                "    dot3 = dot(input.tex3.xyz, dotmap(%uu, t%d));\n"
+                "    dot3 = dot(input.tex3.xyz, dotmap(%uu, %s));\n"
                 "    t3 = sample_tex3d3(float3(dot1, dot2, dot3));\n",
-                dot_map, input);
+                dot_map, in);
         } else {
             g_string_append_printf(
                 source,
-                "    dot3 = dot(input.tex3.xyz, dotmap(%uu, t%d));\n"
+                "    dot3 = dot(input.tex3.xyz, dotmap(%uu, %s));\n"
                 "    t3 = sample_tex3(float2(dot1, dot2));\n",
-                dot_map, input);
+                dot_map, in);
         }
         break;
     case PS_TEXTUREMODES_DOT_STR_CUBE:
@@ -4982,10 +5052,10 @@ static void append_texture_shader_stage(
         }
         g_string_append_printf(
             source,
-            "    dot3 = dot(input.tex3.xyz, dotmap(%uu, t%d));\n"
+            "    dot3 = dot(input.tex3.xyz, dotmap(%uu, %s));\n"
             "    float3 dotSTR3Cube = float3(dot1, dot2, dot3);\n"
             "    t3 = sample_tex_cube3(dotSTR3Cube);\n",
-            dot_map, input);
+            dot_map, in);
         break;
     case PS_TEXTUREMODES_DPNDNT_AR:
         if (!sampled) {
@@ -4998,8 +5068,8 @@ static void append_texture_shader_stage(
         }
         g_string_append_printf(
             source,
-            "    t%u = sample_tex%u(float2(t%d.a, t%d.r));\n",
-            stage, stage, input, input);
+            "    t%u = sample_tex%u(float2(%s.a, %s.r));\n",
+            stage, stage, in, in);
         break;
     case PS_TEXTUREMODES_DPNDNT_GB:
         if (!sampled) {
@@ -5012,15 +5082,15 @@ static void append_texture_shader_stage(
         }
         g_string_append_printf(
             source,
-            "    t%u = sample_tex%u(t%d.gb);\n",
-            stage, stage, input);
+            "    t%u = sample_tex%u(%s.gb);\n",
+            stage, stage, in);
         break;
     case PS_TEXTUREMODES_DOTPRODUCT:
         if (input >= 0 && input < NV2A_MAX_TEXTURES) {
             g_string_append_printf(
                 source,
-                "    dot%u = dot(input.tex%u.xyz, dotmap(%uu, t%d));\n",
-                stage, stage, dot_map, input);
+                "    dot%u = dot(input.tex%u.xyz, dotmap(%uu, %s));\n",
+                stage, stage, dot_map, in);
         }
         g_string_append_printf(
             source,
@@ -5828,6 +5898,13 @@ static char *build_minimal_pixel_shader(const PGRAPHD3D12PipelineKey *key)
                         "    float dot1 = 0.0;\n"
                         "    float dot2 = 0.0;\n"
                         "    float dot3 = 0.0;\n");
+        for (unsigned int i = 0; i < NV2A_MAX_TEXTURES; i++) {
+            if (key->texture_signs[i]) {
+                g_string_append_printf(
+                    source, "    float4 traw%u = float4(0.0, 0.0, 0.0, 1.0);\n",
+                    i);
+            }
+        }
     }
     append_window_clip_shader(source, key);
     if (texture_execution_mask) {
@@ -6022,6 +6099,9 @@ static const char *uber_ps_unsupported(const PGRAPHD3D12PipelineKey *key)
         if ((sampled & (1u << i)) &&
             uber_swizzle_index(key->texture_color_format[i]) < 0) {
             return "texture swizzle";
+        }
+        if ((sampled & (1u << i)) && key->texture_signs[i]) {
+            return "signed texture channels";
         }
     }
     return NULL;
@@ -9803,6 +9883,10 @@ static bool fill_pipeline_key(PGRAPHState *pg,
             key->texture_pitch[i] = texture->shape.pitch;
             key->texture_bytes_per_pixel[i] =
                 MAX(texture->upload_bytes_per_pixel, 1);
+            /* texture.c keeps channel_signs only where it stored the
+             * channels offset by 128 (texture_effective_signs) */
+            key->texture_signs[i] = texture->replacement != NULL ? 0 :
+                texture->shape.channel_signs & TEX_CHANNEL_SIGNED_MASK;
             if (basic.linear) {
                 key->texture_linear_mask |= 1u << i;
             }
@@ -10969,7 +11053,7 @@ static void queue_urgent_pso_job(PGRAPHD3D12State *r, PGRAPHD3D12PsoJob *job);
 static bool fallback_mode_draws(PGRAPHD3D12FallbackMode mode);
 
 #define PIPELINE_LIST_MAGIC 0x4b535058u         /* "XPSK" */
-#define PIPELINE_LIST_KEY_VERSION 4
+#define PIPELINE_LIST_KEY_VERSION 5
 #define PIPELINE_LIST_FLAG_VERTEX_PULLING (1u << 0)
 /* Records kept per title, and pipelines precompiled per title. */
 #define PIPELINE_LIST_MAX 8192

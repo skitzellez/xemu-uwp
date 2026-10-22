@@ -471,6 +471,9 @@ typedef struct PGRAPHD3D12PipelineKey {
     float texture_border_inv_real_size[NV2A_MAX_TEXTURES][3];
     uint8_t texture_coord_mask;
     uint8_t texture_convolution_filter[NV2A_MAX_TEXTURES];
+    /* TEX_CHANNEL_* signed channels: the texture holds them offset by 128
+     * (texsigns.c) and the pixel shader reads them as -1..1. */
+    uint8_t texture_signs[NV2A_MAX_TEXTURES];
     uint32_t combiner_control;
     uint32_t shader_stage_program;
     uint32_t other_stage_input;
