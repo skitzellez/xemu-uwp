@@ -908,15 +908,31 @@ static bool check_surface_overlaps_range(const SurfaceBinding *surface,
  */
 static uint64_t uwp_clean_page;
 
+/*
+ * One page of surface memory the CPU has just written: every surface there is already marked for upload,
+ * none has drawing that is not in memory yet, and no write-back is on its way there. Another write there
+ * would only mark the same surfaces again, so it skips the graphics lock. Halo 2's intro movie writes its
+ * frames into surface memory: ~1.75 million calls a second, 8% of the CPU thread. Dropped like the clean
+ * page, and also when a surface there is uploaded or created. Value: page address + 1, 0 = none.
+ */
+static uint64_t uwp_written_page;
+
+static bool uwp_page_in(uint64_t c, hwaddr addr, hwaddr len)
+{
+    return c && addr < (c & ~(uint64_t)0xfff) + 0x1000 && (c & ~(uint64_t)0xfff) < addr + len;
+}
+
 static void uwp_clean_drop(hwaddr addr, hwaddr len)
 {
-    uint64_t c = qatomic_read(&uwp_clean_page);
-    if (c && addr < (c & ~(uint64_t)0xfff) + 0x1000 && (c & ~(uint64_t)0xfff) < addr + len) {
+    if (uwp_page_in(qatomic_read(&uwp_clean_page), addr, len)) {
         qatomic_set(&uwp_clean_page, 0);
+    }
+    if (uwp_page_in(qatomic_read(&uwp_written_page), addr, len)) {
+        qatomic_set(&uwp_written_page, 0);
     }
 }
 
-/* test file clean-page-off.txt: every CPU access to surface memory takes the full path, as before */
+/* test file clean-page-off.txt: every CPU access to surface memory takes the full path, as before (reads and writes) */
 static bool uwp_clean_page_off(void)
 {
     static int off = -1;
@@ -924,7 +940,7 @@ static bool uwp_clean_page_off(void)
         extern bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
         off = xemu_uwp_test_file_exists("clean-page-off.txt");
         if (off) {
-            uwp_log("surface test: no clean-page shortcut for CPU reads (clean-page-off.txt)");
+            uwp_log("surface test: no clean-page or written-page shortcut for CPU access (clean-page-off.txt)");
         }
     }
     return off;
@@ -936,8 +952,9 @@ static void surface_access_callback(void *opaque, MemoryRegion *mr, hwaddr addr,
 {
     NV2AState *d = (NV2AState *)opaque;
 #ifdef XEMU_UWP
-    if (!write) {
-        uint64_t c = qatomic_read(&uwp_clean_page);
+    {
+        uint64_t *cp = write ? &uwp_written_page : &uwp_clean_page;
+        uint64_t c = qatomic_read(cp);
         if (c && (addr & ~(hwaddr)0xfff) == (c & ~(uint64_t)0xfff) &&
             ((addr + len - 1) & ~(hwaddr)0xfff) == (c & ~(uint64_t)0xfff)) {
             return;
@@ -978,8 +995,11 @@ static void surface_access_callback(void *opaque, MemoryRegion *mr, hwaddr addr,
     if (uwp_wb_overlaps(addr, len)) {
         wait_for_downloads = true;
     }
-    /* a read that needed nothing: its page is remembered as clean when every surface there is (above) */
-    if (!write && !wait_for_downloads && !uwp_clean_page_off()) {
+    /*
+     * an access that needed no wait: its page is remembered (a read: as clean, a write: as written) when
+     * no surface there has drawing that is not in memory yet; a write has marked every surface there
+     */
+    if (!wait_for_downloads && !uwp_clean_page_off()) {
         hwaddr page = addr & ~(hwaddr)0xfff;
         bool clean = ((addr + len - 1) & ~(hwaddr)0xfff) == page && !uwp_wb_overlaps(page, 0x1000);
         QTAILQ_FOREACH(surface, &r->surfaces, entry) {
@@ -988,7 +1008,8 @@ static void surface_access_callback(void *opaque, MemoryRegion *mr, hwaddr addr,
             }
         }
         if (clean) {
-            qatomic_set(&uwp_clean_page, (uint64_t)page + 1);
+            uint64_t *cp = write ? &uwp_written_page : &uwp_clean_page;
+            qatomic_set(cp, (uint64_t)page + 1);
         }
     }
 #endif
@@ -1307,6 +1328,7 @@ static SurfaceBinding *surface_put(NV2AState *d, hwaddr addr,
 
     QTAILQ_INSERT_TAIL(&r->surfaces, surface_out, entry);
 #ifdef XEMU_UWP
+    uwp_clean_drop(surface_out->vram_addr, surface_out->size);
     xemu_uwp_counters[UWP_CNT_SURF_NEW]++;
 #endif
 
@@ -2557,6 +2579,10 @@ void pgraph_gl_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
 
     PGRAPHState *pg = &d->pgraph;
 
+#ifdef XEMU_UWP
+    /* CPU writes from here on must mark the surface again */
+    uwp_clean_drop(surface->vram_addr, surface->size);
+#endif
     surface->upload_pending = false;
     surface->draw_time = pg->draw_time;
 
