@@ -3164,6 +3164,10 @@ static uint64_t uwp_prepare_tick(void)
     int done = 0, total = 0;
     bool busy = uwp_prep_status(&done, &total);
     if (uwp_prep == UWP_PREP_START) {
+        if (qemu_reset_requested_get()) {
+            /* a disc swap's reset still to come: paused now, QEMU would reset into PRELAUNCH and never run */
+            return 0;
+        }
         uwp_prep = UWP_PREP_OVER;
         if (!uwp_prep_wanted) {
             return 0;   /* the start screen is switched off (the default) */
@@ -4916,6 +4920,9 @@ static char *uwp_take_activation_disc(void)
     bool fps = false;
     bool tests = uwp_test_links_allowed(), refused = false;
     char *query = strchr(uri, '?');
+    /* each link names its own game (tid=); a link without one must not keep the game before it, or the
+     * next game's pipelines are recorded into that game's list */
+    uwp_title_key[0] = '\0';
     for (char *p = query ? query + 1 : NULL; p && *p;) {
         char *end = strchr(p, '&');
         if (end) {
@@ -5807,6 +5814,9 @@ static void uwp_poll_activation(void)
             uwp_log("disc changed by launcher: %s", disc);
             qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
             uwp_watch_start();
+            /* the new game's shaders get ready first, as at a fresh start: without the hold its whole list
+             * built on one background worker while it played (Halo 2 after Turok: 635 pipelines in 54 s) */
+            uwp_prep = UWP_PREP_START;
         }
         xemu_main_loop_unlock();
     }
