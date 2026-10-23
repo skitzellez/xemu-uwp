@@ -79,6 +79,14 @@ void tcg_gen_goto_tb(unsigned idx);
  */
 void tcg_gen_lookup_and_goto_ptr(void);
 
+/**
+ * tcg_gen_goto_ptr() - jump to translated code
+ * @ptr: host address of the code, e.g. a TB's tc.ptr
+ *
+ * For front ends that find the next TB themselves (xemu UWP: the inline jump cache probe).
+ */
+void tcg_gen_goto_ptr(TCGv_ptr ptr);
+
 void tcg_gen_plugin_cb(unsigned from);
 void tcg_gen_plugin_mem_cb(TCGv_i64 addr, unsigned meminfo);
 

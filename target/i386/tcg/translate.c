@@ -40,6 +40,10 @@ static int g_use_hard_fpu;
 #if defined(XBOX) && defined(__x86_64__)
 #include "ui/xemu-settings.h"
 #include "qemu/xemu-uwp.h"
+#ifdef XEMU_UWP
+#include "accel/tcg/tb-hash.h"
+#include "tcg/tcg-temp-internal.h"
+#endif
 
 #ifdef XEMU_UWP
 uint32_t xemu_uwp_flcr_shadow;
@@ -2786,6 +2790,100 @@ static void gen_bnd_jmp(DisasContext *s)
     }
 }
 
+#ifdef XEMU_UWP
+#define CPU_ENV_OFFSET(field)     (offsetof(ArchCPU, parent_obj.field) - offsetof(ArchCPU, env))
+
+/*
+ * tcg_gen_lookup_and_goto_ptr() with the jump cache probed from the translated code (the approach of another
+ * Xbox port of xemu). Indirect jumps and returns run tens of millions of times a second (PGR2 and Burnout 3
+ * movies: 33M/s, 40% of the vCPU in helper_lookup_tb_ptr), and the helper call, its CPU state collection and
+ * its prologue cost more than the probe. Any mismatch takes the helper, so the checks only have to cover what
+ * tb_lookup() accepts as a hit with the state x86_get_tb_cpu_state() and curr_cflags() would produce: pc
+ * (cs_base + eip, 32-bit), cs_base, flags (hflags | IOPL/TF/RF/VM/AC), cflags (an invalidated TB carries
+ * CF_INVALID and fails). Breakpoints and single-step go to the helper. Test file jc-inline-off.txt: the helper.
+ */
+bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+static bool uwp_tb_inline_lookup(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = !xemu_uwp_test_file_exists("jc-inline-off.txt");
+        uwp_log("cpu: jump lookups %s", on ? "in the translated code" : "through the helper (jc-inline-off.txt)");
+    }
+    return on;
+}
+
+static void gen_lookup_and_goto_ptr_inline(DisasContext *s)
+{
+    TCGLabel *miss;
+    TCGv_i32 pc, cs_base, t0, t1;
+    TCGv_ptr ptr, tb;
+    TCGv_i64 v0, v1;
+
+    if ((tb_cflags(s->base.tb) & CF_NO_GOTO_PTR) || (s->flags & HF_CS64_MASK) || !uwp_tb_inline_lookup()) {
+        tcg_gen_lookup_and_goto_ptr();
+        return;
+    }
+
+    miss = gen_new_label();
+    pc = tcg_temp_ebb_new_i32();
+    cs_base = tcg_temp_ebb_new_i32();
+    t0 = tcg_temp_ebb_new_i32();
+    t1 = tcg_temp_ebb_new_i32();
+    ptr = tcg_temp_ebb_new_ptr();
+    tb = tcg_temp_ebb_new_ptr();
+    v0 = tcg_temp_ebb_new_i64();
+    v1 = tcg_temp_ebb_new_i64();
+
+    /* breakpoints and single-step: the helper checks them */
+    tcg_gen_ld_ptr(ptr, tcg_env, CPU_ENV_OFFSET(breakpoints.tqh_first));
+    tcg_gen_brcondi_ptr(TCG_COND_NE, ptr, 0, miss);
+    tcg_gen_ld_i32(t0, tcg_env, CPU_ENV_OFFSET(singlestep_enabled));
+    tcg_gen_brcondi_i32(TCG_COND_NE, t0, 0, miss);
+
+    tcg_gen_ld_i32(cs_base, tcg_env, offsetof(CPUX86State, segs[R_CS].base));
+    tcg_gen_add_i32(pc, cpu_eip, cs_base);
+
+    /* the slot: must match tb_jmp_cache_hash_func() */
+    tcg_gen_shri_i32(t0, pc, TARGET_PAGE_BITS - TB_JMP_PAGE_BITS);
+    tcg_gen_xor_i32(t0, t0, pc);
+    tcg_gen_shri_i32(t1, t0, TARGET_PAGE_BITS - TB_JMP_PAGE_BITS);
+    tcg_gen_andi_i32(t1, t1, TB_JMP_PAGE_MASK);
+    tcg_gen_andi_i32(t0, t0, TB_JMP_ADDR_MASK);
+    tcg_gen_or_i32(t0, t0, t1);
+    QEMU_BUILD_BUG_ON(sizeof(((CPUJumpCache *)0)->array[0]) != 16);
+    tcg_gen_shli_i32(t0, t0, 4);
+    tcg_gen_ext_i32_ptr(tb, t0);
+    tcg_gen_ld_ptr(ptr, tcg_env, CPU_ENV_OFFSET(tb_jmp_cache));
+    tcg_gen_add_ptr(ptr, ptr, tb);
+
+    tcg_gen_ld_ptr(tb, ptr, offsetof(CPUJumpCache, array[0].tb));
+    tcg_gen_brcondi_ptr(TCG_COND_EQ, tb, 0, miss);
+    tcg_gen_ld_i64(v0, ptr, offsetof(CPUJumpCache, array[0].pc));
+    tcg_gen_extu_i32_i64(v1, pc);
+    tcg_gen_brcond_i64(TCG_COND_NE, v0, v1, miss);
+
+    tcg_gen_ld_i32(t0, tcg_env, offsetof(CPUX86State, eflags));
+    tcg_gen_andi_i32(t0, t0, IOPL_MASK | TF_MASK | RF_MASK | VM_MASK | AC_MASK);
+    tcg_gen_ld_i32(t1, tcg_env, offsetof(CPUX86State, hflags));
+    tcg_gen_or_i32(t0, t0, t1);
+    tcg_gen_ld_i32(t1, tb, offsetof(TranslationBlock, flags));
+    tcg_gen_brcond_i32(TCG_COND_NE, t0, t1, miss);
+    tcg_gen_ld_i64(v0, tb, offsetof(TranslationBlock, cs_base));
+    tcg_gen_extu_i32_i64(v1, cs_base);
+    tcg_gen_brcond_i64(TCG_COND_NE, v0, v1, miss);
+    tcg_gen_ld_i32(t0, tcg_env, CPU_ENV_OFFSET(tcg_cflags));
+    tcg_gen_ld_i32(t1, tb, offsetof(TranslationBlock, cflags));
+    tcg_gen_brcond_i32(TCG_COND_NE, t0, t1, miss);
+
+    tcg_gen_ld_ptr(ptr, tb, offsetof(TranslationBlock, tc.ptr));
+    tcg_gen_goto_ptr(ptr);
+
+    gen_set_label(miss);
+    tcg_gen_lookup_and_goto_ptr();
+}
+#endif
+
 /*
  * Generate an end of block, including common tasks such as generating
  * single step traps, resetting the RF flag, and handling the interrupt
@@ -2818,7 +2916,11 @@ gen_eob(DisasContext *s, int mode)
     } else if (mode == DISAS_JUMP &&
                /* give irqs a chance to happen */
                !inhibit_reset) {
+#ifdef XEMU_UWP
+        gen_lookup_and_goto_ptr_inline(s);
+#else
         tcg_gen_lookup_and_goto_ptr();
+#endif
     } else {
         tcg_gen_exit_tb(NULL, 0);
     }
