@@ -729,6 +729,13 @@ static uint32_t pgraph_d3d12_tune_text_flags(const char *text)
             flags |= switches[i].flag;
         }
     }
+    /* ZCLIPMIN/ZCLIPMAX clamp instead of cull by default: Halo 2's HUD frame,
+     * crosshair and icons (zclip 256.. with the draws at depth 0, no depth
+     * buffer) were culled here while the GL renderer draws them.
+     * "zclip=cull" restores the cull. */
+    if (!tune_word(text, "zclip=cull")) {
+        flags |= PGRAPH_D3D12_TUNE_ZCLIP_CLAMP;
+    }
     /* DXIL is the default: it compiles and builds pipelines faster on the
      * console driver. "dxbc" selects FXC bytecode instead. */
     if (!tune_word(text, "dxbc")) {
@@ -2016,6 +2023,16 @@ static void capture_vertex_samples(PGRAPHState *pg, GString *line,
 }
 
 /* One line per draw while a capture is active. */
+/* A float register's value, for the capture line. */
+static double capture_reg_float(PGRAPHState *pg, unsigned int reg)
+{
+    uint32_t bits = pgraph_reg_r(pg, reg);
+    float value;
+
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
 void pgraph_d3d12_capture_draw(PGRAPHState *pg, unsigned int topology)
 {
     PGRAPHD3D12State *r = pg->d3d12_renderer_state;
@@ -2032,7 +2049,8 @@ void pgraph_d3d12_capture_draw(PGRAPHState *pg, unsigned int topology)
         "CAP draw #%u prim=%u topo=%u c=0x%" HWADDR_PRIx ":%ux%u:f%u z=0x%"
         HWADDR_PRIx ":%ux%u stype=%u ctl0=%08x ctl1=%08x ctl2=%08x "
         "ctl3=%08x blend=%08x setup=%08x csv0d=%08x comb=%08x "
-        "fc=%08x/%08x shprog=%08x shctl=%08x",
+        "fc=%08x/%08x shprog=%08x shctl=%08x zclip=%g/%g zco=%08x zofs=%g/%g "
+        "zfmt=%u/%u",
         r->capture_draws, pg->primitive_mode, topology,
         r->color_binding ? r->color_binding->vram_addr : 0,
         r->color_binding ? r->color_binding->width : 0,
@@ -2054,7 +2072,13 @@ void pgraph_d3d12_capture_draw(PGRAPHState *pg, unsigned int topology)
         pgraph_reg_r(pg, NV_PGRAPH_COMBINESPECFOG0),
         pgraph_reg_r(pg, NV_PGRAPH_COMBINESPECFOG1),
         pgraph_reg_r(pg, NV_PGRAPH_SHADERPROG),
-        pgraph_reg_r(pg, NV_PGRAPH_SHADERCTL));
+        pgraph_reg_r(pg, NV_PGRAPH_SHADERCTL),
+        capture_reg_float(pg, NV_PGRAPH_ZCLIPMIN),
+        capture_reg_float(pg, NV_PGRAPH_ZCLIPMAX),
+        pgraph_reg_r(pg, NV_PGRAPH_ZCOMPRESSOCCLUDE),
+        capture_reg_float(pg, NV_PGRAPH_ZOFFSETBIAS),
+        capture_reg_float(pg, NV_PGRAPH_ZOFFSETFACTOR),
+        pg->surface_shape.zeta_format, pg->surface_shape.z_format);
     for (unsigned int i = 0; i < NV2A_MAX_TEXTURES; i++) {
         PGRAPHD3D12TextureBinding *b = r->texture_binding[i];
 

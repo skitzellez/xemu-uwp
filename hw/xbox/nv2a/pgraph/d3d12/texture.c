@@ -388,8 +388,12 @@ static bool texture_format_for_shape(const TextureShape *shape,
 
     case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A4R4G4B4:
     case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A4R4G4B4:
-        info->dxgi_format = DXGI_FORMAT_B4G4R4A4_UNORM;
-        info->upload_bytes_per_pixel = 2;
+        /* B4G4R4A4 is optional in D3D12 and samples as nothing on the
+         * console (Halo 2 HUD frame, crosshair and icons missing), so the
+         * texels widen to RGBA8 (texsigns_convert_argb4444, R,G,B,A). */
+        info->dxgi_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        info->upload_bytes_per_pixel = 4;
+        info->converted = true;
         return true;
 
     case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8:
@@ -1127,6 +1131,18 @@ static uint8_t *decode_texture_level(
             return convert_y16_float_to_r32_float(
                 linear_src, width, height, depth, source_row_pitch,
                 source_slice_pitch, decoded_size_out);
+        }
+
+        if (!shape->channel_signs &&
+            (shape->color_format ==
+                 NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A4R4G4B4 ||
+             shape->color_format ==
+                 NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A4R4G4B4)) {
+            *row_pitch_out = width * info->upload_bytes_per_pixel;
+            *slice_pitch_out = *row_pitch_out * height;
+            return texsigns_convert_argb4444(
+                linear_src, width, height, depth, source_row_pitch,
+                source_slice_pitch, 0, decoded_size_out);
         }
 
         if (shape->color_format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R6G5B5) {
