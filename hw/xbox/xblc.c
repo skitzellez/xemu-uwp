@@ -24,6 +24,8 @@
 #include "migration/vmstate.h"
 #include "hw/usb.h"
 #include "hw/usb/desc.h"
+#include "qemu/thread.h"
+#include "qemu/main-loop.h"
 
 #include <SDL3/SDL.h>
 #ifdef XEMU_UWP
@@ -71,6 +73,9 @@ typedef struct USBXBLCState {
 #ifdef XEMU_UWP
     bool uwp_heard;  /* logged the first microphone sound and the first game voice */
     bool uwp_spoke;
+    bool uwp_sdl_audio;  /* holds a reference on SDL's sound system */
+    QemuThread uwp_open_thread;
+    bool uwp_opening;
 #endif
 } USBXBLCState;
 
@@ -345,6 +350,51 @@ static void xblc_audio_channel_init(USBXBLCState *s, bool capture, Error **errp)
     SDL_ResumeAudioStreamDevice(*channel);
 }
 
+#ifdef XEMU_UWP
+static void *uwp_xblc_open(void *opaque)
+{
+    USBXBLCState *s = opaque;
+    Error *err = NULL;
+
+    /* the headset is plugged in with the controller, before the APU starts SDL's sound */
+    s->uwp_sdl_audio = SDL_InitSubSystem(SDL_INIT_AUDIO);
+    if (!s->uwp_sdl_audio) {
+        uwp_log("headset: no sound system: %s", SDL_GetError());
+        return NULL;
+    }
+    int n = 0;
+    SDL_AudioDeviceID *ids = SDL_GetAudioRecordingDevices(&n);
+    uwp_log("headset: %d microphone(s) on the console", n);
+    for (int i = 0; ids && i < n && i < 8; i++) {
+        const char *name = SDL_GetAudioDeviceName(ids[i]);
+        uwp_log("headset:   %s", name ? name : "?");
+    }
+    SDL_free(ids);
+    xblc_audio_channel_init(s, true, &err);
+    error_free(err);
+    err = NULL;
+    xblc_audio_channel_init(s, false, &err);
+    error_free(err);
+    return NULL;
+}
+
+/* closing also waits for SDL's output thread: done on a thread, without the BQL */
+static void *uwp_xblc_close(void *opaque)
+{
+    SDL_AudioStream **streams = opaque;
+    for (int i = 0; i < 2; i++) {
+        if (streams[i]) {
+            SDL_DestroyAudioStream(streams[i]);
+        }
+    }
+    if (streams[2]) {
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+    }
+    g_free(streams);
+    return NULL;
+}
+#endif
+
 static void xblc_realize(USBDevice *dev, Error **errp)
 {
     USBXBLCState *s = USB_XBLC(dev);
@@ -356,6 +406,15 @@ static void xblc_realize(USBDevice *dev, Error **errp)
     s->in = NULL;
     s->out = NULL;
     s->sample_rate = XBLC_DEFAULT_SAMPLE_RATE;
+
+#ifdef XEMU_UWP
+    /* Opened on a thread of its own: the device is added with the BQL held, and opening the sound output
+     * waits for SDL's output thread, which may be in the APU's callback waiting for the BQL. */
+    s->uwp_opening = true;
+    qemu_thread_create(&s->uwp_open_thread, "xblc-open", uwp_xblc_open, s, QEMU_THREAD_JOINABLE);
+    (void)err;
+    return;
+#endif
 
     xblc_audio_channel_init(s, true, &err);
     if (err) {
@@ -373,6 +432,24 @@ static void xblc_realize(USBDevice *dev, Error **errp)
 static void xblc_unrealize(USBDevice *dev)
 {
     USBXBLCState *s = USB_XBLC(dev);
+
+#ifdef XEMU_UWP
+    if (s->uwp_opening) {
+        bql_unlock();
+        qemu_thread_join(&s->uwp_open_thread);
+        bql_lock();
+        s->uwp_opening = false;
+    }
+    SDL_AudioStream **streams = g_new0(SDL_AudioStream *, 3);
+    streams[0] = s->in;
+    streams[1] = s->out;
+    streams[2] = s->uwp_sdl_audio ? (void *)1 : NULL;
+    s->in = s->out = NULL;
+    s->uwp_sdl_audio = false;
+    QemuThread t;
+    qemu_thread_create(&t, "xblc-close", uwp_xblc_close, streams, QEMU_THREAD_DETACHED);
+    return;
+#endif
 
     if (s->in) {
         SDL_DestroyAudioStream(s->in);
