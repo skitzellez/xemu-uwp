@@ -3307,9 +3307,44 @@ static void uwp_pace_second(unsigned at, char *out, size_t size)
              uneven, n, target, spread, low1);
 }
 
+/*
+ * The hard disk's new parts written out soon after the game wrote them. xemu's disk (qcow2) keeps the map of newly
+ * used space in memory until a flush, and the console ends an app without warning: anything made since the last
+ * flush was lost (a tester's new Insignia account, 2026-10-22: gone each time xemu was closed; saves that only
+ * overwrite old space survived). Once a second: after a write, flush when the disk has been quiet 2 s, or 10 s after
+ * the first unsaved write at the latest.
+ */
+static void uwp_hdd_save_second(void)
+{
+    extern uint64_t xemu_uwp_hdd_write_bytes;
+    static uint64_t last_bytes;
+    static unsigned quiet, pending, flushes;
+    uint64_t bytes = qatomic_read(&xemu_uwp_hdd_write_bytes);
+    if (bytes != last_bytes) {
+        last_bytes = bytes;
+        quiet = 0;
+        pending++;
+        if (pending < 10) {
+            return;
+        }
+    } else if (!pending || ++quiet < 2) {
+        return;
+    }
+    int64_t t0 = g_get_monotonic_time();
+    xemu_main_loop_lock();
+    int ret = bdrv_flush_all();
+    xemu_main_loop_unlock();
+    int ms = (int)((g_get_monotonic_time() - t0) / 1000);
+    pending = quiet = 0;
+    if (++flushes <= 5 || ret || ms > 100) {
+        uwp_log("hard disk: written changes saved (%d ms%s)", ms, ret ? ", FAILED" : "");
+    }
+}
+
 static void uwp_box_sample(void)
 {
     uwp_start_screen_second();
+    uwp_hdd_save_second();
     uwp_watch_second();
     {
         /*

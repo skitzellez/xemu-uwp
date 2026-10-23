@@ -769,6 +769,7 @@ void ide_cancel_dma_sync(IDEState *s)
 
 #ifdef XEMU_UWP
 uint64_t xemu_uwp_hdd_read_bytes, xemu_uwp_dvd_read_bytes; /* bytes read by the guest, for the log */
+uint64_t xemu_uwp_hdd_write_bytes; /* bytes the guest wrote to the hard disk (ui/xemu.c saves them soon after) */
 #endif
 static void ide_sector_read(IDEState *s);
 
@@ -928,6 +929,9 @@ static void ide_dma_cb(void *opaque, int ret)
     if (n > 0 && s->dma_cmd == IDE_DMA_READ) {
         qatomic_add(&xemu_uwp_hdd_read_bytes, (uint64_t)n * 512); /* for the log's MB/s */
     }
+    if (n > 0 && s->dma_cmd == IDE_DMA_WRITE) {
+        qatomic_add(&xemu_uwp_hdd_write_bytes, (uint64_t)n * 512);
+    }
 #endif
     if (n > 0) {
         assert(n * 512 == s->sg.size);
@@ -1049,6 +1053,9 @@ static void ide_sector_write_cb(void *opaque, int ret)
 
     s->pio_aiocb = NULL;
     s->status &= ~BUSY_STAT;
+#ifdef XEMU_UWP
+    qatomic_add(&xemu_uwp_hdd_write_bytes, (uint64_t)MIN(s->nsector, s->req_nb_sectors) * BDRV_SECTOR_SIZE);
+#endif
 
     if (ret != 0) {
         if (ide_handle_rw_error(s, -ret, IDE_RETRY_PIO)) {
