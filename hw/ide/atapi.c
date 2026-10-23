@@ -261,6 +261,22 @@ static void atapi_defer_completion(IDEState *s)
 void ide_atapi_cmd_error(IDEState *s, int sense_key, int asc)
 {
     trace_ide_atapi_cmd_error(s, sense_key, asc);
+#ifdef XEMU_UWP
+    {
+        /* refused commands, each kind once (up to 32 kinds) */
+        static uint32_t told[32];
+        static int ntold;
+        uint32_t k = (uint32_t)s->io_buffer[0] << 16 | (uint32_t)(sense_key & 0xff) << 8 | (asc & 0xff);
+        bool known = false;
+        for (int i = 0; i < ntold && !known; i++) {
+            known = told[i] == k;
+        }
+        if (!known && ntold < 32) {
+            told[ntold++] = k;
+            uwp_log("disc drive: command 0x%02x refused (sense %x, asc %02x)", s->io_buffer[0], sense_key, asc);
+        }
+    }
+#endif
     s->error = sense_key << 4;
     s->status = READY_STAT | ERR_STAT;
     s->nsector = (s->nsector & ~7) | ATAPI_INT_REASON_IO | ATAPI_INT_REASON_CD;
@@ -1392,6 +1408,16 @@ void ide_atapi_cmd(IDEState *s)
     const struct AtapiCmd *cmd = &atapi_cmd_table[s->io_buffer[0]];
 
     trace_ide_atapi_cmd(s, s->io_buffer[0]);
+#ifdef XEMU_UWP
+    {
+        /* each command the first time, with its time: a game that waits on the drive shows what it asked */
+        static bool seen[256];
+        if (!seen[s->io_buffer[0]]) {
+            seen[s->io_buffer[0]] = true;
+            uwp_log("disc drive: command 0x%02x (first time)", s->io_buffer[0]);
+        }
+    }
+#endif
 
     if (trace_event_get_state_backends(TRACE_IDE_ATAPI_CMD_PACKET)) {
         g_autoptr(GString) str =

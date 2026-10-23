@@ -24,6 +24,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xemu-uwp.h"
 #include "hw/irq.h"
 #include "hw/isa/isa.h"
 #include "migration/vmstate.h"
@@ -2192,6 +2193,17 @@ void ide_bus_exec_cmd(IDEBus *bus, uint32_t val)
 
     s = ide_bus_active_if(bus);
     trace_ide_bus_exec_cmd(bus, s, val);
+#ifdef XEMU_UWP
+    {
+        /* each ATA command the first time, per drive kind (hard disk / disc drive), with its time */
+        static bool seen[2][256];
+        int kind = s->drive_kind == IDE_CD;
+        if (!seen[kind][val & 0xff]) {
+            seen[kind][val & 0xff] = true;
+            uwp_log("%s: ATA command 0x%02x (first time)", kind ? "disc drive" : "hard disk", val & 0xff);
+        }
+    }
+#endif
 
     /* ignore commands to non existent slave */
     if (s != bus->ifs && !s->blk) {
