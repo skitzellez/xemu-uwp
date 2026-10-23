@@ -5666,6 +5666,28 @@ static bool zeta_test_reads_buffer(PGRAPHState *pg)
                 NV_PGRAPH_CONTROL_1_STENCIL_FUNC_ALWAYS);
 }
 
+/*
+ * Whether a draw writes the zeta buffer, as the pipeline state does it
+ * (fill_depth_stencil_key): depth only with the depth test on, stencil only
+ * with the stencil test on. The write-enable bits alone are not enough: Hot
+ * Wheels draws its 256x256 and 128x128 glow passes (swizzled) with the main
+ * 640x480 depth buffer still set, ZFUNC ALWAYS, depth writes off and the
+ * stencil test off but its write bit on. Counted as a write, each pass made a
+ * swizzled depth surface over the 640x480 one and read the main depth back
+ * and up again several times a frame; the title logo was then tested against
+ * scrambled depth and cut along the mountains.
+ */
+static bool zeta_draw_writes_buffer(PGRAPHState *pg)
+{
+    uint32_t control_0 = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0);
+    uint32_t control_1 = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_1);
+
+    return ((control_0 & NV_PGRAPH_CONTROL_0_ZENABLE) &&
+            (control_0 & NV_PGRAPH_CONTROL_0_ZWRITEENABLE)) ||
+           ((control_1 & NV_PGRAPH_CONTROL_1_STENCIL_TEST_ENABLE) &&
+            (control_0 & NV_PGRAPH_CONTROL_0_STENCIL_WRITE_ENABLE));
+}
+
 static void pgraph_d3d12_surface_update_internal(
     NV2AState *d, bool upload, bool color_write, bool zeta_write,
     const uint32_t *clear_parameter)
@@ -5686,7 +5708,7 @@ static void pgraph_d3d12_surface_update_internal(
     color_write = color_write &&
                   (pg->clearing || pgraph_color_write_enabled(pg));
     zeta_write = zeta_write &&
-                 (pg->clearing || pgraph_zeta_write_enabled(pg));
+                 (pg->clearing || zeta_draw_writes_buffer(pg));
     zeta_access = zeta_access && (pg->clearing || zeta_write ||
                                   zeta_test_reads_buffer(pg));
 
@@ -5907,7 +5929,7 @@ void pgraph_d3d12_set_surface_dirty(PGRAPHState *pg, bool color, bool zeta)
     PGRAPHD3D12State *r = pg->d3d12_renderer_state;
 
     color = color && (pg->clearing || pgraph_color_write_enabled(pg));
-    zeta = zeta && (pg->clearing || pgraph_zeta_write_enabled(pg));
+    zeta = zeta && (pg->clearing || zeta_draw_writes_buffer(pg));
 
     pg->surface_color.draw_dirty |= color;
     pg->surface_zeta.draw_dirty |= zeta;
