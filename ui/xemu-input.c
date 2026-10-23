@@ -264,6 +264,51 @@ static const char *get_bound_driver(int port)
 
 static const int port_map[4] = { 3, 4, 1, 2 };
 
+#ifdef XEMU_UWP
+/* Headset test: an Xbox Live Communicator in slot A of player 1's controller, using the console's own
+ * default microphone and sound output (hw/xbox/xblc.c, SDL). Not when a memory unit uses slot A. */
+static DeviceState *uwp_xblc_dev[4];
+
+static void uwp_xblc_attach(int index)
+{
+    if (index != 0 || uwp_xblc_dev[index] || !bound_controllers[index] ||
+        bound_controllers[index]->peripheral_types[0] == PERIPHERAL_XMU) {
+        return;
+    }
+    QDict *qdict = qdict_new();
+    qdict_put_str(qdict, "driver", "usb-xblc");
+    char *tmp = g_strdup_printf("1.%d.2", port_map[index]);
+    qdict_put_str(qdict, "port", tmp);
+    g_free(tmp);
+    QemuOpts *opts = qemu_opts_from_qdict(qemu_find_opts("device"), qdict, &error_abort);
+    Error *err = NULL;
+    DeviceState *dev = qdev_device_add(opts, &err);
+    qobject_unref(qdict);
+    if (!dev) {
+        uwp_log("headset: not connected to port %dA: %s", index + 1, error_get_pretty(err));
+        error_free(err);
+        return;
+    }
+    uwp_xblc_dev[index] = dev;
+    uwp_log("headset: connected to port %dA", index + 1);
+}
+
+static void uwp_xblc_detach(int index)
+{
+    if (!uwp_xblc_dev[index]) {
+        return;
+    }
+    Error *err = NULL;
+    qdev_unplug(uwp_xblc_dev[index], &err);
+    if (err) {
+        uwp_log("headset: not removed from port %dA: %s", index + 1, error_get_pretty(err));
+        error_free(err);
+    }
+    object_unref(OBJECT(uwp_xblc_dev[index]));
+    uwp_xblc_dev[index] = NULL;
+}
+#endif
+
 void xemu_input_init(void)
 {
     if (g_config.input.background_input_capture) {
@@ -936,6 +981,9 @@ void xemu_input_bind(int index, ControllerState *state, int save)
             }
         }
 
+#ifdef XEMU_UWP
+        uwp_xblc_detach(index);
+#endif
         qdev_unplug((DeviceState *)bound_controllers[index]->device, &err);
         assert(err == NULL);
 
@@ -1027,6 +1075,12 @@ bool xemu_input_bind_xmu(int player_index, int expansion_slot_index,
         return false;
 
     XmuState *xmu = (XmuState *)player->peripherals[expansion_slot_index];
+
+#ifdef XEMU_UWP
+    if (expansion_slot_index == 0 && filename != NULL) {
+        uwp_xblc_detach(player_index);
+    }
+#endif
 
     // Unbind existing XMU
     if (xmu->dev != NULL) {
@@ -1185,6 +1239,9 @@ void xemu_input_rebind_xmu(int port)
             }
         }
     }
+#ifdef XEMU_UWP
+    uwp_xblc_attach(port);
+#endif
 }
 
 void xemu_input_set_test_mode(int enabled)

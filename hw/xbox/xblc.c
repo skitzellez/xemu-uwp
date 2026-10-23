@@ -26,6 +26,9 @@
 #include "hw/usb/desc.h"
 
 #include <SDL3/SDL.h>
+#ifdef XEMU_UWP
+#include "qemu/xemu-uwp.h"
+#endif
 
 /* #define DEBUG_XBLC */
 #ifdef DEBUG_XBLC
@@ -65,6 +68,10 @@ typedef struct USBXBLCState {
 
     SDL_AudioStream *in;
     SDL_AudioStream *out;
+#ifdef XEMU_UWP
+    bool uwp_heard;  /* logged the first microphone sound and the first game voice */
+    bool uwp_spoke;
+#endif
 } USBXBLCState;
 
 enum {
@@ -261,6 +268,17 @@ static void xblc_handle_data(USBDevice *dev, USBPacket *p)
                 DPRINTF("SDL_GetAudioStreamData failed: %s", SDL_GetError());
                 break;
             } else if (chunk_len > 0) {
+#ifdef XEMU_UWP
+                if (!s->uwp_heard) {
+                    for (int i = 0; i + 1 < chunk_len; i += 2) {
+                        if (packet[i] | packet[i + 1]) {
+                            s->uwp_heard = true;
+                            uwp_log("headset: microphone sound reaches the game (%d Hz)", s->sample_rate);
+                            break;
+                        }
+                    }
+                }
+#endif
                 usb_packet_copy(p, (void *)packet, chunk_len);
                 remaining -= chunk_len;
             } else {
@@ -276,6 +294,12 @@ static void xblc_handle_data(USBDevice *dev, USBPacket *p)
             break;
         }
         if (s->out != NULL) {
+#ifdef XEMU_UWP
+            if (!s->uwp_spoke && p->iov.size > 0) {
+                s->uwp_spoke = true;
+                uwp_log("headset: the game sends voice to the headphones (%d Hz)", s->sample_rate);
+            }
+#endif
             if (!SDL_PutAudioStreamData(s->out, p->iov.iov->iov_base,
                                         p->iov.size)) {
                 DPRINTF("SDL_PutAudioStreamData failed: %s", SDL_GetError());
@@ -303,6 +327,15 @@ static void xblc_audio_channel_init(USBXBLCState *s, bool capture, Error **errp)
         SDL_DestroyAudioStream(*channel);
     }
     *channel = SDL_OpenAudioDeviceStream(devid, &spec, NULL, (void *)s);
+#ifdef XEMU_UWP
+    if (*channel == NULL) {
+        uwp_log("headset: %s not opened: %s", capture ? "microphone" : "headphones", SDL_GetError());
+    } else {
+        SDL_AudioDeviceID id = SDL_GetAudioStreamDevice(*channel);
+        const char *name = SDL_GetAudioDeviceName(id);
+        uwp_log("headset: %s opened: %s", capture ? "microphone" : "headphones", name ? name : "?");
+    }
+#endif
     if (*channel == NULL) {
         error_setg(errp, "Failed to open audio device stream: %s",
                    SDL_GetError());
