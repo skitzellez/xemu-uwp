@@ -11090,7 +11090,7 @@ struct PGRAPHD3D12PipelineList {
      * with it. */
     bool uber_ps;
     /* fallback=all/debug: the interpreter pipelines of the recorded keys
-     * build first. */
+     * build after the keys. */
     bool fallback;
     bool loaded;                /* pso_mutex */
     bool abandoned;             /* pso_mutex */
@@ -11490,7 +11490,26 @@ static void load_pipeline_list(PGRAPHD3D12State *r,
                         pipeline_key_hash64(&inflight->key);
                 }
             }
-            /* Interpreter pipelines first, ahead of the precompile. */
+            while ((job = QSIMPLEQ_FIRST(&jobs)) != NULL) {
+                uint64_t hash = pipeline_key_hash64(&job->key);
+                bool skip = g_hash_table_contains(r->pso_built, &hash) ||
+                            g_hash_table_contains(r->pso_queued, &job->key);
+
+                for (unsigned int i = 0; i < num_building && !skip; i++) {
+                    skip = building[i] == hash;
+                }
+                QSIMPLEQ_REMOVE_HEAD(&jobs, entry);
+                if (skip) {
+                    g_free(job);
+                    continue;
+                }
+                QSIMPLEQ_INSERT_TAIL(&r->pso_jobs, job, entry);
+                g_hash_table_insert(r->pso_queued, &job->key, job);
+                queued++;
+            }
+            /* Interpreter pipelines after the precompile: a recorded key's
+             * own pipeline builds far sooner, and a draw that needs one
+             * moves it ahead (get_fallback_pipeline()). */
             while ((job = QSIMPLEQ_FIRST(&fallback_jobs)) != NULL) {
                 bool skip = g_hash_table_contains(r->fallback_queued,
                                                   &job->fallback_key) ||
@@ -11511,27 +11530,11 @@ static void load_pipeline_list(PGRAPHD3D12State *r,
                     g_free(job);
                     continue;
                 }
+                job->preload = true;
                 g_hash_table_insert(r->fallback_queued, &job->fallback_key,
                                     job);
-                queue_urgent_pso_job(r, job);
-                fallback_queued++;
-            }
-            while ((job = QSIMPLEQ_FIRST(&jobs)) != NULL) {
-                uint64_t hash = pipeline_key_hash64(&job->key);
-                bool skip = g_hash_table_contains(r->pso_built, &hash) ||
-                            g_hash_table_contains(r->pso_queued, &job->key);
-
-                for (unsigned int i = 0; i < num_building && !skip; i++) {
-                    skip = building[i] == hash;
-                }
-                QSIMPLEQ_REMOVE_HEAD(&jobs, entry);
-                if (skip) {
-                    g_free(job);
-                    continue;
-                }
                 QSIMPLEQ_INSERT_TAIL(&r->pso_jobs, job, entry);
-                g_hash_table_insert(r->pso_queued, &job->key, job);
-                queued++;
+                fallback_queued++;
             }
             r->pso_run_total = queued;
             r->pso_run_active = queued != 0;
@@ -12212,7 +12215,15 @@ static bool build_fallback_pso(PGRAPHD3D12State *r,
 /* Draws wait on demand builds and on interpreter pipelines. */
 static bool pso_job_urgent(const PGRAPHD3D12PsoJob *job)
 {
-    return job->demand || job->kind == PGRAPH_D3D12_PSO_JOB_FALLBACK;
+    return job->demand ||
+           (job->kind == PGRAPH_D3D12_PSO_JOB_FALLBACK && !job->preload);
+}
+
+/* Precompile builds and preloaded interpreter pipelines: no draw waits. */
+static bool pso_job_background(const PGRAPHD3D12PsoJob *job)
+{
+    return (job->kind == PGRAPH_D3D12_PSO_JOB_BUILD && !job->demand) ||
+           (job->kind == PGRAPH_D3D12_PSO_JOB_FALLBACK && job->preload);
 }
 
 /*
@@ -12228,7 +12239,7 @@ static PGRAPHD3D12PsoJob *first_urgent_pso_job(PGRAPHD3D12State *r)
         if (pso_job_urgent(it)) {
             return it;
         }
-        if (it->kind == PGRAPH_D3D12_PSO_JOB_BUILD) {
+        if (pso_job_background(it)) {
             break;
         }
     }
@@ -12246,7 +12257,7 @@ static void queue_urgent_pso_job(PGRAPHD3D12State *r, PGRAPHD3D12PsoJob *job)
     PGRAPHD3D12PsoJob *it;
 
     QSIMPLEQ_FOREACH(it, &r->pso_jobs, entry) {
-        if (it->kind == PGRAPH_D3D12_PSO_JOB_BUILD && !it->demand) {
+        if (pso_job_background(it)) {
             break;
         }
         after = it;
@@ -12301,7 +12312,7 @@ static void *pso_worker_thread_fn(void *opaque)
         }
         if (job->kind == PGRAPH_D3D12_PSO_JOB_FALLBACK) {
             g_hash_table_remove(r->fallback_queued, &job->fallback_key);
-            w->boosted = true;
+            w->boosted = !job->preload;
             update_worker_priority(w);
             qemu_mutex_unlock(&r->pso_mutex);
             job->started_us = g_get_monotonic_time();
@@ -12958,13 +12969,21 @@ static FallbackPipelineEntry *get_fallback_pipeline(
     }
     if (build && entry->pipeline_state == NULL && !entry->queued &&
         !entry->failed && r->pso_workers_running) {
+        PGRAPHD3D12PsoJob *preloaded;
         bool pending;
 
         entry->queued = true;
         qemu_mutex_lock(&r->pso_mutex);
         /* A list load may have queued it, or a worker built it and its
-         * result awaits the drain. */
-        pending = g_hash_table_contains(r->fallback_queued, fb) ||
+         * result awaits the drain. A preloaded one moves ahead now. */
+        preloaded = g_hash_table_lookup(r->fallback_queued, fb);
+        if (preloaded != NULL && preloaded->preload) {
+            QSIMPLEQ_REMOVE(&r->pso_jobs, preloaded, PGRAPHD3D12PsoJob,
+                            entry);
+            preloaded->preload = false;
+            queue_urgent_pso_job(r, preloaded);
+        }
+        pending = preloaded != NULL ||
                   g_hash_table_contains(r->fallback_done, fb);
         for (unsigned int i = 0; i < r->pso_num_workers && !pending; i++) {
             PGRAPHD3D12PsoJob *inflight = r->pso_workers[i].inflight;

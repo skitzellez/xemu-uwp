@@ -634,6 +634,9 @@ typedef struct PGRAPHD3D12PsoJob {
     /* A skipped draw waits for this build: it goes ahead of precompile
      * builds and runs at normal priority, on a parked worker if need be. */
     bool demand;
+    /* An interpreter pipeline of a list's recorded key: it builds after
+     * the precompile builds, at their priority, until a draw needs it. */
+    bool preload;
     PGRAPHD3D12PipelineList *list;
     PGRAPHD3D12PipelineKey key;
     PGRAPHD3D12FallbackKey fallback_key;
