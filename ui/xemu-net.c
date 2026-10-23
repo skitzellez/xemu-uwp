@@ -44,6 +44,99 @@
 static const char *id = "xemu-netdev";
 static const char *id_hubport = "xemu-netdev-hubport";
 
+#ifdef XEMU_UWP
+#include "qemu/xemu-uwp.h"
+
+/* The emulated Xbox's address behind the NAT. Upstream it is always 10.0.2.15, so two consoles in
+ * one home (same internet address) hand each other the same local address: the joining Xbox then
+ * calls itself and drops out of the lobby. Instead the emulated Xbox takes the console's own home
+ * network address in a tiny private network, and the Xbox online port is forwarded to it, as two
+ * real Xboxes behind one router would be. */
+#define UWP_XBOX_ONLINE_PORT 3074
+static struct in_addr uwp_guest_addr = { .s_addr = 0 };
+static bool uwp_online_port_open;
+
+static bool uwp_private_addr(uint32_t a)
+{
+    return (a >> 24) == 10 || (a >> 20) == 0xac1 || (a >> 16) == 0xc0a8;
+}
+
+/* the console's home network address (no packet is sent: a UDP connect only picks the route) */
+static bool uwp_home_addr(struct in_addr *out)
+{
+    struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(53) };
+    struct sockaddr_in me;
+    socklen_t len = sizeof(me);
+    bool ok = false;
+
+    inet_aton("1.1.1.1", &to.sin_addr);
+    int fd = qemu_socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+    if (connect(fd, (struct sockaddr *)&to, sizeof(to)) == 0 &&
+        getsockname(fd, (struct sockaddr *)&me, &len) == 0 &&
+        uwp_private_addr(ntohl(me.sin_addr.s_addr))) {
+        *out = me.sin_addr;
+        ok = true;
+    }
+    closesocket(fd);
+    return ok;
+}
+
+/* the smallest network around the home address with room for the Xbox and the NAT's gateway */
+static void uwp_nat_addresses(QDict *qdict)
+{
+    struct in_addr home;
+    char buf[32];
+
+    uwp_guest_addr.s_addr = htonl(0x0a00020f);
+    if (!uwp_home_addr(&home)) {
+        uwp_log("net: no home network address found, the Xbox uses 10.0.2.15");
+        return;
+    }
+    uint32_t a = ntohl(home.s_addr);
+    for (int bits = 30; bits >= 24; bits--) {
+        uint32_t mask = 0xffffffffu << (32 - bits);
+        uint32_t net = a & mask, last = net | ~mask;
+        if (a == net || a == last) {
+            continue;
+        }
+        uint32_t gw = (a == net + 1) ? net + 2 : net + 1;
+        struct in_addr n = { .s_addr = htonl(net) }, g = { .s_addr = htonl(gw) };
+        snprintf(buf, sizeof(buf), "%s/%d", inet_ntoa(n), bits);
+        qdict_put_str(qdict, "net", buf);
+        qdict_put_str(qdict, "host", inet_ntoa(g));
+        /* outside the network is allowed: the NAT still answers it as its DNS server */
+        qdict_put_str(qdict, "dns", "10.0.2.3");
+        qdict_put_str(qdict, "dhcpstart", inet_ntoa(home));
+        uwp_guest_addr = home;
+        /* the address itself stays out of the log: logs travel in player reports */
+        uwp_log("net: the Xbox takes the console's home address (/%d network)", bits);
+        return;
+    }
+}
+
+static void uwp_open_online_port(void *s)
+{
+    struct in_addr any = { .s_addr = INADDR_ANY };
+
+    for (int i = 0; i < g_config.net.nat.forward_ports_count; i++) {
+        if (g_config.net.nat.forward_ports[i].protocol ==
+                CONFIG_NET_NAT_FORWARD_PORTS_PROTOCOL_UDP &&
+            g_config.net.nat.forward_ports[i].host == UWP_XBOX_ONLINE_PORT) {
+            return; /* the player's own rule wins */
+        }
+    }
+    uwp_online_port_open = slirp_add_hostfwd(s, true, any, UWP_XBOX_ONLINE_PORT,
+                                             uwp_guest_addr,
+                                             UWP_XBOX_ONLINE_PORT) == 0;
+    uwp_log("net: online port %d %s", UWP_XBOX_ONLINE_PORT,
+            uwp_online_port_open ? "open to the home network"
+                                 : "could not be opened (in use?)");
+}
+#endif
+
 void xemu_net_enable(void)
 {
     Error *local_err = NULL;
@@ -59,6 +152,9 @@ void xemu_net_enable(void)
         qdict = qdict_new();
         qdict_put_str(qdict, "id",   id);
         qdict_put_str(qdict, "type", "user");
+#ifdef XEMU_UWP
+        uwp_nat_addresses(qdict);
+#endif
     } else if (g_config.net.backend == CONFIG_NET_BACKEND_UDP) {
         qdict = qdict_new();
         qdict_put_str(qdict, "id",        id);
@@ -115,6 +211,9 @@ void xemu_net_enable(void)
         struct in_addr host_addr = { .s_addr = INADDR_ANY };
         struct in_addr guest_addr = { .s_addr = 0 };
         inet_aton("10.0.2.15", &guest_addr);
+#ifdef XEMU_UWP
+        guest_addr = uwp_guest_addr;
+#endif
 
         for (int i = 0; i < g_config.net.nat.forward_ports_count; i++) {
             bool is_udp = g_config.net.nat.forward_ports[i].protocol ==
@@ -133,6 +232,11 @@ void xemu_net_enable(void)
             }
 
         }
+#ifdef XEMU_UWP
+        if (!local_err) {
+            uwp_open_online_port(s);
+        }
+#endif
     }
 
     if (local_err) {
@@ -179,6 +283,12 @@ static void clear_slirp_port_forwards(void)
                              host_addr,
                              g_config.net.nat.forward_ports[i].host);
     }
+#ifdef XEMU_UWP
+    if (uwp_online_port_open) {
+        slirp_remove_hostfwd(s, true, host_addr, UWP_XBOX_ONLINE_PORT);
+        uwp_online_port_open = false;
+    }
+#endif
 }
 
 void xemu_net_disable(void)
