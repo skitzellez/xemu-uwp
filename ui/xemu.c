@@ -1183,15 +1183,16 @@ static void poll_events(struct xemu_console *scon)
 
 #ifdef CONFIG_D3D12
 /*
- * New graphics (Direct3D 12 renderer) or Classic (OpenGL through Mesa), fixed for the session. Console: chosen
- * by use-d3d12.txt next to xemu.toml (Game Vault writes it, per game); elsewhere by the renderer setting.
+ * New graphics (Direct3D 12 renderer) or Classic (OpenGL through Mesa), fixed for the session. Console: New
+ * graphics unless use-mesa.txt is next to xemu.toml or the launch link says gfx=classic; elsewhere by the
+ * renderer setting.
  */
 static bool use_d3d12_renderer(void)
 {
 #ifdef XEMU_UWP
     gchar *dir = g_path_get_dirname(xemu_settings_get_path());
-    gchar *marker = g_build_filename(dir, "use-d3d12.txt", NULL);
-    bool on = g_file_test(marker, G_FILE_TEST_EXISTS);
+    gchar *marker = g_build_filename(dir, "use-mesa.txt", NULL);
+    bool on = !g_file_test(marker, G_FILE_TEST_EXISTS);
     g_free(marker);
     g_free(dir);
     /* or the launch link (Game Vault, per game): gfx=new / gfx=classic. The link arrives through the event queue
