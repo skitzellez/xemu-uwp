@@ -5333,6 +5333,19 @@ static void uwp_move_to_folder(const char **setting, const char *what, const cha
     }
     g_mkdir_with_parents(folder, 0755);
     char *to = g_strdup_printf("%s%s", folder, name);
+    if (setting == &g_config.sys.files.eeprom_path && uwp_file_exists(to)) {
+        /* The EEPROM signs the saves on the hard disk next to it: the publisher's one is the console's own.
+         * One in xemu's own storage is a new one xemu made after a reinstall wiped xemu.toml; taking it
+         * would make every signed save "damaged". Keep it aside, never in use. */
+        char *spare = g_strdup_printf("%s.unused", *setting);
+        uwp_move_file(*setting, spare);
+        uwp_log("%s: kept the publisher's folder's one (the console's own); xemu's own one set aside as %s",
+                what, spare);
+        uwp_set_path(setting, what, to);
+        g_free(spare);
+        g_free(to);
+        return;
+    }
     if (uwp_file_exists(to)) {
         char *spare = g_strdup_printf("%s.unused", to);
         for (int n = 2; uwp_file_exists(spare); n++) {
@@ -5470,10 +5483,19 @@ static void uwp_fill_system_files(void)
         }
         g_free(usb);
     }
+    if (folder && own && uwp_under(g_config.sys.files.eeprom_path, own)) {
+        uwp_move_to_folder(&g_config.sys.files.eeprom_path, "EEPROM", folder, own, "eeprom.bin");
+    }
     if (!uwp_file_exists(g_config.sys.files.eeprom_path)) {
         static const char *const eeprom[] = { "eeprom.bin", NULL };
         xemu_settings_set_string(&g_config.sys.files.eeprom_path, "");
-        uwp_fill_one(&g_config.sys.files.eeprom_path, "EEPROM", folder, own, eeprom);
+        if (!uwp_fill_one(&g_config.sys.files.eeprom_path, "EEPROM", folder, own, eeprom) && folder) {
+            /* none yet: xemu makes one at start; in the publisher's folder it survives reinstalling xemu */
+            g_mkdir_with_parents(folder, 0755);
+            char *path = g_strdup_printf("%seeprom.bin", folder);
+            uwp_set_path(&g_config.sys.files.eeprom_path, "EEPROM (new, made at start)", path);
+            g_free(path);
+        }
     }
     if (uwp_home) {
         uwp_home_disk(folder, own);
