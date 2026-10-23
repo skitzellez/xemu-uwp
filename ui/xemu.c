@@ -4865,6 +4865,9 @@ HANDLE xemu_uwp_shared_file(LPCWSTR name, DWORD access)
     return dup;
 }
 
+/* the link asked for the Xbox dashboard (no disc): Game Vault, PLAY ONLINE > Xbox dashboard */
+static bool uwp_want_dashboard;
+
 static char *uwp_take_activation_disc(void)
 {
     const char *hint = SDL_GetHint(UWP_ACTIVATION_HINT);
@@ -5096,6 +5099,9 @@ static char *uwp_take_activation_disc(void)
                 uwp_log("link: network sign-in refused (not Game Vault's file)");
             }
             g_free(path);
+        }
+        if (!strncmp(p, "dashboard=1", 11)) {
+            uwp_want_dashboard = true;   /* Game Vault's "Xbox dashboard": no disc, the console's own menu */
         }
         if (!strncmp(p, "disc=", 5)) {
             /* undo the %XX escaping; xemu.toml uses forward slashes */
@@ -5719,6 +5725,13 @@ static void uwp_startup_disc(void)
         SDL_Delay(10);
     }
     char *disc = uwp_take_activation_disc();
+    if (uwp_want_dashboard) {
+        /* an empty tray: the Xbox starts its dashboard (Xbox Live account recovery, settings) */
+        g_free(disc);
+        disc = NULL;
+        xemu_settings_set_string(&g_config.sys.files.dvd_path, "");
+        uwp_log("disc from launcher: none, the Xbox dashboard (dashboard=1)");
+    }
     if (disc) {
         uwp_log("disc from launcher: %s", disc);
         uwp_log_share(disc);
