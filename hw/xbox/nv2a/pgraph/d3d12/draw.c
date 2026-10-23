@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qemu/fast-hash.h"
 #include "qapi/error.h"
+#include "qemu/xemu-uwp.h"
 #include "renderer.h"
 
 static void report_draw_error(Error *err)
@@ -1131,12 +1132,12 @@ void pgraph_d3d12_draw_begin(NV2AState *d)
     r->num_vertex_ram_buffer_syncs = 0;
 
     if (fragment_output) {
-        int64_t perf_start = g_get_monotonic_time();
+        int64_t perf_start = uwp_prof_now(); /* once per draw: the cheap clock */
 
         /* Depth and stencil writes only happen with their tests enabled. */
         pgraph_d3d12_surface_update(d, true, color_write,
                                     depth_test || stencil_test);
-        r->perf.surface_update_us += g_get_monotonic_time() - perf_start;
+        r->perf.surface_update_ticks += uwp_prof_now() - perf_start;
     }
 }
 
@@ -1207,12 +1208,12 @@ static void pgraph_d3d12_flush_draw_body(NV2AState *d)
 
         nv2a_profile_inc_counter(NV2A_PROF_DRAW_ARRAYS);
 
-        int64_t vertex_start = g_get_monotonic_time();
+        int64_t vertex_start = uwp_prof_now();
         bool vertices_ok = pgraph_d3d12_bind_vertex_attributes(
                 d, pg->draw_arrays_min_start, pg->draw_arrays_max_count - 1,
                 false, 0, pg->draw_arrays_max_count - 1, &local_err) &&
             sync_vertex_ram_buffer(pg, &local_err);
-        r->perf.vertex_setup_us += g_get_monotonic_time() - vertex_start;
+        r->perf.vertex_setup_ticks += uwp_prof_now() - vertex_start;
         if (!vertices_ok) {
             report_draw_error(local_err);
             return;
@@ -1308,7 +1309,7 @@ static void pgraph_d3d12_flush_draw_body(NV2AState *d)
         }
 
         index_data_size = output_index_count * sizeof(pg->inline_elements[0]);
-        int64_t vertex_start = g_get_monotonic_time();
+        int64_t vertex_start = uwp_prof_now();
         bool vertices_ok = pgraph_d3d12_bind_vertex_attributes(
                 d, min_element, max_element, false, 0,
                 pg->inline_elements[pg->inline_elements_length - 1],
@@ -1317,7 +1318,7 @@ static void pgraph_d3d12_flush_draw_body(NV2AState *d)
             pgraph_d3d12_update_index_buffer(
                 pg, expanded_topology ? expanded_indices : pg->inline_elements,
                 index_data_size, &index_offset, &local_err);
-        r->perf.vertex_setup_us += g_get_monotonic_time() - vertex_start;
+        r->perf.vertex_setup_ticks += uwp_prof_now() - vertex_start;
         if (!vertices_ok) {
             report_draw_error(local_err);
             return;
@@ -1363,16 +1364,16 @@ static void pgraph_d3d12_flush_draw_body(NV2AState *d)
             total_size += vertex_data_size;
         }
 
-        int64_t vertex_start = g_get_monotonic_time();
+        int64_t vertex_start = uwp_prof_now();
         if (!pgraph_d3d12_update_vertex_inline_buffer(
                 pg, data, sizes, r->num_active_vertex_attribute_descriptions,
                 &buffer_offset, &local_err)) {
-            r->perf.vertex_setup_us +=
-                g_get_monotonic_time() - vertex_start;
+            r->perf.vertex_setup_ticks +=
+                uwp_prof_now() - vertex_start;
             report_draw_error(local_err);
             return;
         }
-        r->perf.vertex_setup_us += g_get_monotonic_time() - vertex_start;
+        r->perf.vertex_setup_ticks += uwp_prof_now() - vertex_start;
         r->vertex_fetch_ring_base = buffer_offset;
 
         if (expanded_topology) {
@@ -1436,14 +1437,14 @@ static void pgraph_d3d12_flush_draw_body(NV2AState *d)
         }
         index_count = pg->inline_array_length * 4 / vertex_size;
 
-        int64_t vertex_start = g_get_monotonic_time();
+        int64_t vertex_start = uwp_prof_now();
         bool vertices_ok = pgraph_d3d12_bind_vertex_attributes(
                 d, 0, index_count - 1, true, vertex_size, index_count - 1,
                 &local_err) &&
             pgraph_d3d12_update_vertex_inline_buffer(
                 pg, &inline_array_data, &inline_array_data_size, 1,
                 &buffer_offset, &local_err);
-        r->perf.vertex_setup_us += g_get_monotonic_time() - vertex_start;
+        r->perf.vertex_setup_ticks += uwp_prof_now() - vertex_start;
         if (!vertices_ok) {
             report_draw_error(local_err);
             return;

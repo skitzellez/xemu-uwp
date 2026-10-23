@@ -916,7 +916,7 @@ typedef struct PGRAPHD3D12State {
         uint32_t vertex_upload_ranges;
         uint64_t vertex_upload_bytes;
         uint64_t constants_bytes;
-        uint64_t surface_update_us;
+        uint64_t surface_update_ticks; /* uwp_prof_now ticks */
         uint64_t surface_download_us;
         uint64_t surface_upload_us;
         uint64_t surface_create_us;
@@ -947,7 +947,7 @@ typedef struct PGRAPHD3D12State {
         uint64_t pipeline_lookup_us;
         uint64_t constant_upload_us;
         uint64_t record_state_us;
-        uint64_t vertex_setup_us;
+        uint64_t vertex_setup_ticks; /* uwp_prof_now ticks */
         uint32_t downloads;
         uint64_t download_bytes;
         uint64_t download_wait_us;

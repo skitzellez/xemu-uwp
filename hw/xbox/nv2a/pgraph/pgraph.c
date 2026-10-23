@@ -911,6 +911,14 @@ static void pgraph_method_log(unsigned int subchannel,
     static unsigned int last = 0;
     static unsigned int count = 0;
 
+#ifdef XEMU_UWP
+    /* runs for every method, vertex indices included (~1.4% of the graphics thread): only when traced */
+    if (!trace_event_get_state_backends(TRACE_NV2A_PGRAPH_METHOD) &&
+        !trace_event_get_state_backends(TRACE_NV2A_PGRAPH_METHOD_ABBREV)) {
+        return;
+    }
+#endif
+
     if (last == NV097_ARRAY_ELEMENT16 && method != last) {
         method_name = "NV097_ARRAY_ELEMENT16";
         trace_nv2a_pgraph_method_abbrev(subchannel, graphics_class, last,

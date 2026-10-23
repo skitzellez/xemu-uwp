@@ -1915,6 +1915,23 @@ int xemu_uwp_thread_busy(const char *name, int slot)
     return -1;
 }
 
+/* uwp_prof_now ticks per second, measured against QueryPerformanceCounter since the first call */
+double uwp_prof_tick_hz(void)
+{
+    static LARGE_INTEGER q0;
+    static int64_t t0;
+    LARGE_INTEGER q, freq;
+    QueryPerformanceCounter(&q);
+    QueryPerformanceFrequency(&freq);
+    int64_t t = uwp_prof_now();
+    if (!t0) {
+        q0 = q;
+        t0 = t;
+    }
+    double secs = (q.QuadPart - q0.QuadPart) / (double)freq.QuadPart;
+    return secs > 0.5 ? (t - t0) / secs : 2.0e9;   /* a guess for the first half second */
+}
+
 /* One log line: CPU use per thread, time per probe, nv2a counters per frame. */
 static void uwp_prof_report(double seconds)
 {
@@ -1928,8 +1945,6 @@ static void uwp_prof_report(double seconds)
     };
     char line[2048];
     int n = 0;
-    LARGE_INTEGER freq;
-    QueryPerformanceFrequency(&freq);
 
     n += snprintf(line + n, sizeof(line) - n, "prof cpu%%:");
     for (int i = 0; i < uwp_prof_num_threads; i++) {
@@ -1986,7 +2001,7 @@ static void uwp_prof_report(double seconds)
         int c = uwp_prof_calls[i];
         if (c != last_calls[i]) {
             n += snprintf(line + n, sizeof(line) - n, " %s %.1f (%d)", names[i],
-                          (t - last_ticks[i]) * 100.0 / freq.QuadPart / seconds,
+                          (t - last_ticks[i]) * 100.0 / uwp_prof_tick_hz() / seconds,
                           c - last_calls[i]);
         }
         last_ticks[i] = t;
@@ -3414,11 +3429,9 @@ static void uwp_box_sample(void)
             last_sys_all = all;
         }
         /* the graphics thread waiting for the console's GPU to finish (the GPU is the limit when this is high) */
-        LARGE_INTEGER freq;
-        QueryPerformanceFrequency(&freq);
         int64_t sync = uwp_prof_ticks[UWP_PROF_PF_SYNC];
         int gpu_wait = last_wall && wall > last_wall
-                           ? (int)((sync - last_sync) * 100.0 / freq.QuadPart / ((wall - last_wall) / 1e7)) : 0;
+                           ? (int)((sync - last_sync) * 100.0 / uwp_prof_tick_hz() / ((wall - last_wall) / 1e7)) : 0;
         last_sync = sync;
         unsigned dry = xemu_uwp_audio_dry;
         /* bytes the game read from the disc and the Xbox hard disk (hw/ide), DMA and PIO */

@@ -13860,6 +13860,170 @@ static bool ensure_constant_upload_space(PGRAPHState *pg, bool draw_constants,
     return true;
 }
 
+#ifdef XEMU_UWP
+/* Copies src over dst when they differ; true when it did. */
+static inline bool draw_constants_put(void *dst, const void *src, size_t n)
+{
+    if (memcmp(dst, src, n) == 0) {
+        return false;
+    }
+    memcpy(dst, src, n);
+    return true;
+}
+
+/*
+ * The constants are compared and updated in place in the cache, block by block, instead of being built in a
+ * zeroed copy, compared whole and copied back: ~4.6 KB cleared, copied and compared per draw was ~10% of the
+ * graphics thread at 150,000 draws a second (Project Gotham Racing). Fields never written stay zero (the
+ * cache is allocated zeroed), as in the cleared copy before.
+ */
+static bool upload_draw_constants(PGRAPHState *pg, uint64_t *offset,
+                                  Error **errp)
+{
+    PGRAPHD3D12State *r = pg->d3d12_renderer_state;
+    unsigned int aa_width = 1;
+    unsigned int aa_height = 1;
+
+    if (r->draw_constants_cache == NULL) {
+        r->draw_constants_cache = g_malloc0(sizeof(PGRAPHD3D12DrawConstants));
+        r->draw_constants_cache_size = sizeof(PGRAPHD3D12DrawConstants);
+        r->draw_constants_cached = false;
+    }
+    PGRAPHD3D12DrawConstants *c = (PGRAPHD3D12DrawConstants *)r->draw_constants_cache;
+    const void *chunks[] = { c };
+    const uint64_t sizes[] = { sizeof(*c) };
+    bool changed = false;
+
+    /* Shaders read inline values only for uniform attributes; streamed
+     * attributes carry the provoking vertex here, which would defeat the
+     * constant cache on every draw. */
+    {
+        static const float zero[4];
+        for (unsigned int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
+            const void *src = (pg->uniform_attrs & (1u << i)) ?
+                                  (const void *)pg->vertex_attributes[i].inline_value :
+                                  (const void *)zero;
+            changed |= draw_constants_put(c->inline_value[i], src, sizeof(c->inline_value[i]));
+        }
+    }
+    changed |= draw_constants_put(c->vsh_constants, pg->vsh_constants, sizeof(c->vsh_constants));
+    changed |= draw_constants_put(c->ltctxa, pg->ltctxa, sizeof(pg->ltctxa));
+    changed |= draw_constants_put(c->ltctxb, pg->ltctxb, sizeof(pg->ltctxb));
+    changed |= draw_constants_put(c->ltc1, pg->ltc1, sizeof(pg->ltc1));
+    changed |= draw_constants_put(c->point_params, pg->point_params, sizeof(pg->point_params));
+    for (unsigned int i = 0; i < NV2A_MAX_LIGHTS; i++) {
+        changed |= draw_constants_put(c->light_infinite_direction[i], pg->light_infinite_direction[i],
+                                      sizeof(pg->light_infinite_direction[i]));
+        changed |= draw_constants_put(c->light_infinite_half_vector[i], pg->light_infinite_half_vector[i],
+                                      sizeof(pg->light_infinite_half_vector[i]));
+        changed |= draw_constants_put(c->light_local_position[i], pg->light_local_position[i],
+                                      sizeof(pg->light_local_position[i]));
+        changed |= draw_constants_put(c->light_local_attenuation[i], pg->light_local_attenuation[i],
+                                      sizeof(pg->light_local_attenuation[i]));
+    }
+    {
+        float clip_range[4] = { 0 };
+        float surface_info[4];
+        float fog_param[4] = { 0 };
+        float fixed_function_info[4] = { 0 };
+
+        fill_clip_range(pg, clip_range);
+        changed |= draw_constants_put(c->clip_range, clip_range, sizeof(clip_range));
+
+        pgraph_apply_anti_aliasing_factor(pg, &aa_width, &aa_height);
+        /* The binding may be a non-multiple of the AA factor (odd clip offset),
+         * so the guest size can be fractional. */
+        surface_info[0] = MAX((float)pg->surface_binding_dim.width / aa_width, 1.0f);
+        surface_info[1] = MAX((float)pg->surface_binding_dim.height / aa_height, 1.0f);
+        surface_info[2] = (float)MAX(pg->surface_scale_factor, 1);
+        /* Register point size in guest pixels; each vertex shader path applies
+         * its own minimum and the scaled viewport applies the scale once. */
+        surface_info[3] = pgraph_reg_r(pg, NV_PGRAPH_POINTSIZE) / 8.0f;
+        changed |= draw_constants_put(c->surface_info, surface_info, sizeof(surface_info));
+
+        fog_param[0] = d3d12_u32_as_float(pgraph_reg_r(pg, NV_PGRAPH_FOGPARAM0));
+        fog_param[1] = d3d12_u32_as_float(pgraph_reg_r(pg, NV_PGRAPH_FOGPARAM1));
+        changed |= draw_constants_put(c->fog_param, fog_param, sizeof(fog_param));
+
+        fixed_function_info[0] = pg->material_alpha;
+        fixed_function_info[1] = pg->specular_power;
+        fixed_function_info[2] = pg->specular_power_back;
+        changed |= draw_constants_put(c->fixed_function_info, fixed_function_info,
+                                      sizeof(fixed_function_info));
+    }
+
+    {
+        uint32_t vertex_fetch[NV2A_VERTEXSHADER_ATTRIBUTES][4];
+
+        memset(vertex_fetch, 0, sizeof(vertex_fetch));
+        if (pgraph_d3d12_vertex_pulling()) {
+            for (unsigned int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
+                bool converted = r->converted_vertex_attribute_mask & (1u << i);
+                bool inline_attr = r->vertex_fetch_inline_mask & (1u << i);
+                int loc = r->vertex_attribute_to_description_location[i];
+                uint32_t format_bits;
+                uint64_t base;
+
+                if (loc < 0) {
+                    continue;
+                }
+                /* The same sources as the pipeline key format fields; set
+                 * in every mode, the static decode only tests the aligned bit. */
+                format_bits = vertex_fetch_format_bits(
+                    r->vertex_attribute_descriptions[loc].Format,
+                    pg->compressed_attrs & (1u << i),
+                    pg->swizzle_attrs & (1u << i));
+                if (converted) {
+                    base = r->vertex_attribute_offsets[i];
+                    vertex_fetch[i][0] = 1;
+                } else if (inline_attr) {
+                    base = r->vertex_fetch_ring_base +
+                           r->vertex_attribute_offsets[i];
+                    vertex_fetch[i][0] = 1;
+                } else {
+                    base = r->vertex_attribute_offsets[i];
+                    vertex_fetch[i][0] = 0;
+                }
+                vertex_fetch[i][1] = (uint32_t)base;
+                vertex_fetch[i][2] = r->vertex_attribute_strides[i];
+                vertex_fetch[i][3] =
+                    (((base | r->vertex_attribute_strides[i]) & 3) == 0 ?
+                         VERTEX_FETCH_ALIGNED : 0) |
+                    format_bits;
+            }
+        }
+        changed |= draw_constants_put(c->vertex_fetch, vertex_fetch, sizeof(vertex_fetch));
+    }
+
+    if (r->draw_constants_cached && !changed) {
+        *offset = r->draw_constants_cache_offset;
+        return true;
+    }
+
+    r->draw_constants_cached = false;
+    if (!pgraph_d3d12_update_uniform_buffer(
+            pg, chunks, sizes, ARRAY_SIZE(chunks),
+            PGRAPH_D3D12_DRAW_CONSTANTS_ALIGNMENT, offset, errp)) {
+        error_prepend(errp,
+                      "Direct3D 12 draw constants upload failed for "
+                      "uniform_attrs=0x%04x, swizzle_attrs=0x%04x, "
+                      "vsh_mode=%u, transform_program_start=%u, "
+                      "surface=%ux%u, aa=%ux%u, zeta_format=0x%x: ",
+                      pg->uniform_attrs, pg->swizzle_attrs,
+                      GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_D),
+                               NV_PGRAPH_CSV0_D_MODE),
+                      GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_CSV0_C),
+                               NV_PGRAPH_CSV0_C_CHEOPS_PROGRAM_START),
+                      pg->surface_binding_dim.width,
+                      pg->surface_binding_dim.height, aa_width, aa_height,
+                      pg->surface_shape.zeta_format);
+        return false;
+    }
+    r->draw_constants_cache_offset = *offset;
+    r->draw_constants_cached = true;
+    return true;
+}
+#else
 static bool upload_draw_constants(PGRAPHState *pg, uint64_t *offset,
                                   Error **errp)
 {
@@ -14005,6 +14169,7 @@ static bool upload_draw_constants(PGRAPHState *pg, uint64_t *offset,
 
     return true;
 }
+#endif
 
 static bool upload_pixel_constants(PGRAPHState *pg, uint64_t *offset,
                                    Error **errp)

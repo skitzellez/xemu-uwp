@@ -26,6 +26,7 @@
 #include "ui/xemu-settings.h"
 #include "ui/xemu-notifications.h"
 #include <glib/gstdio.h>
+#include "qemu/xemu-uwp.h"
 #include "renderer.h"
 #include "system/cpus.h"
 #include "cpu-stats-compat.h"
@@ -1097,7 +1098,7 @@ static void pgraph_d3d12_perf_report(NV2AState *d)
             (unsigned int)(r->perf.vertex_upload_bytes >> 10),
             r->perf.vertex_upload_ranges,
             (unsigned int)(r->perf.constants_bytes >> 20),
-            (unsigned int)(r->perf.surface_update_us * 100 / elapsed),
+            (unsigned int)(r->perf.surface_update_ticks / (uwp_prof_tick_hz() / 1e6) * 100 / elapsed),
             (unsigned int)(r->perf.surface_download_us * 100 / elapsed),
             (unsigned int)(r->perf.surface_upload_us * 100 / elapsed),
             (unsigned int)(r->perf.surface_create_us * 100 / elapsed),
@@ -1106,7 +1107,7 @@ static void pgraph_d3d12_perf_report(NV2AState *d)
             (unsigned int)(r->perf.pipeline_lookup_us * 100 / elapsed),
             (unsigned int)(r->perf.constant_upload_us * 100 / elapsed),
             (unsigned int)(r->perf.record_state_us * 100 / elapsed),
-            (unsigned int)(r->perf.vertex_setup_us * 100 / elapsed),
+            (unsigned int)(r->perf.vertex_setup_ticks / (uwp_prof_tick_hz() / 1e6) * 100 / elapsed),
             r->perf.downloads,
             (unsigned int)(r->perf.download_wait_us * 100 / elapsed),
             r->perf.finish_sampler, r->perf.finish_report,

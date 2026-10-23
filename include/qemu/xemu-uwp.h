@@ -171,12 +171,13 @@ extern int64_t uwp_prof_ticks[UWP_PROF__COUNT];
 extern int uwp_prof_calls[UWP_PROF__COUNT];
 void uwp_prof_register_thread(const char *name);
 
+/* The processor's time stamp counter: QueryPerformanceCounter twice per draw (150,000 draws a second in busy
+   scenes) was ~5% of the graphics thread on the console. Ticks per second: uwp_prof_tick_hz() (ui/xemu.c). */
 static inline int64_t uwp_prof_now(void)
 {
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    return t.QuadPart;
+    return (int64_t)__builtin_ia32_rdtsc();
 }
+double uwp_prof_tick_hz(void);
 
 #define UWP_PROF_BEGIN(var) int64_t var = uwp_prof_now()
 #define UWP_PROF_END(id, var) do {     uwp_prof_ticks[UWP_PROF_##id] += uwp_prof_now() - (var);     uwp_prof_calls[UWP_PROF_##id]++; } while (0)
