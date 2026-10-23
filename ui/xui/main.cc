@@ -73,6 +73,7 @@ extern "C" int xemu_uwp_prep_done, xemu_uwp_prep_total;
 
 /* waiting for the game's first picture (ui/xemu.c, start watch) */
 extern "C" bool xemu_uwp_starting(void);
+extern "C" bool xemu_uwp_prep_over(void);
 
 /* the game's name from the disc file Game Vault passed: no folder, no extensions, no "(USA, Japan)" tags */
 static std::string UwpGameName(void)
@@ -104,8 +105,8 @@ static std::string UwpGameName(void)
 }
 
 /*
- * The green start screen (the Game Vault style logo, user's pick 2026-10-22): from the start until the game's first
- * picture, and while the game's graphics are prepared (xemu_uwp_prep_on). Drawn with shapes, no picture file, so it
+ * The green start screen (the Game Vault style logo, user's pick 2026-10-22): while the game's graphics are prepared
+ * (xemu_uwp_prep_on); then it goes, so the Xbox start-up animation plays (user: shaders first, THEN the animation). Drawn with shapes, no picture file, so it
  * looks the same on old and New graphics. Few shapes on purpose: it stays cheap on the console.
  */
 static bool UwpStartScreen(void)
@@ -113,7 +114,7 @@ static bool UwpStartScreen(void)
     static float alpha;
     static double since;
     const char *disc = g_config.sys.files.dvd_path;
-    bool want = xemu_uwp_prep_on || (xemu_uwp_starting() && disc && *disc);
+    bool want = xemu_uwp_prep_on || (xemu_uwp_starting() && disc && *disc && !xemu_uwp_prep_over());
     double now = ImGui::GetTime();
     if (want && alpha == 0) {
         since = now;

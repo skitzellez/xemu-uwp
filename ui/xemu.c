@@ -3110,6 +3110,8 @@ static void uwp_watch_second(void)
  * count while the console is held (it only counts while running).
  * Experimental, off unless the link has prep=1 (Game Vault: Xemu setup, Experimental): without it xemu starts
  * games as before the start screen existed (0.9.947).
+ * New graphics hold the same way for the game's pipeline list (user 2026-10-22: "load the shaders first and THEN
+ * boot"); once the hold is over the start screen goes, so the Xbox start-up animation plays (ui/xui/main.cc).
  */
 #define UWP_PREP_MAX_MS 180000 /* a safety limit; the warm-up also stops by itself with 1.5 GB left */
 bool xemu_uwp_warm_status(int *done, int *total); /* gl/shaders.c */
@@ -3119,6 +3121,40 @@ static enum { UWP_PREP_START, UWP_PREP_HOLD, UWP_PREP_OVER } uwp_prep;
 static bool uwp_prep_wanted; /* link prep=1 */
 static uint64_t uwp_prep_t0;
 
+/* the hold is decided (and over, if there was one): the start screen no longer covers the picture */
+bool xemu_uwp_prep_over(void)
+{
+    return uwp_prep == UWP_PREP_OVER && !xemu_uwp_prep_on;
+}
+
+static char uwp_title_key[8];
+static uint32_t uwp_title_id(const char *key);
+
+/*
+ * How far the game's graphics are: Mesa's warm-up list, or on New graphics the game's pipeline list (its own
+ * pipelines only: the interpreter ones build afterwards, in the background). total is 0 while the list loads.
+ */
+static bool uwp_prep_status(int *done, int *total)
+{
+#ifdef CONFIG_D3D12
+    if (m_use_d3d12) {
+        NV2AShaderPrecompileStatus st;
+        *done = *total = 0;
+        if (!uwp_title_key[0]) {
+            return false;   /* no game ID from Game Vault: no list of its own */
+        }
+        nv2a_shader_precompile_status(&st);
+        if (st.title_id != uwp_title_id(uwp_title_key) || st.state == NV2A_SHADER_PRECOMPILE_LOADING) {
+            return true;
+        }
+        *done = st.done + st.failed;
+        *total = st.total;
+        return st.state == NV2A_SHADER_PRECOMPILE_COMPILING;
+    }
+#endif
+    return xemu_uwp_warm_status(done, total);
+}
+
 /* each UI frame until it is over; returns how long the console was held, once, when it ends */
 static uint64_t uwp_prepare_tick(void)
 {
@@ -3126,13 +3162,13 @@ static uint64_t uwp_prepare_tick(void)
         return 0;
     }
     int done = 0, total = 0;
-    bool busy = xemu_uwp_warm_status(&done, &total);
+    bool busy = uwp_prep_status(&done, &total);
     if (uwp_prep == UWP_PREP_START) {
         uwp_prep = UWP_PREP_OVER;
         if (!uwp_prep_wanted) {
             return 0;   /* the start screen is switched off (the default) */
         }
-        if (!busy || done >= total) {
+        if (!busy || (total > 0 && done >= total)) {
             return 0;   /* no list for this disc yet: nothing to prepare */
         }
         xemu_main_loop_lock();
@@ -3148,10 +3184,16 @@ static uint64_t uwp_prepare_tick(void)
         uwp_prep_t0 = SDL_GetTicks();
         xemu_uwp_prep_total = total;
         xemu_uwp_prep_on = true;
+#ifdef CONFIG_D3D12
+        if (m_use_d3d12) {
+            nv2a_shader_precompile_set_foreground(true);   /* the console waits: every CPU but one builds */
+        }
+#endif
         uwp_log("shader preparing: holding the start for %d shaders (%d ready)", total, done);
         return 0;
     }
     xemu_uwp_prep_done = done;
+    xemu_uwp_prep_total = total;
     uint64_t held = SDL_GetTicks() - uwp_prep_t0;
     /* a new press only: a B still held from the launcher does not skip it */
     static bool b_before = true;
@@ -3174,6 +3216,11 @@ static uint64_t uwp_prepare_tick(void)
     }
     uwp_prep = UWP_PREP_OVER;
     xemu_uwp_prep_on = false;
+#ifdef CONFIG_D3D12
+    if (m_use_d3d12) {
+        nv2a_shader_precompile_set_foreground(false);   /* the rest, if any, behind the running game */
+    }
+#endif
     uwp_log("shader preparing: %d of %d ready after %llu ms (%s)", done, total, (unsigned long long)held, why);
     return held;
 }
