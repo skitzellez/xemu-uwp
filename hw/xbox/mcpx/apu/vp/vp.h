@@ -87,6 +87,13 @@ typedef struct {
     uint8_t submix_headroom[NUM_MIXBINS];
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
     uint64_t voice_locked[4];
+#ifdef XEMU_UWP
+    /* per voice: queued to a voice worker and not processed yet (see voice_lock) */
+    int voice_inflight[MCPX_HW_MAX_VOICES];
+    int inflight_waiters;
+    QemuMutex inflight_lock;
+    QemuCond inflight_done;
+#endif
 
     struct {
         int current_entry;

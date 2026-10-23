@@ -131,6 +131,50 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
+#ifdef XEMU_UWP
+/*
+ * A voice lock waits only while that voice is queued to the voice workers, not for the whole sound frame:
+ * d->lock is held by the sound thread from the start of a frame to its end, and games lock a voice for every
+ * voice on/off/release/pause (Project Gotham Racing with 8 cars: the CPU thread waited here ~55% of the time,
+ * 26-35 fps). Pairs with voice_work_dispatch: each side sets its own flag, then reads the other's (full barrier
+ * between), so a voice is never processed while it is locked and never locked while it is processed.
+ */
+static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
+{
+    assert(v < MCPX_HW_MAX_VOICES);
+    uint64_t mask = 1LL << (v % 64);
+    if (lock) {
+        qatomic_or(&d->vp.voice_locked[v / 64], mask);
+        smp_mb();
+        if (qatomic_read(&d->vp.voice_inflight[v])) {
+            qemu_mutex_lock(&d->vp.inflight_lock);
+            qatomic_inc(&d->vp.inflight_waiters);
+            smp_mb();
+            while (qatomic_read(&d->vp.voice_inflight[v])) {
+                qemu_cond_wait(&d->vp.inflight_done, &d->vp.inflight_lock);
+            }
+            qatomic_dec(&d->vp.inflight_waiters);
+            qemu_mutex_unlock(&d->vp.inflight_lock);
+        }
+    } else {
+        qatomic_and(&d->vp.voice_locked[v / 64], ~mask);
+    }
+    qemu_cond_signal(&d->cond);
+}
+
+static void voice_inflight_add(MCPXAPUState *d, uint16_t v, int n)
+{
+    qatomic_add(&d->vp.voice_inflight[v], n);
+    if (n < 0) {
+        smp_mb();
+        if (qatomic_read(&d->vp.inflight_waiters)) {
+            qemu_mutex_lock(&d->vp.inflight_lock);
+            qemu_cond_broadcast(&d->vp.inflight_done);
+            qemu_mutex_unlock(&d->vp.inflight_lock);
+        }
+    }
+}
+#else
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
@@ -146,6 +190,7 @@ static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
     qemu_cond_signal(&d->cond);
     qemu_mutex_unlock(&d->lock);
 }
+#endif
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
 {
@@ -1616,6 +1661,9 @@ static void *voice_worker_thread(void *arg)
             for (int i = 0; i < self->queue_len; i++) {
                 voice_process(d, self->mixbins, self->sample_buf,
                               self->queue[i].voice, self->queue[i].list);
+#ifdef XEMU_UWP
+                voice_inflight_add(d, self->queue[i].voice, -1);
+#endif
             }
 
             qemu_mutex_lock(&vwd->lock);
@@ -1738,9 +1786,25 @@ voice_work_dispatch(MCPXAPUState *d,
             return;
         }
 
+#ifdef XEMU_UWP
+        if (!any_queued_voice_locked(d)) {
+            /* in flight first, then the locks again: a lock set in between is seen here, or sees ours */
+            for (int i = 0; i < vwd->queue_len; i++) {
+                voice_inflight_add(d, vwd->queue[i].voice, 1);
+            }
+            smp_mb();
+            if (!any_queued_voice_locked(d)) {
+                break;
+            }
+            for (int i = 0; i < vwd->queue_len; i++) {
+                voice_inflight_add(d, vwd->queue[i].voice, -1);
+            }
+        }
+#else
         if (!any_queued_voice_locked(d)) {
             break;
         }
+#endif
 
         qemu_cond_timedwait(&d->cond, &d->lock, 1);
     }
@@ -1872,6 +1936,10 @@ void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_P
 
 void mcpx_apu_vp_init(MCPXAPUState *d)
 {
+#ifdef XEMU_UWP
+    qemu_mutex_init(&d->vp.inflight_lock);
+    qemu_cond_init(&d->vp.inflight_done);
+#endif
     voice_work_init(d);
 }
 
