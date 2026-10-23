@@ -3227,6 +3227,86 @@ static uint64_t uwp_prepare_tick(void)
 
 static bool uwp_file_exists(const char *path);
 
+/*
+ * Frame pacing: how evenly the game's frames reach the screen, not only how many. A game can make 30 fps and
+ * still judder when its frames stay on screen 17, 50, 17, 50 ms instead of 33 each. Each screen refresh (the UI
+ * loop presents once per refresh) that brings a new game frame closes the time the one before stayed up. Against
+ * the game's own rate (60 or 30 fps, the nearer to this second's average) a frame is uneven when it stayed more
+ * than half a refresh (8 ms) off. One part of the SEC line each second; the session's share in the summary.
+ */
+#define UWP_PACE_MAX 256
+static struct {
+    LARGE_INTEGER last_new;     /* when the last new game frame was presented */
+    unsigned last_fc;
+    float ms[UWP_PACE_MAX];     /* this second's on-screen times */
+    unsigned n;
+    unsigned s_frames, s_uneven;            /* the session, seconds with a steady target only */
+    double s_err;                           /* sum of each frame's distance from the target, ms */
+    unsigned worst_uneven, worst_at;
+} uwp_pace;
+
+static void uwp_pace_refresh(void)
+{
+    unsigned fc = g_nv2a_stats.frame_count;
+    if (fc == uwp_pace.last_fc) {
+        return;   /* the same game frame stays up for this refresh */
+    }
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    if (uwp_pace.last_new.QuadPart && uwp_pace.n < UWP_PACE_MAX) {
+        uwp_pace.ms[uwp_pace.n++] = (float)((now.QuadPart - uwp_pace.last_new.QuadPart) * 1000.0 / freq.QuadPart);
+    }
+    uwp_pace.last_new = now;
+    uwp_pace.last_fc = fc;
+}
+
+static int uwp_pace_cmp(const void *a, const void *b)
+{
+    float x = *(const float *)a, y = *(const float *)b;
+    return (x > y) - (x < y);
+}
+
+/* this second's pacing as words for the SEC line; starts the next second */
+static void uwp_pace_second(unsigned at, char *out, size_t size)
+{
+    unsigned n = uwp_pace.n;
+    uwp_pace.n = 0;
+    if (n < 5) {
+        snprintf(out, size, "pacing: -");
+        return;
+    }
+    double sum = 0, sq = 0;
+    for (unsigned i = 0; i < n; i++) {
+        sum += uwp_pace.ms[i];
+        sq += (double)uwp_pace.ms[i] * uwp_pace.ms[i];
+    }
+    double avg = sum / n, spread = sqrt(fmax(0, sq / n - avg * avg));
+    qsort(uwp_pace.ms, n, sizeof(uwp_pace.ms[0]), uwp_pace_cmp);
+    float low1 = uwp_pace.ms[n - 1 - (n - 1) / 100];   /* the 1% low, as a frame time */
+    /* the game's own rate: 60 or 30, whichever this second's average is near (else none: slow, no target) */
+    double target = fabs(avg - 1000.0 / 60) < 1000.0 / 60 * 0.2 ? 1000.0 / 60
+                  : fabs(avg - 1000.0 / 30) < 1000.0 / 30 * 0.2 ? 1000.0 / 30 : 0;
+    if (!target) {
+        snprintf(out, size, "pacing: avg %.1f ms, spread %.1f ms, 1%% low %.0f ms (no steady rate)", avg, spread, low1);
+        return;
+    }
+    unsigned uneven = 0;
+    for (unsigned i = 0; i < n; i++) {
+        double err = fabs(uwp_pace.ms[i] - target);
+        uneven += err > 8.0;
+        uwp_pace.s_err += err;
+    }
+    uwp_pace.s_frames += n;
+    uwp_pace.s_uneven += uneven;
+    if (uneven > uwp_pace.worst_uneven) {
+        uwp_pace.worst_uneven = uneven;
+        uwp_pace.worst_at = at;
+    }
+    snprintf(out, size, "pacing: %u of %u frames uneven (target %.1f ms), spread %.1f ms, 1%% low %.0f ms",
+             uneven, n, target, spread, low1);
+}
+
 static void uwp_box_sample(void)
 {
     uwp_start_screen_second();
@@ -3326,15 +3406,17 @@ static void uwp_box_sample(void)
             g_free(marker);
             g_free(dir);
         }
+        char pace[160];
+        uwp_pace_second(at, pace, sizeof(pace));
         uwp_log("SEC %u:%02u | %d fps, slowest frame %d ms, %d frames over 34 ms | CPU: game %d%%, graphics %d%%, "
                 "xemu %.1f cores%s | memory %llu of %llu MB | per frame: %ld objects drawn; this second: %ld shaders "
-                "built, %ld textures loaded | waiting on the GPU %d%% | disc %.1f MB/s (%u reads) | hard disk %.1f MB/s | sound %s | holding: %s",
+                "built, %ld textures loaded | waiting on the GPU %d%% | disc %.1f MB/s (%u reads) | hard disk %.1f MB/s | sound %s | holding: %s | %s",
                 at / 60, at % 60, g_nv2a_stats.increment_fps, slowest, late, vcpu_busy,
                 pfifo_busy, app_cores, console, (unsigned long long)(u >> 20),
                 (unsigned long long)((u + l) >> 20), n ? draws / (long)n : 0, shaders, textures,
                 gpu_wait > 100 ? 100 : gpu_wait, disc_mb, nreads, hdd_mb,
                 dry != last_dry ? "RAN DRY (the game could not make sound fast enough)" : "ok",
-                uwp_held_now_for_sec[0] ? uwp_held_now_for_sec : "no buttons");
+                uwp_held_now_for_sec[0] ? uwp_held_now_for_sec : "no buttons", pace);
         uwp_auto_scale(g_nv2a_stats.increment_fps, late, gpu_wait, vcpu_busy, shaders);
         last_dvd = dvd;
         last_dry = dry;
@@ -4170,6 +4252,13 @@ static void uwp_session_summary_head(const char *how, bool story)
                 uwp_session.worst_stretch_from / 60, uwp_session.worst_stretch_from % 60);
     } else {
         uwp_log("Speed: the game never drew a frame");
+    }
+    if (uwp_pace.s_frames) {
+        double on_time = 100.0 * (uwp_pace.s_frames - uwp_pace.s_uneven) / uwp_pace.s_frames;
+        uwp_log("Pacing: %.1f%% of frames on time, %.1f ms off on average (%s); most uneven second %d:%02d (%u frames)",
+                on_time, uwp_pace.s_err / uwp_pace.s_frames,
+                on_time >= 97 ? "steady" : on_time >= 90 ? "mostly steady" : on_time >= 75 ? "uneven" : "judder",
+                uwp_pace.worst_at / 60, uwp_pace.worst_at % 60, uwp_pace.worst_uneven);
     }
     uwp_log("Ended: %s", how);
     if (story) {
@@ -6025,6 +6114,7 @@ int main(int argc, char **argv)
         poll_events(scon);
         render_frame(scon);
 #ifdef XEMU_UWP
+        uwp_pace_refresh();
         uwp_frames++;
         uwp_poll_activation();
 #ifdef CONFIG_D3D12
