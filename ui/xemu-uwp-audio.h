@@ -20,4 +20,16 @@
  * starts playing it. Returns NULL if XAudio2 is unavailable. */
 SDL_AudioStream *xemu_uwp_audio_start(void);
 
+/* Headset (hw/xbox/xblc.c): the game's voice output (played next to the game's sound) and the
+ * console's microphone, both 48 kHz mono signed 16-bit; xblc sets its own side's format.
+ * Made by xemu_uwp_audio_start(); NULL without XAudio2. */
+extern SDL_AudioStream *xemu_uwp_headset_out;
+extern SDL_AudioStream *xemu_uwp_headset_in;
+/* bytes the microphone has delivered so far (for the log) */
+extern volatile unsigned xemu_uwp_mic_bytes;
+/* Asks for the default microphone; call on the UI thread. Never waits. */
+void xemu_uwp_mic_start(void);
+/* every 3 s on the UI thread: asks again once the window is up, logs how the microphone does */
+void xemu_uwp_mic_tick(void);
+
 #endif

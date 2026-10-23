@@ -6115,6 +6115,7 @@ int main(int argc, char **argv)
      * The QEMU thread picks the stream up in mcpx_apu_monitor_init().
      */
     xemu_uwp_audio_stream = xemu_uwp_audio_start();
+    xemu_uwp_mic_start();
 #endif
     qemu_sem_init(&display_init_sem, 0);
     qemu_sem_init(&display_shutdown_sem, 0);
@@ -6242,6 +6243,7 @@ int main(int argc, char **argv)
                     RunState_str(runstate_get()), g_nv2a_stats.increment_fps,
                     pads, p1 ? p1->name : "(none)");
             uwp_prof_report((SDL_GetTicks() - (uwp_next_report - 3000)) / 1000.0);
+            xemu_uwp_mic_tick();
             uwp_session_sample(g_nv2a_stats.increment_fps);
             uwp_story_sample(g_nv2a_stats.increment_fps);
             uwp_log_memory();   /* every 3 s: a log that just stops shows how close to the limit it was */
