@@ -14,6 +14,7 @@
 #include <xaudio2.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <hstring.h>
 
 #include "xemu-uwp-audio.h"
 
@@ -292,6 +293,7 @@ static HRESULT STDMETHODCALLTYPE mic_done(IActivateAudioInterfaceCompletionHandl
     }
     if (FAILED(hr) || FAILED(ahr) || !unk) {
         uwp_log("headset: microphone not allowed or missing (0x%08lx 0x%08lx)", hr, ahr);
+        InterlockedExchange(&mic_answered, 0);   /* asked again once the player has allowed it */
         return S_OK;
     }
     hr = IUnknown_QueryInterface(unk, &uwp_IID_IAudioClient, (void **)&mic_client);
@@ -338,6 +340,13 @@ static HRESULT STDMETHODCALLTYPE mic_done(IActivateAudioInterfaceCompletionHandl
     if (FAILED(hr)) {
         uwp_log("headset: microphone not started at %s (0x%08lx%s)", step, hr,
                 hr == E_ACCESSDENIED ? ": the console does not let apps use the microphone" : "");
+        if (mic_capture) {
+            IAudioCaptureClient_Release(mic_capture);
+            mic_capture = NULL;
+        }
+        IAudioClient_Release(mic_client);
+        mic_client = NULL;
+        InterlockedExchange(&mic_answered, 0);   /* asked again once the player has allowed it */
         return S_OK;
     }
     HANDLE t = CreateThread(NULL, 0, mic_thread, NULL, 0, NULL);
@@ -389,11 +398,175 @@ static void mic_request(bool control)
     IActivateAudioInterfaceCompletionHandler_Release(&done->iface);
 }
 
+/*
+ * The console's "allow microphone" question. WASAPI alone never asks it (Initialize answers
+ * E_ACCESSDENIED with no prompt), so the app first asks through Windows.Media.Capture.MediaCapture
+ * (audio only) from the UI thread, as the documentation says; the capture object is closed as soon
+ * as the answer is in, and the WASAPI request is made again. Only the few ABI entries used here are
+ * declared (MinGW's windows.media.capture.h is a stub); the slots follow the Windows SDK header.
+ */
+typedef struct WinRTObj { const struct WinRTObjVtbl *v; } WinRTObj;
+typedef HRESULT (STDMETHODCALLTYPE *winrt_fn)(WinRTObj *, ...);
+typedef struct WinRTObjVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(WinRTObj *, REFIID, void **);
+    ULONG (STDMETHODCALLTYPE *AddRef)(WinRTObj *);
+    ULONG (STDMETHODCALLTYPE *Release)(WinRTObj *);
+    winrt_fn slot[16];   /* IInspectable's three, then the interface's own methods */
+} WinRTObjVtbl;
+#define WINRT_SLOT(o, n) ((o)->v->slot[(n) - 3])   /* n = slot number counted from QueryInterface */
+
+static const GUID uwp_IID_IMediaCapture = { 0xc61afbb4, 0xfb10, 0x4a34, { 0xac, 0x18, 0xca, 0x80, 0xd9, 0xc8, 0xe7, 0xee } };
+static const GUID uwp_IID_IMediaCaptureSettings = { 0x9782ba70, 0xea65, 0x4900, { 0x93, 0x56, 0x8c, 0xa8, 0x87, 0x72, 0x68, 0x84 } };
+static const GUID uwp_IID_IAsyncInfo = { 0x00000036, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+static const GUID uwp_IID_IClosable = { 0x30d5a829, 0x7fa4, 0x4026, { 0x83, 0xbb, 0xd7, 0x5b, 0xae, 0x4e, 0xa9, 0x9e } };
+static const GUID uwp_IID_IAsyncActionDone = { 0xa4ed5c81, 0x76c9, 0x40bd, { 0x8b, 0xe6, 0xb1, 0xd9, 0x0f, 0xb2, 0x0a, 0xe7 } };
+
+typedef HRESULT (WINAPI *RoActivateInstance_fn)(HSTRING, WinRTObj **);
+typedef HRESULT (WINAPI *WindowsCreateString_fn)(LPCWSTR, UINT32, HSTRING *);
+typedef HRESULT (WINAPI *WindowsDeleteString_fn)(HSTRING);
+
+static WinRTObj *consent_capture;
+static volatile LONG consent_granted;
+
+typedef struct {
+    const struct ConsentDoneVtbl *v;
+    LONG refs;
+} ConsentDone;
+typedef struct ConsentDoneVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(ConsentDone *, REFIID, void **);
+    ULONG (STDMETHODCALLTYPE *AddRef)(ConsentDone *);
+    ULONG (STDMETHODCALLTYPE *Release)(ConsentDone *);
+    HRESULT (STDMETHODCALLTYPE *Invoke)(ConsentDone *, WinRTObj *action, int status);
+} ConsentDoneVtbl;
+
+static HRESULT STDMETHODCALLTYPE consent_qi(ConsentDone *This, REFIID riid, void **out)
+{
+    if (IsEqualGUID(riid, &uwp_IID_IUnknown) || IsEqualGUID(riid, &uwp_IID_IAsyncActionDone) ||
+        IsEqualGUID(riid, &uwp_IID_IAgileObject)) {
+        *out = This;
+        InterlockedIncrement(&This->refs);
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE consent_addref(ConsentDone *This)
+{
+    return InterlockedIncrement(&This->refs);
+}
+
+static ULONG STDMETHODCALLTYPE consent_release(ConsentDone *This)
+{
+    LONG n = InterlockedDecrement(&This->refs);
+    if (n == 0) {
+        free(This);
+    }
+    return n;
+}
+
+/* AsyncStatus: 1 completed, 2 canceled, 3 error */
+static HRESULT STDMETHODCALLTYPE consent_invoke(ConsentDone *This, WinRTObj *action, int status)
+{
+    HRESULT err = S_OK;
+    WinRTObj *info = NULL;
+    if (action && SUCCEEDED(action->v->QueryInterface(action, &uwp_IID_IAsyncInfo, (void **)&info))) {
+        WINRT_SLOT(info, 8)(info, &err);   /* IAsyncInfo::get_ErrorCode */
+        info->v->Release(info);
+    }
+    if (status == 1) {
+        uwp_log("headset: microphone allowed (MediaCapture)");
+        InterlockedExchange(&consent_granted, 1);
+    } else {
+        uwp_log("headset: microphone not allowed through MediaCapture (status %d, 0x%08lx%s)", status, err,
+                err == E_ACCESSDENIED ? ": refused, or the console's privacy setting is off" : "");
+    }
+    WinRTObj *cap = (WinRTObj *)InterlockedExchangePointer((PVOID *)&consent_capture, NULL);
+    if (cap) {
+        WinRTObj *closable = NULL;
+        if (SUCCEEDED(cap->v->QueryInterface(cap, &uwp_IID_IClosable, (void **)&closable))) {
+            WINRT_SLOT(closable, 6)(closable);   /* IClosable::Close */
+            closable->v->Release(closable);
+        }
+        cap->v->Release(cap);
+    }
+    return S_OK;
+}
+
+static const ConsentDoneVtbl consent_vtbl = {
+    consent_qi, consent_addref, consent_release, consent_invoke
+};
+
+static WinRTObj *winrt_new(const wchar_t *cls, const GUID *iid)
+{
+    static RoActivateInstance_fn activate;
+    static WindowsCreateString_fn mk;
+    static WindowsDeleteString_fn del;
+    if (!activate) {
+        HMODULE combase = LoadLibraryExW(L"combase.dll", NULL, 0);
+        if (!combase) {
+            return NULL;
+        }
+        mk = (WindowsCreateString_fn)(void *)GetProcAddress(combase, "WindowsCreateString");
+        del = (WindowsDeleteString_fn)(void *)GetProcAddress(combase, "WindowsDeleteString");
+        activate = (RoActivateInstance_fn)(void *)GetProcAddress(combase, "RoActivateInstance");
+        if (!mk || !del || !activate) {
+            activate = NULL;
+            return NULL;
+        }
+    }
+    HSTRING name = NULL;
+    WinRTObj *obj = NULL, *want = NULL;
+    if (FAILED(mk(cls, (UINT32)wcslen(cls), &name))) {
+        return NULL;
+    }
+    HRESULT hr = activate(name, &obj);
+    del(name);
+    if (FAILED(hr) || !obj) {
+        uwp_log("headset: %ls not available (0x%08lx)", cls, hr);
+        return NULL;
+    }
+    hr = obj->v->QueryInterface(obj, iid, (void **)&want);
+    obj->v->Release(obj);
+    return SUCCEEDED(hr) ? want : NULL;
+}
+
+static void mic_ask_consent(void)
+{
+    WinRTObj *settings = winrt_new(L"Windows.Media.Capture.MediaCaptureInitializationSettings",
+                                   &uwp_IID_IMediaCaptureSettings);
+    WinRTObj *cap = winrt_new(L"Windows.Media.Capture.MediaCapture", &uwp_IID_IMediaCapture);
+    WinRTObj *op = NULL;
+    HRESULT hr = E_FAIL;
+    if (settings && cap) {
+        WINRT_SLOT(settings, 10)(settings, 1);   /* put_StreamingCaptureMode(Audio) */
+        hr = WINRT_SLOT(cap, 7)(cap, settings, &op);   /* InitializeWithSettingsAsync */
+    }
+    if (settings) {
+        settings->v->Release(settings);
+    }
+    if (FAILED(hr) || !op) {
+        uwp_log("headset: could not ask for the microphone (0x%08lx)", hr);
+        if (cap) {
+            cap->v->Release(cap);
+        }
+        return;
+    }
+    consent_capture = cap;
+    ConsentDone *done = calloc(1, sizeof(*done));
+    if (done) {
+        done->v = &consent_vtbl;
+        done->refs = 1;
+        hr = WINRT_SLOT(op, 6)(op, done);   /* IAsyncAction::put_Completed */
+        consent_release(done);
+        uwp_log("headset: asked the player for the microphone (0x%08lx)", hr);
+    }
+    op->v->Release(op);
+}
+
 void xemu_uwp_mic_start(void)
 {
-    if (xemu_uwp_headset_in) {
-        mic_request(false);
-    }
+    /* asked on the first tick instead, with the window up (the question needs it) */
 }
 
 void xemu_uwp_mic_tick(void)
@@ -404,11 +577,10 @@ void xemu_uwp_mic_tick(void)
     }
     ticks++;
     if (ticks == 1) {
-        /* again with the window up, and the control request */
-        mic_request(true);
-        if (!mic_answered) {
-            mic_request(false);
-        }
+        mic_ask_consent();
+    } else if (consent_granted == 1 && !mic_answered) {
+        consent_granted = 2;   /* once: the WASAPI request again, now that the player has allowed it */
+        mic_request(false);
     } else if (ticks == 5 && !mic_answered) {
         uwp_log("headset: the microphone request has no answer after 15 s");
     } else if (ticks % 20 == 0 && mic_answered) {
