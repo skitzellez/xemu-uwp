@@ -477,6 +477,26 @@ const MemoryRegionOps ep_ops = {
     .write = ep_write,
 };
 
+#ifdef XEMU_UWP
+/*
+ * Real-time DSP with a time cap. A light DSP program finishes its frame (halts) long before the cap and runs in
+ * full: Black waits each frame for a block its GP program writes back and needs that for 30 fps. A heavy one
+ * (Halo 2's, JSRF's) would keep the sound thread past real time and the sound would run dry; it stops at the cap
+ * for that frame instead, still with far more cycles than the 1000 a frame real-time DSP off gives. A GP frame
+ * is 32 samples (667 us of sound) and shares the thread with the voices; the EP runs once per 8 frames.
+ */
+#define UWP_GP_FRAME_CAP_US 300
+#define UWP_EP_FRAME_CAP_US 1500
+
+static void uwp_dsp_run_capped(DSPState *dsp, int64_t cap_us)
+{
+    int64_t start = g_get_monotonic_time();
+    do {
+        dsp_run(dsp, 1000);
+    } while (!dsp_get_halt_requested(dsp) && g_get_monotonic_time() - start < cap_us);
+}
+#endif
+
 void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     /* Write VP results to the GP DSP MIXBUF */
@@ -497,9 +517,17 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
         dsp_start_frame(d->gp.dsp);
         dsp_set_halt_requested(d->gp.dsp, false);
         dsp_set_cycle_count(d->gp.dsp, 0);
+#ifdef XEMU_UWP
+        if (d->gp.realtime) {
+            uwp_dsp_run_capped(d->gp.dsp, UWP_GP_FRAME_CAP_US);
+        } else {
+            dsp_run(d->gp.dsp, 1000);
+        }
+#else
         do {
             dsp_run(d->gp.dsp, 1000);
         } while (!dsp_get_halt_requested(d->gp.dsp) && d->gp.realtime);
+#endif
         g_dbg.gp.cycles = dsp_get_cycle_count(d->gp.dsp);
 
         if ((d->monitor.point == MCPX_APU_DEBUG_MON_GP) ||
@@ -522,9 +550,17 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
             dsp_start_frame(d->ep.dsp);
             dsp_set_halt_requested(d->ep.dsp, false);
             dsp_set_cycle_count(d->ep.dsp, 0);
+#ifdef XEMU_UWP
+            if (d->ep.realtime) {
+                uwp_dsp_run_capped(d->ep.dsp, UWP_EP_FRAME_CAP_US);
+            } else {
+                dsp_run(d->ep.dsp, 1000);
+            }
+#else
             do {
                 dsp_run(d->ep.dsp, 1000);
             } while (!dsp_get_halt_requested(d->ep.dsp) && d->ep.realtime);
+#endif
             g_dbg.ep.cycles = dsp_get_cycle_count(d->ep.dsp);
         }
     }
