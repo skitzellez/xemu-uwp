@@ -479,21 +479,67 @@ const MemoryRegionOps ep_ops = {
 
 #ifdef XEMU_UWP
 /*
- * Real-time DSP with a time cap. A light DSP program finishes its frame (halts) long before the cap and runs in
- * full: Black waits each frame for a block its GP program writes back and needs that for 30 fps. A heavy one
- * (Halo 2's, JSRF's) would keep the sound thread past real time and the sound would run dry; it stops at the cap
- * for that frame instead, still with far more cycles than the 1000 a frame real-time DSP off gives. A GP frame
- * is 32 samples (667 us of sound) and shares the thread with the voices; the EP runs once per 8 frames.
+ * Real-time DSP that falls back by itself. A light DSP program (Black's: the game waits each frame for a block its
+ * GP program writes back, and needs that for 30 fps) runs every frame to its end, as on the Xbox. A heavy one
+ * (Halo 2's, JSRF's) cannot keep up on the console: run to the end it pushed the sound thread past real time (sound
+ * ran dry), and cut short it came out scrambled (tried). So a frame is never cut (the cap is only a guard against a
+ * runaway program), and a game whose GP program takes more than the console can keep up with (on average over
+ * 450 us of each 667 us frame, 2 s in a row) goes back to the lighter mode of real-time DSP off for the rest of the
+ * session: the voices mixed straight to the output, as before.
  */
-#define UWP_GP_FRAME_CAP_US 300
-#define UWP_EP_FRAME_CAP_US 1500
+#define UWP_GP_FRAME_CAP_US 5000
+#define UWP_EP_FRAME_CAP_US 5000
+#define UWP_GP_SUSTAINABLE_US 450
 
-static void uwp_dsp_run_capped(DSPState *dsp, int64_t cap_us)
+static bool uwp_dsp_run_capped(DSPState *dsp, int64_t cap_us, int64_t *took_us)
 {
-    int64_t start = g_get_monotonic_time();
+    int64_t start = g_get_monotonic_time(), now;
     do {
         dsp_run(dsp, 1000);
-    } while (!dsp_get_halt_requested(dsp) && g_get_monotonic_time() - start < cap_us);
+        now = g_get_monotonic_time();
+    } while (!dsp_get_halt_requested(dsp) && now - start < cap_us);
+    *took_us = now - start;
+    return dsp_get_halt_requested(dsp);
+}
+
+/* per GP frame: its time, whether it finished; logs every 10 s and falls back when it keeps missing */
+static void uwp_gp_frame_done(MCPXAPUState *d, int64_t took_us, bool finished)
+{
+    static int64_t win_start, log_start, sum_us, max_us;
+    static uint32_t frames, missed, log_frames, log_missed, bad_windows;
+    int64_t now = g_get_monotonic_time();
+    if (!win_start) {
+        win_start = log_start = now;
+    }
+    frames++;
+    missed += !finished;
+    log_frames++;
+    log_missed += !finished;
+    sum_us += took_us;
+    max_us = MAX(max_us, took_us);
+    static int64_t win_sum_us;
+    win_sum_us += took_us;
+    if (now - win_start >= 1000000) {
+        bad_windows = win_sum_us > (int64_t)frames * UWP_GP_SUSTAINABLE_US || missed ? bad_windows + 1 : 0;
+        frames = missed = 0;
+        win_sum_us = 0;
+        win_start = now;
+        if (bad_windows >= 2 && d->gp.realtime) {
+            d->gp.realtime = false;
+            d->ep.realtime = false;
+            d->monitor.point = MCPX_APU_DEBUG_MON_VP;
+            uwp_log("sound: this game's DSP program needs more than the console can give each sound frame; "
+                    "back to the lighter sound mode (real-time DSP off) for this session");
+        }
+    }
+    if (now - log_start >= 10000000 && log_frames) {
+        uwp_log("sound DSP: %u frames, GP avg %lld us max %lld us (%u stopped by the guard)%s", log_frames,
+                (long long)(sum_us / log_frames), (long long)max_us, log_missed,
+                d->gp.realtime ? "" : " (lighter mode)");
+        log_frames = log_missed = 0;
+        sum_us = max_us = 0;
+        log_start = now;
+    }
 }
 #endif
 
@@ -519,7 +565,9 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
         dsp_set_cycle_count(d->gp.dsp, 0);
 #ifdef XEMU_UWP
         if (d->gp.realtime) {
-            uwp_dsp_run_capped(d->gp.dsp, UWP_GP_FRAME_CAP_US);
+            int64_t took_us;
+            bool finished = uwp_dsp_run_capped(d->gp.dsp, UWP_GP_FRAME_CAP_US, &took_us);
+            uwp_gp_frame_done(d, took_us, finished);
         } else {
             dsp_run(d->gp.dsp, 1000);
         }
@@ -552,7 +600,8 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_
             dsp_set_cycle_count(d->ep.dsp, 0);
 #ifdef XEMU_UWP
             if (d->ep.realtime) {
-                uwp_dsp_run_capped(d->ep.dsp, UWP_EP_FRAME_CAP_US);
+                int64_t took_us;
+                uwp_dsp_run_capped(d->ep.dsp, UWP_EP_FRAME_CAP_US, &took_us);
             } else {
                 dsp_run(d->ep.dsp, 1000);
             }
