@@ -706,6 +706,10 @@ static unsigned int trim_texture_cache(PGRAPHD3D12State *r,
     return evicted;
 }
 
+static void texture_cache_range_update(PGRAPHD3D12State *r,
+                                       const PGRAPHD3D12TextureBinding *binding,
+                                       bool active);
+
 static bool create_texture_resource(PGRAPHState *pg, unsigned int stage,
                                     PGRAPHD3D12TextureBinding *binding,
                                     const TextureShape *shape,
@@ -870,6 +874,7 @@ static bool create_texture_resource(PGRAPHState *pg, unsigned int stage,
     binding->compressed = info->compressed;
     binding->scale = (float)MAX(resource_scale, 1);
     binding->valid = true;
+    texture_cache_range_update(r, binding, true);
     return true;
 }
 
@@ -2996,6 +3001,33 @@ static void report_texture_binding_once(
 }
 
 
+/* Keeps the packed range row of a cache slot in step with its binding. */
+static void texture_cache_range_update(PGRAPHD3D12State *r,
+                                       const PGRAPHD3D12TextureBinding *binding,
+                                       bool active)
+{
+    PGRAPHD3D12TextureRange *range;
+
+    if (r->texture_cache_ranges == NULL || binding < r->texture_cache_entries ||
+        binding >= r->texture_cache_entries + PGRAPH_D3D12_TEXTURE_CACHE_SIZE) {
+        return;
+    }
+    range = &r->texture_cache_ranges[binding - r->texture_cache_entries];
+    memset(range, 0, sizeof(*range));
+    if (!active) {
+        return;
+    }
+    if (binding->length != 0) {
+        range->start = binding->vram_addr;
+        range->end = binding->vram_addr + binding->length;
+    }
+    if (binding->palette_length != 0) {
+        range->palette_start = binding->palette_vram_addr;
+        range->palette_end =
+            binding->palette_vram_addr + binding->palette_length;
+    }
+}
+
 static void texture_cache_entry_init(Lru *lru, LruNode *node, const void *key)
 {
     PGRAPHD3D12TextureBinding *binding =
@@ -3029,6 +3061,8 @@ static void texture_cache_entry_init(Lru *lru, LruNode *node, const void *key)
     binding->descriptors_allocated = false;
     binding->valid = false;
     binding->resource_bytes = 0;
+    texture_cache_range_update(
+        container_of(lru, PGRAPHD3D12State, texture_cache), binding, true);
 }
 
 static bool texture_cache_entry_compare(Lru *lru, LruNode *node,
@@ -3064,6 +3098,7 @@ static void texture_cache_entry_post_evict(Lru *lru, LruNode *node)
     release_texture_resource(r->pg, binding);
     binding->possibly_dirty = false;
     binding->replacement = NULL;
+    texture_cache_range_update(r, binding, false);
 }
 
 void pgraph_d3d12_init_textures(NV2AState *d)
@@ -3075,6 +3110,9 @@ void pgraph_d3d12_init_textures(NV2AState *d)
     r->texture_cache_entries =
         g_malloc0_n(PGRAPH_D3D12_TEXTURE_CACHE_SIZE,
                     sizeof(*r->texture_cache_entries));
+    r->texture_cache_ranges =
+        g_malloc0_n(PGRAPH_D3D12_TEXTURE_CACHE_SIZE,
+                    sizeof(*r->texture_cache_ranges));
     for (unsigned int i = 0; i < PGRAPH_D3D12_TEXTURE_CACHE_SIZE; i++) {
         lru_add_free(&r->texture_cache, &r->texture_cache_entries[i].node);
     }
@@ -3154,8 +3192,26 @@ void pgraph_d3d12_mark_textures_possibly_dirty(NV2AState *d, hwaddr addr,
     ctx.addr = addr & TARGET_PAGE_MASK;
     ctx.end = MIN(TARGET_PAGE_ALIGN(addr + size), vram_size);
 
-    lru_visit_active(&r->texture_cache, mark_textures_possibly_dirty_visitor,
-                     &ctx);
+    if (r->texture_cache_ranges != NULL) {
+        /* Same test as the visitor, on the packed rows: walking the cache's
+         * lists cost a fifth of the graphics thread in Bloody Roar Extreme,
+         * which writes texture memory between many of its 2,000 draws. */
+        const PGRAPHD3D12TextureRange *range = r->texture_cache_ranges;
+        for (unsigned int i = 0; i < PGRAPH_D3D12_TEXTURE_CACHE_SIZE; i++) {
+            if ((ctx.addr < range[i].end && range[i].start < ctx.end) ||
+                (ctx.addr < range[i].palette_end &&
+                 range[i].palette_start < ctx.end)) {
+                PGRAPHD3D12TextureBinding *binding =
+                    &r->texture_cache_entries[i];
+                if (binding->resource != NULL) {
+                    binding->possibly_dirty = true;
+                }
+            }
+        }
+    } else {
+        lru_visit_active(&r->texture_cache,
+                         mark_textures_possibly_dirty_visitor, &ctx);
+    }
 
     /* Force currently-bound stages that overlap to revalidate. */
     for (unsigned int i = 0; i < NV2A_MAX_TEXTURES; i++) {
@@ -3218,6 +3274,8 @@ void pgraph_d3d12_finalize_textures(PGRAPHState *pg)
         lru_flush(&r->texture_cache);
         g_free(r->texture_cache_entries);
         r->texture_cache_entries = NULL;
+        g_free(r->texture_cache_ranges);
+        r->texture_cache_ranges = NULL;
     }
     if (r->sampler_cache != NULL) {
         g_hash_table_destroy(r->sampler_cache);

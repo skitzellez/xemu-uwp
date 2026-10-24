@@ -378,6 +378,12 @@ typedef struct PGRAPHD3D12TextureBinding {
     uint64_t surface_free_gen;
 } PGRAPHD3D12TextureBinding;
 
+/* Half-open guest byte ranges of a texture cache slot; all zero when free. */
+typedef struct PGRAPHD3D12TextureRange {
+    hwaddr start, end;
+    hwaddr palette_start, palette_end;
+} PGRAPHD3D12TextureRange;
+
 typedef struct PGRAPHD3D12BlitDisplayCandidate {
     bool valid;
     hwaddr addr;
@@ -1101,6 +1107,9 @@ typedef struct PGRAPHD3D12State {
     bool surface_scale_flush_pending;
     Lru texture_cache;
     PGRAPHD3D12TextureBinding *texture_cache_entries;
+    /* Guest bytes of each texture_cache_entries slot, packed so a dirty mark
+     * scans 512 small rows instead of walking the cache's lists. */
+    PGRAPHD3D12TextureRange *texture_cache_ranges;
     uint64_t texture_cache_bytes;
     PGRAPHD3D12TextureBinding *texture_binding[NV2A_MAX_TEXTURES];
     /* Custom texture loading and dumping (texture_replace.c). */
