@@ -483,13 +483,13 @@ const MemoryRegionOps ep_ops = {
  * GP program writes back, and needs that for 30 fps) runs every frame to its end, as on the Xbox. A heavy one
  * (Halo 2's, JSRF's) cannot keep up on the console: run to the end it pushed the sound thread past real time (sound
  * ran dry), and cut short it came out scrambled (tried). So a frame is never cut (the cap is only a guard against a
- * runaway program), and a game whose GP program takes more than the console can keep up with (on average over
- * 450 us of each 667 us frame, 2 s in a row) goes back to the lighter mode of real-time DSP off for the rest of the
- * session: the voices mixed straight to the output, as before.
+ * runaway program), and a game whose sound falls behind real time (under 90% of the 1500 frames a second, 3 s in a
+ * row) goes back to the lighter mode of real-time DSP off for the rest of the session: the voices mixed straight to
+ * the output, as before. One slow second (a quick load, the boot) does not count.
  */
 #define UWP_GP_FRAME_CAP_US 5000
 #define UWP_EP_FRAME_CAP_US 5000
-#define UWP_GP_SUSTAINABLE_US 450
+#define UWP_GP_FRAMES_PER_S_MIN 1350
 
 static bool uwp_dsp_run_capped(DSPState *dsp, int64_t cap_us, int64_t *took_us)
 {
@@ -517,19 +517,18 @@ static void uwp_gp_frame_done(MCPXAPUState *d, int64_t took_us, bool finished)
     log_missed += !finished;
     sum_us += took_us;
     max_us = MAX(max_us, took_us);
-    static int64_t win_sum_us;
-    win_sum_us += took_us;
     if (now - win_start >= 1000000) {
-        bad_windows = win_sum_us > (int64_t)frames * UWP_GP_SUSTAINABLE_US || missed ? bad_windows + 1 : 0;
+        int64_t win_us = now - win_start;
+        uint32_t win_frames = frames;
+        bad_windows = (int64_t)frames * 1000000 < (int64_t)UWP_GP_FRAMES_PER_S_MIN * win_us ? bad_windows + 1 : 0;
         frames = missed = 0;
-        win_sum_us = 0;
         win_start = now;
-        if (bad_windows >= 2 && d->gp.realtime) {
+        if (bad_windows >= 3 && d->gp.realtime) {
             d->gp.realtime = false;
             d->ep.realtime = false;
             d->monitor.point = MCPX_APU_DEBUG_MON_VP;
-            uwp_log("sound: this game's DSP program needs more than the console can give each sound frame; "
-                    "back to the lighter sound mode (real-time DSP off) for this session");
+            uwp_log("sound: the DSP fell behind real time (%u frames in the last second); back to the lighter sound "
+                    "mode (real-time DSP off) for this session", win_frames);
         }
     }
     if (now - log_start >= 10000000 && log_frames) {
