@@ -328,10 +328,15 @@ audio:
     num_workers:
       type: integer
       default: 0  # 0 = auto
-  use_dsp: bool
+  # Xbox build: on. With it off the GP DSP runs only 1000 cycles a frame, so a game that waits for a DSP block
+  # each frame (Black: 25 fps instead of 30) waits ~35-40 ms; the console has the cores for it (JIT: about half
+  # of one core in Black).
+  use_dsp:
+    type: bool
+    default: true
   use_dsp_jit:
     type: bool
-    default: false
+    default: true
   hrtf:
     type: bool
     default: true
