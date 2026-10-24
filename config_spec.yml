@@ -346,6 +346,9 @@ audio:
 
 net:
   enable: bool
+  # Xbox build: the emulated Xbox's network card address, e.g. '00:50:f2:00:00:02'. Empty = the one in its
+  # EEPROM. Two consoles set up from one EEPROM share it (and clash online): give each its own here.
+  mac: string
   backend:
     type: enum
     values: [nat, udp, pcap]

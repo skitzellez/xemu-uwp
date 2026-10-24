@@ -4825,6 +4825,13 @@ static char *uwp_unescape(const char *in)
  * console's Device Portal can put there: any app on the console can open an xemu: link, and must not
  * crash it or press its buttons. A launcher needs disc, home and the return link only.
  */
+/* xemu.toml net.mac, for the EEPROM (hw/xbox/smbus_storage.c) */
+const char *xemu_uwp_config_mac(void);
+const char *xemu_uwp_config_mac(void)
+{
+    return g_config.net.mac;
+}
+
 /* a test file next to the log (LocalState/xemu/xemu); only the Device Portal can put one there */
 bool xemu_uwp_test_file_exists(const char *name);
 bool xemu_uwp_test_file_exists(const char *name)

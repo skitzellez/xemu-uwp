@@ -106,6 +106,39 @@ static void uwp_eeprom_language(uint8_t *e)
     }
 }
 
+/*
+ * The network card address (factory section, 0x40) from xemu.toml's net.mac, in memory only, with the factory
+ * checksum (0x30, over 0x34..0x5F) made again. Two consoles set up from one EEPROM have the same address and
+ * clash online (Insignia, system link) in one home; each can be given its own this way.
+ */
+static void uwp_eeprom_mac(uint8_t *e)
+{
+    extern const char *xemu_uwp_config_mac(void); /* ui/xemu.c */
+    const char *text = xemu_uwp_config_mac();
+    unsigned int b[6];
+    if (!text || !text[0]) {
+        return;
+    }
+    if (sscanf(text, "%2x%*[:-]%2x%*[:-]%2x%*[:-]%2x%*[:-]%2x%*[:-]%2x", &b[0], &b[1], &b[2], &b[3], &b[4],
+               &b[5]) != 6) {
+        uwp_log("EEPROM: net.mac '%s' in xemu.toml is not an address like 00:50:f2:00:00:02; not used", text);
+        return;
+    }
+    for (int i = 0; i < 6; i++) {
+        e[0x40 + i] = (uint8_t)b[i];
+    }
+    uint32_t high = 0, low = 0;
+    for (int i = 0; i < 0x2C / 4; i++) {
+        uint32_t val = ldl_le_p(e + 0x34 + 4 * i);
+        uint64_t sum = ((uint64_t)high << 32) | low;
+        high = (sum + val) >> 32;
+        low += val;
+    }
+    stl_le_p(e + 0x30, ~(high + low));
+    uwp_log("EEPROM: network address %02x:%02x:%02x:%02x:%02x:%02x from xemu.toml for this session", b[0], b[1],
+            b[2], b[3], b[4], b[5]);
+}
+
 static void uwp_eeprom_widescreen(uint8_t *e)
 {
     if (xemu_uwp_widescreen < 0) {
@@ -154,6 +187,7 @@ static void smbus_storage_realize(DeviceState *dev, Error **errp)
         if (s->addr == 0x54 && s->size == 256) {
             uwp_eeprom_language(s->data);
             uwp_eeprom_widescreen(s->data);
+            uwp_eeprom_mac(s->data);
         }
 #endif
     } else {
