@@ -26,14 +26,45 @@
 
 static const int16_t ep_silence[256][2] = { 0 };
 
+#ifdef XEMU_UWP
+static const char *uwp_disc_name(void);
+static bool uwp_dsp_light_known(void);
+#endif
+
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
 {
     static int last_known_dsp_pref = -1;
     static int last_known_jit_pref = -1;
 
+#ifdef XEMU_UWP
+    /* a disc this console could not keep up with before starts in the lighter mode (dsp-light.txt) */
+    {
+        static char *checked_disc;
+        const char *disc = uwp_disc_name();
+        if (g_config.audio.use_dsp && disc[0] && (!checked_disc || strcmp(checked_disc, disc))) {
+            g_free(checked_disc);
+            checked_disc = g_strdup(disc);
+            if (uwp_dsp_light_known()) {
+                last_known_dsp_pref = (int)g_config.audio.use_dsp;
+                d->gp.realtime = false;
+                d->ep.realtime = false;
+                d->monitor.point = MCPX_APU_DEBUG_MON_VP;
+                uwp_log("sound: %s is in dsp-light.txt: real-time DSP off for it", disc);
+            } else if (!d->gp.realtime) {
+                last_known_dsp_pref = -1;   /* another disc: real-time DSP again */
+            }
+        }
+    }
+#endif
     if (last_known_dsp_pref != (int)g_config.audio.use_dsp) {
         if (g_config.audio.use_dsp) {
+#ifdef XEMU_UWP
+            /* The DSPs run in full (games wait for them: Black), but what is heard stays the voices' mix, as with
+             * real-time DSP off: the DSP output overflowed and distorted in Halo 2's intro (too loud, crackling). */
+            d->monitor.point = MCPX_APU_DEBUG_MON_VP;
+#else
             d->monitor.point = MCPX_APU_DEBUG_MON_GP_OR_EP;
+#endif
             d->gp.realtime = true;
             d->ep.realtime = true;
         } else {
@@ -483,9 +514,10 @@ const MemoryRegionOps ep_ops = {
  * GP program writes back, and needs that for 30 fps) runs every frame to its end, as on the Xbox. A heavy one
  * (Halo 2's, JSRF's) cannot keep up on the console: run to the end it pushed the sound thread past real time (sound
  * ran dry), and cut short it came out scrambled (tried). So a frame is never cut (the cap is only a guard against a
- * runaway program), and a game whose sound falls behind real time (under 90% of the 1500 frames a second, 3 s in a
- * row) goes back to the lighter mode of real-time DSP off for the rest of the session: the voices mixed straight to
- * the output, as before. One slow second (a quick load, the boot) does not count.
+ * runaway program), and a game whose sound falls behind real time (under 90% of the 1500 frames a second, 2 s in a
+ * row; the first 20 s after the sound starts and 5 s after a pause such as a quick load do not count) goes back to
+ * the lighter mode of real-time DSP off for the rest of the session. The disc is noted in dsp-light.txt (next to
+ * xemu.toml) and starts in the lighter mode from then on, so it falls behind only once per console.
  */
 #define UWP_GP_FRAME_CAP_US 5000
 #define UWP_EP_FRAME_CAP_US 5000
@@ -500,6 +532,69 @@ static bool uwp_dsp_run_capped(DSPState *dsp, int64_t cap_us, int64_t *took_us)
     } while (!dsp_get_halt_requested(dsp) && now - start < cap_us);
     *took_us = now - start;
     return dsp_get_halt_requested(dsp);
+}
+
+/* when the sound first ran (the first 20 s are the boot: slow seconds there do not count) */
+static int64_t log_start_first(int64_t now)
+{
+    static int64_t first;
+    if (!first) {
+        first = now;
+    }
+    return first;
+}
+
+/* dsp-light.txt: discs whose DSP program the console cannot keep up with, one file name a line */
+static char *uwp_dsp_light_file(void)
+{
+    extern const char *xemu_settings_get_path(void);
+    char *dir = g_path_get_dirname(xemu_settings_get_path());
+    char *f = g_build_filename(dir, "dsp-light.txt", NULL);
+    g_free(dir);
+    return f;
+}
+
+static const char *uwp_disc_name(void)
+{
+    const char *p = g_config.sys.files.dvd_path ? g_config.sys.files.dvd_path : "";
+    for (const char *c = p; *c; c++) {
+        if (*c == '/' || *c == '\\') {
+            p = c + 1;
+        }
+    }
+    return p;
+}
+
+static bool uwp_dsp_light_known(void)
+{
+    char *f = uwp_dsp_light_file(), *text = NULL;
+    bool known = false;
+    const char *disc = uwp_disc_name();
+    if (disc[0] && g_file_get_contents(f, &text, NULL, NULL)) {
+        char **lines = g_strsplit(text, "\n", -1);
+        for (int i = 0; lines[i] && !known; i++) {
+            known = !strcmp(g_strstrip(lines[i]), disc);
+        }
+        g_strfreev(lines);
+    }
+    g_free(text);
+    g_free(f);
+    return known;
+}
+
+static void uwp_dsp_light_remember(void)
+{
+    const char *disc = uwp_disc_name();
+    if (!disc[0] || uwp_dsp_light_known()) {
+        return;
+    }
+    char *f = uwp_dsp_light_file();
+    FILE *fp = fopen(f, "a");
+    if (fp) {
+        fprintf(fp, "%s\n", disc);
+        fclose(fp);
+    }
+    g_free(f);
 }
 
 /* per GP frame: its time, whether it finished; logs every 10 s and falls back when it keeps missing */
@@ -523,7 +618,12 @@ static void uwp_gp_frame_done(MCPXAPUState *d, int64_t took_us, bool finished)
         bad_windows = (int64_t)frames * 1000000 < (int64_t)UWP_GP_FRAMES_PER_S_MIN * win_us ? bad_windows + 1 : 0;
         frames = missed = 0;
         win_start = now;
-        if (bad_windows >= 3 && d->gp.realtime) {
+        extern int64_t xemu_uwp_apu_resumed_us;
+        if (now - xemu_uwp_apu_resumed_us < 5000000 || now - log_start_first(now) < 20000000) {
+            bad_windows = 0;
+        }
+        if (bad_windows >= 2 && d->gp.realtime) {
+            uwp_dsp_light_remember();
             d->gp.realtime = false;
             d->ep.realtime = false;
             d->monitor.point = MCPX_APU_DEBUG_MON_VP;

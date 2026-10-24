@@ -334,8 +334,15 @@ static void mcpx_apu_wait_for_idle(MCPXAPUState *d)
     }
 }
 
+#ifdef XEMU_UWP
+int64_t xemu_uwp_apu_resumed_us; /* read by gp_ep.c: slow sound seconds right after a pause do not count */
+#endif
+
 static void mcpx_apu_resume(MCPXAPUState *d)
 {
+#ifdef XEMU_UWP
+    xemu_uwp_apu_resumed_us = g_get_monotonic_time();
+#endif
     d->pause_requested = false;
     qemu_cond_signal(&d->cond);
 }
