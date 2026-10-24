@@ -25,6 +25,9 @@ SDL_AudioStream *xemu_uwp_audio_start(void);
  * Made by xemu_uwp_audio_start(); NULL without XAudio2. */
 extern SDL_AudioStream *xemu_uwp_headset_out;
 extern SDL_AudioStream *xemu_uwp_headset_in;
+/* The headset is used only when the player turned it on in Game Vault's Xemu setup (headset=1 in the
+ * launch link): a quick save made with it plugged in does not load without it, and the other way round. */
+extern bool xemu_uwp_headset_on;
 /* bytes the microphone has delivered so far (for the log) */
 extern volatile unsigned xemu_uwp_mic_bytes;
 /* Asks for the default microphone; call on the UI thread. Never waits. */

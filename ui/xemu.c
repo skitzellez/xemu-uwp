@@ -5064,6 +5064,16 @@ static char *uwp_take_activation_disc(void)
             g_config.general.skip_boot_anim = p[9] == '1';
             uwp_log("link: skip startup animation %s", p[9] == '1' ? "on" : "off");
         }
+        if (!strcmp(p, "headset=1") || !strcmp(p, "headset=0")) {
+            extern bool xemu_uwp_headset_on; /* ui/xemu-uwp-audio.c */
+            static bool taken;
+            if (!taken) {   /* the headset is plugged in at the start; a later link changes it next time */
+                taken = true;
+                xemu_uwp_headset_on = p[8] == '1';
+            }
+            uwp_log("link: headset %s%s", p[8] == '1' ? "on" : "off",
+                    xemu_uwp_headset_on == (p[8] == '1') ? "" : " (from the next start)");
+        }
         if (!strcmp(p, "rumble=1") || !strcmp(p, "rumble=0")) {
             extern bool xemu_uwp_rumble_off; /* ui/xemu-input.c */
             xemu_uwp_rumble_off = p[7] == '0';

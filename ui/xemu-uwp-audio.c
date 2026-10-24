@@ -191,6 +191,7 @@ static const GUID uwp_IID_IUnknown = { 0x00000000, 0x0000, 0x0000, { 0xc0, 0x00,
 static IAudioClient *mic_client;
 static IAudioCaptureClient *mic_capture;
 volatile unsigned xemu_uwp_mic_bytes;
+bool xemu_uwp_headset_on;
 
 static DWORD WINAPI mic_thread(LPVOID unused)
 {
@@ -572,7 +573,7 @@ void xemu_uwp_mic_start(void)
 void xemu_uwp_mic_tick(void)
 {
     static int ticks;
-    if (!xemu_uwp_headset_in) {
+    if (!xemu_uwp_headset_in || !xemu_uwp_headset_on) {
         return;
     }
     ticks++;

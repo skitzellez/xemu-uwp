@@ -265,13 +265,15 @@ static const char *get_bound_driver(int port)
 static const int port_map[4] = { 3, 4, 1, 2 };
 
 #ifdef XEMU_UWP
-/* Headset test: an Xbox Live Communicator in slot A of player 1's controller, using the console's own
- * default microphone and sound output (hw/xbox/xblc.c, SDL). Not when a memory unit uses slot A. */
+/* Headset (Game Vault's Xemu setup, headset=1): an Xbox Live Communicator in slot A of player 1's
+ * controller, using the console's own default microphone and sound output (hw/xbox/xblc.c,
+ * ui/xemu-uwp-audio.c). Not when a memory unit uses slot A. */
+extern bool xemu_uwp_headset_on; /* ui/xemu-uwp-audio.c */
 static DeviceState *uwp_xblc_dev[4];
 
 static void uwp_xblc_attach(int index)
 {
-    if (index != 0 || uwp_xblc_dev[index] || !bound_controllers[index] ||
+    if (!xemu_uwp_headset_on || index != 0 || uwp_xblc_dev[index] || !bound_controllers[index] ||
         bound_controllers[index]->peripheral_types[0] == PERIPHERAL_XMU) {
         return;
     }
