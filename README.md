@@ -81,6 +81,8 @@ The port is free and stays free. If you'd like to help keep the test console run
 
 - **[xemu](https://xemu.app)** by Matt Borgerson and contributors, built on QEMU. All the emulation is theirs.
 - Xbox port by **[Skitzelles](https://github.com/skitzellez)**, written with an AI assistant (Claude).
+- **New graphics** (the Direct3D 12 renderer and presenter) by **[danprice142](https://github.com/danprice142/xemu-uwp)**,
+  from his own Xbox port of xemu.
 - [XboxEmulationHub](https://github.com/XboxEmulationHub) for SDL3-uwp and mesa-uwp;
   [SpiritBoot](https://github.com/Mainkill1/SpiritBoot) for the free BIOS.
 

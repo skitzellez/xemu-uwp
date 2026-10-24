@@ -239,8 +239,8 @@ void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state)
 #ifdef XEMU_UWP
     /*
      * Settings the generated shader never reads in this state are set to one value, so that they do not
-     * make shaders that differ only there (each a stutter while playing; idea from another Xbox port of
-     * xemu):
+     * make shaders that differ only there (each a stutter while playing; idea from danprice142's Xbox
+     * port of xemu):
      * - the alpha function without alpha test, and "always" with it (the same as no test)
      * - the shadow comparison when no texture is a shadow map
      * - the clip-plane comparisons of a texture stage that is not in clip-plane mode

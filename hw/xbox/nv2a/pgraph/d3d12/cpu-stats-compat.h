@@ -2,8 +2,8 @@
  * Copyright (c) 2026 Skitzelles - part of xemu for Xbox Dev Mode (github.com/skitzellez/xemu-uwp). GPL-2.0-or-later.
  *
  * New graphics renderer: stand-ins for CPU-side counters and switches the
- * renderer's tune file and log lines read in the build it came from (another
- * Xbox port of xemu). Our CPU core has none of them: counters read 0 and the
+ * renderer's tune file and log lines read in the build it came from
+ * (danprice142's Xbox port of xemu, github.com/danprice142/xemu-uwp). Our CPU core has none of them: counters read 0 and the
  * switches do nothing, so the renderer code stays as it was written.
  */
 

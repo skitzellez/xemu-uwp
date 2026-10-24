@@ -972,7 +972,7 @@ static inline void copy_tlb_helper_locked(CPUTLBEntry *d, const CPUTLBEntry *s)
  * number plus one, or TLB_WR_MANY. tlb_reset_dirty() then resets those entries (and the victim TLBs) instead of
  * walking every entry of every mode: the graphics renderers check and clear written memory per draw, and each
  * reset walked the whole TLB (New graphics: a fifth of the FIFO thread in Mortal Kombat crowds, the game in slow
- * motion). A stale note only costs a lookup. Single vCPU only (the Xbox). Idea from another Xbox port of xemu.
+ * motion). A stale note only costs a lookup. Single vCPU only (the Xbox). Idea from danprice142's Xbox port of xemu.
  */
 #define TLB_WR_MANY UINT32_MAX
 static uintptr_t tlb_wr_base;

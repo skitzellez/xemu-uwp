@@ -1,7 +1,8 @@
 /*
  * xemu Direct3D 12 presenter
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 danprice142 (https://github.com/danprice142/xemu-uwp)
+ * Changed for xemu on Xbox Dev Mode by Skitzelles (https://github.com/skitzellez/xemu-uwp)
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by

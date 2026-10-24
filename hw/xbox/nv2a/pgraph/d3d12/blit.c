@@ -1,7 +1,8 @@
 /*
  * Geforce NV2A PGRAPH Direct3D 12 Renderer
  *
- * Copyright (c) 2026
+ * Copyright (c) 2026 danprice142 (https://github.com/danprice142/xemu-uwp)
+ * Changed for xemu on Xbox Dev Mode by Skitzelles (https://github.com/skitzellez/xemu-uwp)
  *
  * Based on the OpenGL and Vulkan CPU image blit paths.
  *

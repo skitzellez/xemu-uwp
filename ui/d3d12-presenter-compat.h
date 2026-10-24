@@ -1,7 +1,8 @@
 /*
  * Copyright (c) 2026 Skitzelles - part of xemu for Xbox Dev Mode (github.com/skitzellez/xemu-uwp). GPL-2.0-or-later.
  *
- * New graphics presenter: the build it came from (another Xbox port of xemu)
+ * New graphics presenter: the build it came from (danprice142's Xbox port of
+ * xemu, github.com/danprice142/xemu-uwp)
  * also streams the picture and aims a light gun; ours has neither, so these
  * stand-ins keep the presenter code as written.
  */

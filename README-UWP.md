@@ -148,6 +148,14 @@ the prompt for the simpler `CreateFileFromAppW` route used here. The GPU read-ba
 "Performance work" are not in that port at the time of writing (its 1.0.0.114 ran one game's demo levels at
 23-28 fps on the same console where this port holds 55-60).
 
+### From danprice142's port
+
+The **New graphics** engine is the Direct3D 12 renderer (`hw/xbox/nv2a/pgraph/d3d12/`) and presenter
+(`ui/d3d12-presenter.*`) written by [danprice142](https://github.com/danprice142/xemu-uwp) for his Xbox port of
+xemu, with thanks. Our changes to it are in the git history. Two speed-ups were also first seen there: the TLB
+reset that skips untouched entries (`accel/tcg/cputlb.c`) and fewer shader variants for unused settings
+(`hw/xbox/nv2a/pgraph/glsl/psh.c`).
+
 ## What had to change to run in a UWP app on the console
 
 | Problem on the console | What this branch does |
