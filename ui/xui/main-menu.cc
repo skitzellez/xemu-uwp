@@ -1314,6 +1314,16 @@ void MainMenuSnapshotsView::Draw()
            "Only display snapshots created while running the currently running "
            "XBE");
 
+    ImGui::PushFont(g_font_mgr.m_menu_font_small);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.8f, 0.4f, 1.0f));
+    ImGui::TextWrapped(
+        "Loading a snapshot also takes the Xbox's game saves and logins "
+        "(Insignia) back to when it was made. Anything saved since is "
+        "replaced. Your game as it was before each load is kept as \""
+        XEMU_SNAPSHOT_UNDO_NAME "\".");
+    ImGui::PopStyleColor();
+    ImGui::PopFont();
+
     if (g_config.general.snapshots.filter_current_game) {
         struct xbe *xbe = xemu_get_xbe_info();
         if (xbe && xbe->cert) {

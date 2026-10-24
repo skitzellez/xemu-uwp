@@ -2525,7 +2525,10 @@ static void uwp_state(bool save)
         error_free(err);
     } else {
         uwp_log("state %s: %s", save ? "saved" : "loaded", name);
-        xemu_queue_notification(save ? "State saved" : "State loaded");
+        xemu_queue_notification(save ? "State saved"
+                                     : "State loaded\n"
+                                       "Xbox saves went back too - undo: "
+                                       "\"" XEMU_SNAPSHOT_UNDO_NAME "\"");
     }
     g_free(name);
 }

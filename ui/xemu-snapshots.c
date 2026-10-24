@@ -30,6 +30,7 @@
 #include "block/qdict.h"
 #include "block/block-io.h"
 #include "migration/qemu-file.h"
+#include "block/snapshot.h"
 #include "migration/snapshot.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-block.h"
@@ -240,10 +241,55 @@ char *xemu_get_currently_loaded_disc_path(void)
 
 void xemu_snapshots_load(const char *vm_name, Error **err)
 {
+    /*
+     * Keep the machine as it is now (hard disk saves included) before it is
+     * replaced. Only when the snapshot exists, so a load that cannot happen
+     * does not overwrite the undo point, and not when loading the undo point
+     * itself, which would replace it with the state it is meant to undo.
+     */
+    bool undo_kept = false;
+    if (g_strcmp0(vm_name, XEMU_SNAPSHOT_UNDO_NAME) != 0 &&
+        bdrv_all_has_snapshot(vm_name, false, NULL, NULL) > 0) {
+        Error *undo_err = NULL;
+        undo_kept = save_snapshot(XEMU_SNAPSHOT_UNDO_NAME, true, NULL, false,
+                                  NULL, &undo_err);
+        if (undo_err) {
+            fprintf(stderr, "snapshot: undo point not kept: %s\n",
+                    error_get_pretty(undo_err));
+            error_free(undo_err);
+        } else {
+            fprintf(stderr, "snapshot: kept \"%s\" before loading \"%s\"\n",
+                    XEMU_SNAPSHOT_UNDO_NAME, vm_name);
+        }
+        xemu_snapshots_mark_dirty();
+    }
+
     bool vm_running = runstate_is_running();
     vm_stop(RUN_STATE_RESTORE_VM);
-    if (load_snapshot(vm_name, NULL, false, NULL, err) && vm_running) {
-        vm_start();
+    if (load_snapshot(vm_name, NULL, false, NULL, err)) {
+        if (vm_running) {
+            vm_start();
+        }
+        return;
+    }
+
+    /*
+     * A load can fail half way (a snapshot made with a device this run does
+     * not have, e.g. the headset: "Unknown section usb-xblc") and leave the
+     * machine half loaded. Put back the state kept just before.
+     */
+    if (undo_kept) {
+        Error *back_err = NULL;
+        if (load_snapshot(XEMU_SNAPSHOT_UNDO_NAME, NULL, false, NULL,
+                          &back_err)) {
+            fprintf(stderr, "snapshot: load of \"%s\" failed, put back "
+                    "the state from before it\n", vm_name);
+            if (vm_running) {
+                vm_start();
+            }
+        } else {
+            error_free(back_err);
+        }
     }
 }
 

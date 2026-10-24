@@ -35,6 +35,13 @@ extern "C" {
 #define XEMU_SNAPSHOT_THUMBNAIL_WIDTH 160
 #define XEMU_SNAPSHOT_THUMBNAIL_HEIGHT 120
 
+/*
+ * A snapshot also holds the Xbox hard disk, so loading one takes game saves
+ * and logins (Insignia) back to that time. Before every load the machine as it
+ * is now is kept under this name, so a wrong load can be undone.
+ */
+#define XEMU_SNAPSHOT_UNDO_NAME "Before last load"
+
 extern const char **g_snapshot_shortcut_index_key_map[];
 
 typedef struct XemuSnapshotData {

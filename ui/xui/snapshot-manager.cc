@@ -103,6 +103,10 @@ void SnapshotManager::LoadSnapshot(const char *name)
     if (err) {
         xemu_queue_error_message(error_get_pretty(err));
         error_free(err);
+    } else if (g_strcmp0(name, XEMU_SNAPSHOT_UNDO_NAME) != 0) {
+        xemu_queue_notification("Snapshot loaded\n"
+                                "Xbox saves went back too - undo: "
+                                "\"" XEMU_SNAPSHOT_UNDO_NAME "\"");
     }
 }
 
