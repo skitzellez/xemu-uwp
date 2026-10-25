@@ -5026,6 +5026,10 @@ HANDLE xemu_uwp_shared_file(LPCWSTR name, DWORD access)
 
 /* the link asked for the Xbox dashboard (no disc): Game Vault, PLAY ONLINE > Xbox dashboard */
 static bool uwp_want_dashboard;
+/* the link said the USB drive's hard disk is another console's (Game Vault, stickdisk=0): a console without a disk
+ * of its own gets a new blank one instead of playing from that copy (two consoles sharing one drive were the same
+ * Xbox online, 2026-10-24) */
+static bool uwp_no_stick_disk;
 
 static char *uwp_take_activation_disc(void)
 {
@@ -5274,6 +5278,9 @@ static char *uwp_take_activation_disc(void)
                 uwp_log("link: network sign-in refused (not Game Vault's file)");
             }
             g_free(path);
+        }
+        if (!strncmp(p, "stickdisk=0", 11)) {
+            uwp_no_stick_disk = true;
         }
         if (!strncmp(p, "dashboard=1", 11)) {
             uwp_want_dashboard = true;   /* Game Vault's "Xbox dashboard": no disc, the console's own menu */
@@ -5792,6 +5799,9 @@ static void uwp_fill_system_files(void)
         char *usb = uwp_home ? g_strdup_printf("%s/xbox/%s", uwp_home, names[0]) : NULL;
         if (uwp_fill_one(&g_config.sys.files.hdd_path, "hard disk", folder, own, names)) {
             /* the console's own */
+        } else if (usb && uwp_no_stick_disk && uwp_file_exists(usb)) {
+            uwp_log("hard disk: the one on the USB drive is another console's, so this console gets its own");
+            uwp_new_hdd(folder, own, names[0]);
         } else if (usb && uwp_file_exists(usb)) {
             /* a console without a disk (new, or reset) and the player's stick: the stick's disk */
             uwp_set_path(&g_config.sys.files.hdd_path, "hard disk (on the USB drive, none on the console)", usb);
