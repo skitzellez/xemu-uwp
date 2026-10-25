@@ -178,7 +178,7 @@ static void voice_inflight_add(MCPXAPUState *d, uint16_t v, int n)
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    qemu_mutex_lock(&d->lock);
+    mcpx_apu_lock(d);
 
     uint64_t mask = 1LL << (v % 64);
     if (lock) {

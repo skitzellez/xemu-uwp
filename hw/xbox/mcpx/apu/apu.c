@@ -280,6 +280,12 @@ static void *mcpx_apu_frame_thread(void *arg)
             continue;
         }
 
+        if (qatomic_read(&d->lock_waiters)) {
+            /* another thread waits for the lock (see mcpx_apu_lock): let it in */
+            qemu_cond_timedwait(&d->cond, &d->lock, 1);
+            continue;
+        }
+
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
@@ -364,10 +370,17 @@ static void mcpx_apu_reset_hold(Object *obj, ResetType type)
     MCPXAPUState *d = MCPX_APU_DEVICE(obj);
 
     bql_unlock();
-    qemu_mutex_lock(&d->lock);
+    mcpx_apu_lock(d);
     mcpx_apu_wait_for_idle(d);
     mcpx_apu_reset_locked(d);
-    mcpx_apu_resume(d);
+    /*
+     * Only a running machine gets its sound back here. Loading a snapshot resets every device with the machine
+     * stopped: resumed, the DSP ran on half-loaded state through the load, and the loaded game then waited
+     * forever for its sound (quick load, 2026-10-24). The machine's start resumes it (mcpx_apu_vm_state_change).
+     */
+    if (runstate_is_running()) {
+        mcpx_apu_resume(d);
+    }
     qemu_mutex_unlock(&d->lock);
     bql_lock();
 }
@@ -381,7 +394,7 @@ static void mcpx_apu_vm_state_change(void *opaque, bool running, RunState state)
 
     if (!running) {
         bql_unlock();
-        qemu_mutex_lock(&d->lock);
+        mcpx_apu_lock(d);
         mcpx_apu_wait_for_idle(d);
         if (d->gp.dsp) {
             dsp_sync_to_vm(d->gp.dsp);
@@ -392,7 +405,7 @@ static void mcpx_apu_vm_state_change(void *opaque, bool running, RunState state)
         qemu_mutex_unlock(&d->lock);
         bql_lock();
     } else {
-        qemu_mutex_lock(&d->lock);
+        mcpx_apu_lock(d);
         if (d->gp.dsp) {
             dsp_sync_from_vm(d->gp.dsp);
         }
@@ -407,7 +420,7 @@ static void mcpx_apu_vm_state_change(void *opaque, bool running, RunState state)
 static int mcpx_apu_pre_load(void *opaque)
 {
     MCPXAPUState *d = opaque;
-    qemu_mutex_lock(&d->lock);
+    mcpx_apu_lock(d);
     mcpx_apu_reset_locked(d);
     qemu_mutex_unlock(&d->lock);
     return 0;
@@ -444,7 +457,7 @@ static void mcpx_apu_realize(PCIDevice *dev, Error **errp)
     d->is_idle = false;
     d->pause_requested = true;
     qemu_mutex_init(&d->lock);
-    qemu_mutex_lock(&d->lock);
+    mcpx_apu_lock(d);
     qemu_cond_init(&d->cond);
     qemu_cond_init(&d->idle_cond);
 
@@ -469,7 +482,7 @@ static void mcpx_apu_exitfn(PCIDevice *dev)
     MCPXAPUState *d = MCPX_APU_DEVICE(dev);
 
     bql_unlock();
-    qemu_mutex_lock(&d->lock);
+    mcpx_apu_lock(d);
     mcpx_apu_wait_for_idle(d);
     qatomic_set(&d->exiting, true);
     qemu_cond_signal(&d->cond);

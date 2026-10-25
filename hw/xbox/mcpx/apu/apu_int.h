@@ -87,6 +87,7 @@ typedef struct MCPXAPUState {
     QemuCond idle_cond;
     bool pause_requested;
     bool is_idle;
+    int lock_waiters;   /* threads waiting in mcpx_apu_lock(); the frame thread lets go between frames */
 
     MemoryRegion *ram;
     uint8_t *ram_ptr;
@@ -125,6 +126,19 @@ typedef struct MCPXAPUState {
         int queued_bytes_low, queued_bytes_high;
     } monitor;
 } MCPXAPUState;
+
+/*
+ * The APU lock for every thread but the frame thread. The frame thread holds the lock while it runs frames and
+ * only lets go while it waits; when the DSP falls behind it never waits, and a lock that is not first come,
+ * first served then never reaches anyone else (loading a quick save waited 27 s on it, 2026-10-24). Counting
+ * the waiters lets the frame thread step aside for them between frames.
+ */
+static inline void mcpx_apu_lock(MCPXAPUState *d)
+{
+    qatomic_inc(&d->lock_waiters);
+    qemu_mutex_lock(&d->lock);
+    qatomic_dec(&d->lock_waiters);
+}
 
 extern MCPXAPUState *g_state; // Used via debug handlers
 extern struct McpxApuDebug g_dbg, g_dbg_cache;

@@ -374,7 +374,7 @@ static void gp_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     MCPXAPUState *d = opaque;
 
-    qemu_mutex_lock(&d->lock);
+    mcpx_apu_lock(d);
 
     assert(size == 4);
     assert(addr % 4 == 0);
@@ -464,7 +464,7 @@ static void ep_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     MCPXAPUState *d = opaque;
 
-    qemu_mutex_lock(&d->lock);
+    mcpx_apu_lock(d);
 
     assert(size == 4);
     assert(addr % 4 == 0);
