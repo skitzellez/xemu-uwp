@@ -4,6 +4,7 @@
 
 extern "C" int xemu_uwp_thread_busy(const char *name, int slot);
 extern "C" void uwp_log(const char *fmt, ...);
+extern "C" bool xemu_uwp_renderer_is_d3d12(void);
 
 static void uwp_overlay(void)
 {
@@ -79,6 +80,12 @@ static void uwp_overlay(void)
     char line[128];
     snprintf(line, sizeof line, "FPS %.0f / %.0f", fps, target);
     dl->AddText(font, 52 * s, ImVec2(o.x + 16 * s, o.y + 8 * s), col, line);
+    {
+        /* which graphics draw the game, top right of the box: players' screenshots then say it */
+        const char *gfx = xemu_uwp_renderer_is_d3d12() ? "D3D12" : "MESA";
+        ImVec2 tw = font->CalcTextSizeA(22 * s, FLT_MAX, 0.0f, gfx);
+        dl->AddText(font, 22 * s, ImVec2(o.x + w - 16 * s - tw.x, o.y + 8 * s), IM_COL32(150, 200, 255, 255), gfx);
+    }
     snprintf(line, sizeof line, "lowest last min %.0f", low);
     dl->AddText(font, 24 * s, ImVec2(o.x + 300 * s, o.y + 30 * s), IM_COL32(200, 200, 200, 255), line);
     snprintf(line, sizeof line, "Xbox CPU %d%%   GPU %d%%%s", cpu, gpu,

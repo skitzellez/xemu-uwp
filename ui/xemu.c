@@ -1082,6 +1082,16 @@ out:
 }
 #endif
 
+/* for the frame-rate counter: which graphics draw the game */
+bool xemu_uwp_renderer_is_d3d12(void)
+{
+#ifdef CONFIG_D3D12
+    return m_use_d3d12;
+#else
+    return false;
+#endif
+}
+
 static void render_frame(struct xemu_console *scon)
 {
 #ifdef CONFIG_D3D12
