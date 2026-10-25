@@ -3594,22 +3594,30 @@ static void uwp_where(uint64_t addr, char *out, size_t n)
 #include <tlhelp32.h>
 static bool uwp_ui_loop_started;
 
-static DWORD WINAPI uwp_start_watchdog(void *arg)
+/* Every thread's stack to the log, one line each, named when the profiler knows the thread ("vcpu", "pfifo",
+ * "ui"). only: just the threads whose name starts with it, NULL for all. Used when something hangs: the Device
+ * Portal refuses live dumps on Dev Mode, so this is all a hang leaves. */
+static void uwp_log_thread_stacks(const char *tag, const char *only)
 {
-    Sleep(12000);
-    if (qatomic_read(&uwp_ui_loop_started)) {
-        return 0;
-    }
-    uwp_log("START HANG: the UI loop has not started after 12 s; thread stacks follow");
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (snap == INVALID_HANDLE_VALUE) {
-        uwp_log("START HANG: no thread list (error %lu)", GetLastError());
-        return 0;
+        uwp_log("%s: no thread list (error %lu)", tag, GetLastError());
+        return;
     }
     THREADENTRY32 te = { .dwSize = sizeof(te) };
+    int others = 0;
     DWORD pid = GetCurrentProcessId(), self = GetCurrentThreadId();
     for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
         if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) {
+            continue;
+        }
+        char name[32] = "";
+        for (int i = 0; i < uwp_prof_num_threads; i++) {
+            if (uwp_prof_threads[i].tid == te.th32ThreadID) {
+                g_strlcpy(name, uwp_prof_threads[i].name, sizeof(name));
+            }
+        }
+        if (only && strncmp(name, only, strlen(only))) {
             continue;
         }
         HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
@@ -3635,10 +3643,89 @@ static DWORD WINAPI uwp_start_watchdog(void *arg)
             uwp_where(frames[i], w, sizeof(w));
             g_string_append_printf(line, "%s%s", i ? " < " : "", w);
         }
-        uwp_log("START HANG thread %lu: %s", te.th32ThreadID, line->str);
+        /* system threads that never enter xemu (sound, input, thread pool) are only counted */
+        if (!name[0] && !strstr(line->str, "xemu.exe")) {
+            others++;
+        } else {
+            uwp_log("%s thread %lu%s%s: %s", tag, te.th32ThreadID, name[0] ? " " : "", name, line->str);
+        }
         g_string_free(line, true);
     }
     CloseHandle(snap);
+    if (others) {
+        uwp_log("%s: %d system threads (sound, input, thread pool) not shown", tag, others);
+    }
+}
+
+static DWORD WINAPI uwp_start_watchdog(void *arg)
+{
+    Sleep(12000);
+    if (qatomic_read(&uwp_ui_loop_started)) {
+        return 0;
+    }
+    uwp_log("START HANG: the UI loop has not started after 12 s; thread stacks follow");
+    uwp_log_thread_stacks("START HANG", NULL);
+    return 0;
+}
+
+/*
+ * Hang watchdog while a game runs (Full Spectrum Warrior froze 2026-10-24: every thread waiting, 0% CPU, and
+ * the log just stopped). Once a second it looks at the screen thread's frame count and the game's frame count:
+ *  - screen thread still for 5 s: "HANG", every thread's stack (who waits for whom);
+ *  - screen running but no game frame for 20 s while the machine runs: "GAME STALL", the vcpu and graphics
+ *    thread stacks (a game stuck in a loop or waiting on the GPU).
+ * Nothing while xemu is in the background or paused. At most 3 of each per session, and a line when it moves
+ * again. Cost: one wake-up a second.
+ */
+static uint64_t uwp_ui_beats;          /* the screen thread's frame count, for the watchdog */
+static bool uwp_hang_test;             /* "hangtest=1" link: the screen thread sleeps 8 s once (test) */
+
+static DWORD WINAPI uwp_run_watchdog(void *arg)
+{
+    uint64_t last_beats = 0, still_since = GetTickCount64();
+    int64_t last_frames = 0;
+    uint64_t frames_still_since = GetTickCount64();
+    bool hang_open = false, stall_open = false;
+    int hangs = 0, stalls = 0;
+    for (;;) {
+        Sleep(1000);
+        uint64_t now = GetTickCount64();
+        uint64_t beats = qatomic_read(&uwp_ui_beats);
+        int64_t frames = qatomic_read(&uwp_prof_nv2a_frames);
+        bool watching = !uwp_background_since_ms(false, false) && runstate_is_running();
+        if (beats != last_beats || !watching) {
+            if (hang_open && beats != last_beats) {
+                uwp_log("HANG over: the screen thread moved again after %llu s",
+                        (unsigned long long)(now - still_since) / 1000);
+            }
+            hang_open = false;
+            last_beats = beats;
+            still_since = now;
+        } else if (!hang_open && now - still_since >= 5000 && hangs < 3) {
+            hang_open = true;
+            hangs++;
+            uwp_log("HANG: the screen thread has not moved for 5 s (game frames so far %lld); thread stacks "
+                    "follow", (long long)frames);
+            uwp_log_thread_stacks("HANG", NULL);
+            fflush(NULL);
+        }
+        if (frames != last_frames || !watching || hang_open) {
+            if (stall_open && frames != last_frames) {
+                uwp_log("GAME STALL over: game frames again after %llu s",
+                        (unsigned long long)(now - frames_still_since) / 1000);
+            }
+            stall_open = false;
+            last_frames = frames;
+            frames_still_since = now;
+        } else if (!stall_open && now - frames_still_since >= 20000 && stalls < 3) {
+            stall_open = true;
+            stalls++;
+            uwp_log("GAME STALL: no game frame for 20 s while the screen runs; game CPU and graphics stacks "
+                    "follow");
+            uwp_log_thread_stacks("GAME STALL", "vcpu");
+            uwp_log_thread_stacks("GAME STALL", "pfifo");
+        }
+    }
     return 0;
 }
 
@@ -4953,7 +5040,7 @@ static char *uwp_take_activation_disc(void)
         }
         if (!tests && (!strcmp(p, "quit=1") || !strncmp(p, "state=", 6) || !strncmp(p, "press=", 6) ||
                        !strncmp(p, "rtcbase=", 8) ||
-                       !strcmp(p, "crashtest=1") || !strcmp(p, "dash=0") || !strcmp(p, "noflush=1") ||
+                       !strcmp(p, "crashtest=1") || !strcmp(p, "hangtest=1") || !strcmp(p, "dash=0") || !strcmp(p, "noflush=1") ||
                        !strcmp(p, "skipdraws=1"))) {
             refused = true;
             p = end ? end + 1 : NULL;
@@ -4967,6 +5054,9 @@ static char *uwp_take_activation_disc(void)
         }
         if (!strncmp(p, "press=", 6)) {
             uwp_press(p + 6);
+        }
+        if (!strcmp(p, "hangtest=1")) {
+            uwp_hang_test = true;
         }
         if (!strcmp(p, "crashtest=1")) {
             /* checks the crash report: a deliberate bad memory read on the screen thread, 20 s from now */
@@ -6199,6 +6289,7 @@ int main(int argc, char **argv)
                              NULL));
     CloseHandle(CreateThread(NULL, 0, uwp_sampler_thread, (void *)"pfifo", 0,
                              NULL));
+    CloseHandle(CreateThread(NULL, 0, uwp_run_watchdog, NULL, 0, NULL));
     uint64_t uwp_frames = 0, uwp_next_report = SDL_GetTicks() + 3000;
     uint64_t uwp_started_ms = SDL_GetTicks();
 #endif
@@ -6208,6 +6299,12 @@ int main(int argc, char **argv)
 #ifdef XEMU_UWP
         uwp_pace_refresh();
         uwp_frames++;
+        qatomic_set(&uwp_ui_beats, uwp_frames);
+        if (uwp_hang_test) {
+            uwp_hang_test = false;
+            uwp_log("hang test: the screen thread sleeps 8 s");
+            Sleep(8000);
+        }
         uwp_poll_activation();
 #ifdef CONFIG_D3D12
         if (m_use_d3d12) {
