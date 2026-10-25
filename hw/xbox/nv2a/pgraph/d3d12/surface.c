@@ -1169,11 +1169,72 @@ static bool zeta_depth_plane_float(PGRAPHState *pg)
                      layout.depth_offset);
     memcpy(&value, &texel, sizeof(value));
     r->zeta_depth_plane_float = fabsf(value - probe_depth) < 1e-6f;
+    r->zeta_depth_upload_float = r->zeta_depth_plane_float;
     fprintf(stderr,
             "Direct3D 12 renderer: D24S8 depth plane copies hold %s depth "
             "(probe texel 0x%08x)\n",
             r->zeta_depth_plane_float ? "32-bit float" : "24-bit UNORM",
             texel);
+
+    /*
+     * Uploads separately: a UNORM 0.25 goes in and is read back. The console
+     * driver reads back float but takes uploads as UNORM; converting uploads
+     * to float there hid everything behind depth that games copy in
+     * (Genma Onimusha's characters behind its pre-drawn backgrounds).
+     */
+    {
+        const uint32_t unorm_quarter = 0x400000;
+        uint64_t upload_offset;
+        uint8_t *up;
+        bool unorm_seen;
+
+        if (!reserve_surface_upload_range(pg, &probe, layout.total_size,
+                                          &upload_offset, &local_err) ||
+            !pgraph_d3d12_begin_commands(pg, &local_err)) {
+            goto out;
+        }
+        up = (uint8_t *)r->upload_buffer.mapped + upload_offset;
+        for (unsigned int y = 0; y < probe.height; y++) {
+            for (unsigned int x = 0; x < probe.width; x++) {
+                stl_le_p(up + layout.depth_offset +
+                             (uint64_t)y * layout.depth_row_pitch + x * 4,
+                         unorm_quarter);
+            }
+        }
+        pgraph_d3d12_transition_raw_resource(r, probe.resource, &state,
+                                             D3D12_RESOURCE_STATE_COPY_DEST);
+        set_texture_subresource_copy_location(&dst_loc, probe.resource, 0);
+        set_buffer_texture_copy_location(&src_loc, r->upload_buffer.resource,
+                                         upload_offset + layout.depth_offset,
+                                         layout.depth_format, probe.width,
+                                         probe.height, layout.depth_row_pitch);
+        r->command_list->lpVtbl->CopyTextureRegion(r->command_list, &dst_loc,
+                                                   0, 0, 0, &src_loc, NULL);
+        pgraph_d3d12_transition_raw_resource(r, probe.resource, &state,
+                                             D3D12_RESOURCE_STATE_COPY_SOURCE);
+        set_buffer_texture_copy_location(&dst_loc, r->readback_buffer.resource,
+                                         layout.depth_offset,
+                                         layout.depth_format, probe.width,
+                                         probe.height, layout.depth_row_pitch);
+        set_texture_subresource_copy_location(&src_loc, probe.resource, 0);
+        r->command_list->lpVtbl->CopyTextureRegion(r->command_list, &dst_loc,
+                                                   0, 0, 0, &src_loc, NULL);
+        if (!pgraph_d3d12_submit_commands(pg, &local_err)) {
+            goto out;
+        }
+        texel = ldl_le_p((const uint8_t *)r->readback_buffer.mapped +
+                         layout.depth_offset);
+        memcpy(&value, &texel, sizeof(value));
+        unorm_seen = r->zeta_depth_plane_float ?
+                         fabsf(value - 0.25f) < 1e-6f :
+                         (texel & 0xffffffu) == unorm_quarter;
+        r->zeta_depth_upload_float = !unorm_seen;
+        fprintf(stderr,
+                "Direct3D 12 renderer: D24S8 depth plane uploads take %s "
+                "depth (probe texel 0x%08x)\n",
+                r->zeta_depth_upload_float ? "32-bit float" : "24-bit UNORM",
+                texel);
+    }
 
 out:
     if (local_err != NULL) {
@@ -1190,6 +1251,13 @@ out:
             -1);
     }
     return r->zeta_depth_plane_float;
+}
+
+/* The depth format uploads of a D24S8 depth plane take (see above). */
+static bool zeta_depth_upload_float(PGRAPHState *pg)
+{
+    zeta_depth_plane_float(pg);
+    return pg->d3d12_renderer_state->zeta_depth_upload_float;
 }
 
 static bool upload_z24s8_surface_data(NV2AState *d,
@@ -1222,7 +1290,7 @@ static bool upload_z24s8_surface_data(NV2AState *d,
         return true;
     }
 
-    depth_float = zeta_depth_plane_float(pg);
+    depth_float = zeta_depth_upload_float(pg);
     pgraph_apply_scaling_factor(pg, &scaled_width, &scaled_height);
     if (!zeta_plane_layout(surface, scaled_width, scaled_height, &layout,
                            errp)) {

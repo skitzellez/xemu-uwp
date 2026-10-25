@@ -1166,9 +1166,12 @@ typedef struct PGRAPHD3D12State {
      * nominal dedicated size, as on unified-memory consoles. */
     uint64_t video_memory_budget;
     /* Buffer copies of a D24_UNORM_S8_UINT depth plane hold 32-bit float
-     * depth instead of 24-bit UNORM; probed before the first transfer. */
+     * depth instead of 24-bit UNORM; probed before the first transfer.
+     * Read-backs and uploads are probed apart: the console driver reads the
+     * plane back as float but takes uploads as UNORM. */
     bool zeta_depth_plane_probed;
     bool zeta_depth_plane_float;
+    bool zeta_depth_upload_float;
     char adapter_description[128];
     bool debug_verbose_reports;
     bool debug_resource_dumps;
