@@ -452,6 +452,59 @@ void xemu_hud_cleanup(void)
     g_hud_ready = false;
 }
 
+#ifdef XEMU_UWP
+extern "C" void uwp_log(const char *fmt, ...);
+
+/*
+ * A keyboard on the Xbox: players could not type into xemu's text boxes
+ * (Network > Port Forwarding). Until the system's typed-text events show up,
+ * a key press in a text box types its character from the key itself.
+ */
+static void xemu_uwp_keyboard_text(const SDL_Event *event)
+{
+    static bool text_seen, fallback_logged;
+
+    if (event->type == SDL_EVENT_TEXT_INPUT) {
+        if (!text_seen) {
+            text_seen = true;
+            uwp_log("keyboard: typed text arrives from the system");
+        }
+        return;
+    }
+    if (event->type != SDL_EVENT_KEY_DOWN || text_seen ||
+        !ImGui::GetIO().WantTextInput ||
+        (event->key.mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT | SDL_KMOD_GUI))) {
+        return;
+    }
+
+    SDL_Keycode key = event->key.key;
+    bool shift = event->key.mod & SDL_KMOD_SHIFT;
+    char c = 0;
+
+    if (key >= 'a' && key <= 'z') {
+        c = shift ? (char)(key - 'a' + 'A') : (char)key;
+    } else if (key >= SDLK_KP_1 && key <= SDLK_KP_9) {
+        c = (char)('1' + (key - SDLK_KP_1));
+    } else if (key == SDLK_KP_0) {
+        c = '0';
+    } else if (key == SDLK_KP_PERIOD) {
+        c = '.';
+    } else if (!shift && key >= ' ' && key <= '~') {
+        c = (char)key;
+    } else if (shift && key == ';') {
+        c = ':';
+    }
+    if (c != 0) {
+        if (!fallback_logged) {
+            fallback_logged = true;
+            uwp_log("keyboard: no typed text from the system, text boxes take "
+                    "characters from key presses");
+        }
+        ImGui::GetIO().AddInputCharacter((unsigned int)c);
+    }
+}
+#endif
+
 void xemu_hud_process_sdl_events(SDL_Event *event)
 {
     if (!g_hud_ready) {
@@ -462,6 +515,9 @@ void xemu_hud_process_sdl_events(SDL_Event *event)
         return;
     }
 
+#ifdef XEMU_UWP
+    xemu_uwp_keyboard_text(event);
+#endif
     ImGui_ImplSDL3_ProcessEvent(event);
 }
 
