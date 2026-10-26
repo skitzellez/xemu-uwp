@@ -1891,6 +1891,17 @@ void uwp_prof_register_thread(const char *name)
     ReleaseSRWLockExclusive(&lock);
 }
 
+/* The handle of a registered thread (by name, e.g. "vcpu"), or NULL (hw/xbox/uwp-eipsampler.c). */
+void *xemu_uwp_thread_handle(const char *name)
+{
+    for (int i = 0; i < uwp_prof_num_threads; i++) {
+        if (!strncmp(uwp_prof_threads[i].name, name, strlen(name))) {
+            return uwp_prof_threads[i].handle;
+        }
+    }
+    return NULL;
+}
+
 /*
  * How busy a registered thread (by name, e.g. "vcpu", "pfifo") was since the previous call
  * for that slot, in percent of one core; -1 when there is no such thread. `slot` keeps
@@ -4732,6 +4743,13 @@ static void uwp_log_memory(void)
                 c[UWP_CNT_TB_LOOKUP] - last[UWP_CNT_TB_LOOKUP], c[UWP_CNT_TB_LOOP] - last[UWP_CNT_TB_LOOP], c[UWP_CNT_TB_JC_MISS] - last[UWP_CNT_TB_JC_MISS],
                 c[UWP_CNT_TB_HT_MISS] - last[UWP_CNT_TB_HT_MISS], c[UWP_CNT_JC_FLUSH] - last[UWP_CNT_JC_FLUSH],
                 c[UWP_CNT_JC_PAGE] - last[UWP_CNT_JC_PAGE]);
+        uwp_log("cpu memory tracking: TLB dirty resets %u on the vCPU, %u elsewhere; %u pages protected for "
+                "new code; %u stores by the slow path; %u blocks invalidated",
+                c[UWP_CNT_TLB_RESET_VCPU] - last[UWP_CNT_TLB_RESET_VCPU],
+                c[UWP_CNT_TLB_RESET_OTHER] - last[UWP_CNT_TLB_RESET_OTHER],
+                c[UWP_CNT_PROTECT_CODE] - last[UWP_CNT_PROTECT_CODE],
+                c[UWP_CNT_NOTDIRTY] - last[UWP_CNT_NOTDIRTY],
+                c[UWP_CNT_TB_INVAL] - last[UWP_CNT_TB_INVAL]);
         memcpy(last, c, sizeof(last));
     }
 }

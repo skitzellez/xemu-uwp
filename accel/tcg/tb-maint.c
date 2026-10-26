@@ -19,6 +19,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/xemu-uwp.h"
+#include "qemu/timer.h"
 #include "qemu/interval-tree.h"
 #include "qemu/qtree.h"
 #include "exec/cputlb.h"
@@ -198,6 +199,19 @@ struct PageDesc {
     QemuSpin lock;
     /* list of TBs intersecting this ram page */
     uintptr_t first_tb;
+#ifdef XBOX
+    /* whole-page code wipes in the current second, and whether this page
+     * switched to precise invalidation (see tb_invalidate_phys_page_range__locked) */
+    uint32_t xbox_wipes;
+    int64_t xbox_wipe_second;
+    bool xbox_precise;
+    /* 32-byte blocks of the page that hold translated code (may include
+     * blocks whose code is gone: only ever says "maybe code") */
+    uint64_t xbox_code_bits[2];
+    /* this page's non-code dirty bits are known set (xbox_tb_store_fast);
+     * reset when anyone clears them (xbox_tb_dirty_cleared) */
+    bool xbox_nocode_dirty;
+#endif
 };
 
 void page_table_config_init(void)
@@ -703,11 +717,47 @@ static void tb_remove_all(void)
  * Add the tb in the target page and protect it if necessary.
  * Called with @p->lock held.
  */
+#ifdef XBOX
+/* Marks the bytes of a page that translated block tb (its part n) covers. */
+static void xbox_mark_code(PageDesc *p, TranslationBlock *tb, unsigned int n)
+{
+    tb_page_addr_t start = tb_page_addr0(tb);
+    unsigned int first, last;
+
+    if (n == 0) {
+        first = start & ~TARGET_PAGE_MASK;
+        last = MIN(first + MAX(tb->size, 1) - 1, TARGET_PAGE_SIZE - 1);
+    } else {
+        first = 0;
+        last = (start + MAX(tb->size, 1) - 1) & ~TARGET_PAGE_MASK;
+    }
+    for (unsigned int b = first / 32; b <= last / 32 && b < 128; b++) {
+        qatomic_set(&p->xbox_code_bits[b / 64],
+                    qatomic_read(&p->xbox_code_bits[b / 64]) | (1ull << (b % 64)));
+    }
+}
+
+/* Whether bytes first..last of the page may hold translated code. */
+static bool xbox_code_maybe_in(PageDesc *p, unsigned int first,
+                               unsigned int last)
+{
+    for (unsigned int b = first / 32; b <= last / 32 && b < 128; b++) {
+        if (qatomic_read(&p->xbox_code_bits[b / 64]) & (1ull << (b % 64))) {
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
 static void tb_page_add(PageDesc *p, TranslationBlock *tb, unsigned int n)
 {
     bool page_already_protected;
 
     assert_page_locked(p);
+#ifdef XBOX
+    xbox_mark_code(p, tb, n);
+#endif
 
     tb->page_next[n] = p->first_tb;
     page_already_protected = p->first_tb != 0;
@@ -952,6 +1002,7 @@ static void tb_jmp_cache_inval_tb(TranslationBlock *tb)
  */
 static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
 {
+    xemu_uwp_counters[UWP_CNT_TB_INVAL]++;
     uint32_t h;
     tb_page_addr_t phys_pc;
     uint32_t orig_cflags = tb_cflags(tb);
@@ -1182,8 +1233,8 @@ tb_invalidate_phys_page_range__locked(CPUState *cpu,
      * only when the store comes from code elsewhere, and fall back to the
      * precise overlap test when the current TB lives on the target page.
      */
-    whole_page = true;
-    if (current_tb) {
+    whole_page = !p->xbox_precise;
+    if (whole_page && current_tb) {
         tb_page_addr_t page = start & TARGET_PAGE_MASK;
 
         if ((tb_page_addr0(current_tb) & TARGET_PAGE_MASK) == page ||
@@ -1198,6 +1249,9 @@ tb_invalidate_phys_page_range__locked(CPUState *cpu,
      * We remove all the TBs in the range [start, last].
      * XXX: see if in some cases it could be faster to invalidate all the code
      */
+#ifdef XBOX
+    unsigned int dropped = 0;
+#endif
     PAGE_FOR_EACH_TB(start, last, p, tb, n) {
         tb_page_addr_t tb_start, tb_last;
 
@@ -1224,8 +1278,48 @@ tb_invalidate_phys_page_range__locked(CPUState *cpu,
                 cpu_restore_state_from_tb(cpu, current_tb, retaddr);
             }
             tb_phys_invalidate__locked(tb);
+#ifdef XBOX
+            dropped++;
+#endif
         }
     }
+
+#ifdef XBOX
+    /*
+     * A page whose code is wiped hundreds of times a second holds hot code
+     * next to data the game keeps writing (007 Everything or Nothing: about
+     * 65,000 blocks rebuilt a second, 3 fps in its levels). Wiping the whole
+     * page then costs far more than it saves: such a page goes back to the
+     * precise test, where a store discards only the code it overlaps.
+     */
+    if (whole_page && dropped) {
+        int64_t second = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) / 1000;
+        if (second != p->xbox_wipe_second) {
+            p->xbox_wipe_second = second;
+            p->xbox_wipes = 0;
+        }
+        if (++p->xbox_wipes > 200) {
+            static unsigned int reported;
+            TranslationBlock *code;
+            int part;
+
+            /* from now on stores check this map first (range_fast) */
+            p->xbox_code_bits[0] = p->xbox_code_bits[1] = 0;
+            PAGE_FOR_EACH_TB(0, 0, p, code, part) {
+                xbox_mark_code(p, code, part);
+            }
+            qatomic_set(&p->xbox_precise, true);
+            if (reported < 16) {
+                reported++;
+                fprintf(stderr,
+                        "xemu: code page 0x%" PRIx64 " was wiped %u times in a second "
+                        "(data written next to running code): precise code "
+                        "invalidation for it from now on\n",
+                        (uint64_t)(start & TARGET_PAGE_MASK), p->xbox_wipes);
+            }
+        }
+    }
+#endif
 
     /* if no code remaining, no need to continue to use slow writes */
     if (!p->first_tb) {
@@ -1273,6 +1367,53 @@ void tb_invalidate_phys_range(CPUState *cpu, tb_page_addr_t start,
     page_collection_unlock(pages);
 }
 
+#ifdef XBOX
+/*
+ * For notdirty_write: 0 when the store needs the normal path; 1 when it
+ * lands on a precise page that still holds code and misses that code (no
+ * code to drop, the page stays write-watched) and the caller must set the
+ * other dirty bits; 2 when those bits are already set.
+ */
+int xbox_tb_store_fast(ram_addr_t start, unsigned int len)
+{
+    PageDesc *p = page_find(start >> TARGET_PAGE_BITS);
+    unsigned int first, last;
+
+    if (p == NULL || !qatomic_read(&p->xbox_precise) ||
+        qatomic_read(&p->first_tb) == 0) {
+        return 0;
+    }
+    first = start & ~TARGET_PAGE_MASK;
+    last = MIN(first + len - 1, TARGET_PAGE_SIZE - 1);
+    if (xbox_code_maybe_in(p, first, last)) {
+        return 0;
+    }
+    if (qatomic_read(&p->xbox_nocode_dirty)) {
+        return 2;
+    }
+    qatomic_set(&p->xbox_nocode_dirty, true);
+    return 1;
+}
+
+/* Dirty bits of [start, start + length) were cleared (system/physmem.c). */
+void xbox_tb_dirty_cleared(ram_addr_t start, ram_addr_t length)
+{
+    ram_addr_t index = start >> TARGET_PAGE_BITS;
+    ram_addr_t index_last = (start + length - 1) >> TARGET_PAGE_BITS;
+
+    if (length == 0) {
+        return;
+    }
+    for (; index <= index_last; index++) {
+        PageDesc *p = page_find(index);
+
+        if (p != NULL && qatomic_read(&p->xbox_nocode_dirty)) {
+            qatomic_set(&p->xbox_nocode_dirty, false);
+        }
+    }
+}
+#endif
+
 /*
  * len must be <= 8 and start must be a multiple of len.
  * Called via softmmu_template.h when code areas are written to with
@@ -1283,6 +1424,22 @@ void tb_invalidate_phys_range_fast(CPUState *cpu, ram_addr_t start,
 {
     PageDesc *p = page_find(start >> TARGET_PAGE_BITS);
 
+#ifdef XBOX
+    /*
+     * A busy page with code and data side by side (precise, see
+     * tb_invalidate_phys_page_range__locked): a store that misses every
+     * code block needs no locks or list walk. 007 Everything or Nothing
+     * spent about 70% of its CPU time in that check otherwise.
+     */
+    if (p && qatomic_read(&p->xbox_precise)) {
+        unsigned int first = start & ~TARGET_PAGE_MASK;
+        unsigned int last = MIN(first + len - 1, TARGET_PAGE_SIZE - 1);
+
+        if (!xbox_code_maybe_in(p, first, last)) {
+            return;
+        }
+    }
+#endif
     if (p) {
         ram_addr_t last = start + len - 1;
         struct page_collection *pages = page_collection_lock(start, last);

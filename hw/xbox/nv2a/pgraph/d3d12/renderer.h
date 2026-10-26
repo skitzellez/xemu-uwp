@@ -139,7 +139,10 @@ static inline bool pgraph_d3d12_swizzled_block_origin(
 /* Interpreter tables (b3); the specialised shaders never read it, so it is
  * left unset. */
 #define PGRAPH_D3D12_ROOT_UBER_CONSTANTS (PGRAPH_D3D12_ROOT_VERTEX_START + 1)
-#define PGRAPH_D3D12_ROOT_PARAMETER_COUNT (NV2A_MAX_TEXTURES * 2 + 7)
+/* Vertex pulling table (b4), apart from the draw constants: it changes on
+ * most draws, the 3 KB of shader constants seldom. */
+#define PGRAPH_D3D12_ROOT_VERTEX_FETCH (PGRAPH_D3D12_ROOT_UBER_CONSTANTS + 1)
+#define PGRAPH_D3D12_ROOT_PARAMETER_COUNT (NV2A_MAX_TEXTURES * 2 + 8)
 /* Ranges per texture SRV table, all on its one descriptor: Texture2D in
  * space 0, TextureCube, Texture2DArray and Texture3D in spaces 1-3. */
 #define PGRAPH_D3D12_TEXTURE_SRV_SPACES 4
@@ -765,6 +768,27 @@ typedef struct PGRAPHD3D12State {
     ID3D12PipelineState *draw_pipeline_state;
     PGRAPHD3D12PipelineKey draw_pipeline_key;
     bool draw_pipeline_key_valid;
+    /* What the previous draw's pipeline was chosen from, beyond the guest
+     * state behind state_generation (ensure_draw_pipeline_state reuse). */
+    struct {
+        bool valid;
+        uint32_t generation;
+        uint32_t tune_flags;
+        unsigned int primitive_mode;
+        uint16_t uniform_attrs, swizzle_attrs, compressed_attrs;
+        const void *color_binding, *zeta_binding;
+        DXGI_FORMAT color_format, zeta_format;
+        int num_attributes;
+        uint32_t attribute_bits[NV2A_VERTEXSHADER_ATTRIBUTES];
+        int attribute_location[NV2A_VERTEXSHADER_ATTRIBUTES];
+        struct {
+            const void *binding, *replacement;
+            TextureShape shape;
+            DXGI_FORMAT dxgi_format;
+            unsigned int upload_bytes_per_pixel;
+            bool surface_to_texture;
+        } textures[NV2A_MAX_TEXTURES];
+    } pso_reuse;
     /* draw_pipeline_state is the interpreter pipeline of the key's fallback
      * key, not the key's own. */
     bool draw_pipeline_fallback;
@@ -905,6 +929,11 @@ typedef struct PGRAPHD3D12State {
     size_t draw_constants_cache_size;
     uint64_t draw_constants_cache_offset;
     bool draw_constants_cached;
+    /* pg->vsh_constants_generation when the cache last took them, +1 (0 = never) */
+    uint32_t draw_constants_vsh_generation;
+    uint32_t vertex_fetch_cache[NV2A_VERTEXSHADER_ATTRIBUTES][4];
+    uint64_t vertex_fetch_offset;
+    bool vertex_fetch_cached;
     void *pixel_constants_cache;
     size_t pixel_constants_cache_size;
     uint64_t pixel_constants_cache_offset;
@@ -955,7 +984,21 @@ typedef struct PGRAPHD3D12State {
         uint64_t constant_upload_us;
         uint64_t record_state_us;
         uint64_t vertex_setup_ticks; /* uwp_prof_now ticks */
+        /* the parts of vertex setup for indexed draws (uwp_prof_now ticks),
+         * and how often a draw repeats the previous draw's state */
+        uint64_t vtx_scan_ticks, vtx_bind_ticks, vtx_sync_ticks,
+            vtx_index_ticks;
+        uint32_t vtx_draws, vtx_same, const_same, pso_same, pso_calls,
+            pso_reused;
+        /* draws whose draw constants changed in: inline values, vertex
+         * shader constants, lighting, misc (clip/surface/fog/ff), vertex fetch */
+        uint32_t const_chg[5];
         uint32_t downloads;
+        /* draws merged into the held-back draw before them; held draws */
+        uint32_t merged_draws, merge_holds;
+        /* merge_try refusals by reason (draw.c) */
+        uint32_t merge_fail[14];
+        uint32_t hold_fail[9];
         uint64_t download_bytes;
         uint64_t download_wait_us;
         uint32_t shader_compiles;
@@ -1152,6 +1195,10 @@ typedef struct PGRAPHD3D12State {
     uint16_t vertex_fetch_inline_mask;
     uint64_t vertex_fetch_ring_base;
     uint16_t converted_vertex_attribute_mask;
+    /* vertexFetch[].w of attributes pulled from RAM in a format the input
+     * assembler lacks (3-component bytes and shorts, S32K); 0 for the rest */
+    uint32_t vertex_fetch_raw_bits[NV2A_VERTEXSHADER_ATTRIBUTES];
+    bool raw_fetch_off;         /* tune "rawfmt=off": CPU conversion */
     PGRAPHD3D12MemorySync vertex_ram_buffer_syncs[NV2A_VERTEXSHADER_ATTRIBUTES];
     size_t num_vertex_ram_buffer_syncs;
 
@@ -1363,6 +1410,41 @@ typedef struct PGRAPHD3D12State {
     char evlog_id[32];
     unsigned int evlog_frames_left;
     bool evlog_draws;
+    /* tune "drawstat": a summary of the draws of a few guest frames */
+    bool drawstat;
+    /* Draw merging (tune "merge=off" disables): an indexed triangle draw
+     * whose index list is already in the index ring is held back, so the
+     * following draws that differ only in vertex addresses and indices can
+     * append their (rebased) indices and share its one DrawIndexedInstanced.
+     * Recorded by pgraph_d3d12_merge_emit() before anything else is. */
+    bool merge_off;
+    bool merge_nosync;
+    struct {
+        bool active;
+        uint32_t generation;    /* pg->merge_generation when held */
+        uint64_t submits;       /* command lists closed when held */
+        uint64_t index_offset;  /* in the index ring */
+        uint32_t index_count;
+        uint32_t primitive_mode;
+        uint32_t draws;
+        PGRAPHState *pg;
+        uint16_t attr_mask;     /* attributes read from RAM */
+        uint16_t dma_mask;      /* of those, read through DMA object B */
+        /* guest attribute offsets and strides of the held draw */
+        uint64_t offsets[NV2A_VERTEXSHADER_ATTRIBUTES];
+        uint32_t strides[NV2A_VERTEXSHADER_ATTRIBUTES];
+        /* RAM pages the merged draws read, copied to the GPU once when the
+         * held draw is recorded (page-rounded, coalesced) */
+        PGRAPHD3D12MemorySync syncs[32];
+        unsigned int num_syncs;
+        /* draw_begin's surface update, put off while a merge may follow */
+        bool surface_update_deferred;
+        bool surface_color_write, surface_zeta_write;
+    } merge;
+    uint64_t submits;           /* command lists closed */
+    /* set while a held draw's vertex copies are made: the staging ring grows
+     * instead of submitting the list the held draw belongs to */
+    bool ring_no_submit;
     /* Per-draw hash of the guest vertex bytes read, and the number of
      * mirror ranges the draw uploaded. */
     uint64_t evlog_vtx_hash;
@@ -1779,6 +1861,10 @@ bool pgraph_d3d12_bind_vertex_attributes(NV2AState *d,
                                          unsigned int provoking_element,
                                          Error **errp);
 void pgraph_d3d12_bind_vertex_attributes_inline(NV2AState *d);
+void pgraph_d3d12_merge_emit(PGRAPHD3D12State *r);
+uint32_t pgraph_d3d12_vertex_fetch_raw_bits(const VertexAttribute *attr,
+                                            bool swizzle);
+void pgraph_d3d12_merge_flush(NV2AState *d);
 void pgraph_d3d12_update_provoking_attribute_values(
     NV2AState *d, unsigned int provoking_element, bool inline_data,
     unsigned int inline_stride);

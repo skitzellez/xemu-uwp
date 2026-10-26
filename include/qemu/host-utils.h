@@ -51,6 +51,23 @@ static inline void muls64(uint64_t *plow, uint64_t *phigh,
 }
 
 /* compute with 96 bit intermediate result: (a*b)/c */
+#ifdef XBOX
+/*
+ * The same results without a 128-bit division (a libgcc call on the UWP
+ * build: rdtsc and the timers spent up to 17% of the vCPU in __divti3).
+ * With a = q * c + r: a * b / c = q * b + r * b / c, and r * b < 2^64
+ * because b and c are 32-bit.
+ */
+static inline uint64_t muldiv64(uint64_t a, uint32_t b, uint32_t c)
+{
+    return (a / c) * b + (a % c) * b / c;
+}
+
+static inline uint64_t muldiv64_round_up(uint64_t a, uint32_t b, uint32_t c)
+{
+    return (a / c) * b + ((a % c) * b + c - 1) / c;
+}
+#else
 static inline uint64_t muldiv64(uint64_t a, uint32_t b, uint32_t c)
 {
     return (__int128_t)a * b / c;
@@ -60,6 +77,7 @@ static inline uint64_t muldiv64_round_up(uint64_t a, uint32_t b, uint32_t c)
 {
     return ((__int128_t)a * b + c - 1) / c;
 }
+#endif
 
 static inline uint64_t divu128(uint64_t *plow, uint64_t *phigh,
                                uint64_t divisor)

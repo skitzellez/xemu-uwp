@@ -61,9 +61,19 @@ enum {
     UWP_CNT_JC_FLUSH,        /* whole jump cache emptied */
     UWP_CNT_JC_PAGE,         /* jump cache entries of one page dropped */
     UWP_CNT_TB_LOOP,         /* ... of which from the main loop (a block ended without jumping on) */
+    UWP_CNT_TLB_RESET_VCPU,  /* whole-TLB dirty resets done on the vCPU thread (system/physmem.c) */
+    UWP_CNT_TLB_RESET_OTHER, /* ... on other threads (GPU, audio) */
+    UWP_CNT_PROTECT_CODE,    /* pages write-protected for new code (accel/tcg/cputlb.c) */
+    UWP_CNT_NOTDIRTY,        /* guest stores that took the dirty-tracking slow path */
+    UWP_CNT_TB_INVAL,        /* translated blocks invalidated (accel/tcg/tb-maint.c) */
     UWP_CNT_MAX
 };
 extern unsigned int xemu_uwp_counters[UWP_CNT_MAX];
+#ifdef XBOX
+/* accel/tcg/tb-maint.c: data stores next to code (see notdirty_write) */
+int xbox_tb_store_fast(uint64_t start, unsigned int len);
+void xbox_tb_dirty_cleared(uint64_t start, uint64_t length);
+#endif
 
 /*
  * The host MXCSR value the x87 code last loaded (target/i386/tcg/translate.c gen_flcr), 0 = unknown.

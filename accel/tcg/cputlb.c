@@ -908,6 +908,7 @@ void tlb_flush_page_bits_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
    can be detected */
 void tlb_protect_code(ram_addr_t ram_addr)
 {
+    xemu_uwp_counters[UWP_CNT_PROTECT_CODE]++;
     physical_memory_test_and_clear_dirty(ram_addr & TARGET_PAGE_MASK,
                                              TARGET_PAGE_SIZE,
                                              DIRTY_MEMORY_CODE);
@@ -1515,9 +1516,32 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
 static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
                            CPUTLBEntryFull *full, uintptr_t retaddr)
 {
+    xemu_uwp_counters[UWP_CNT_NOTDIRTY]++;
     ram_addr_t ram_addr = mem_vaddr + full->xlat_section;
 
     trace_memory_notdirty_write_access(mem_vaddr, ram_addr, size);
+
+#ifdef XBOX
+    /*
+     * A store to a busy page that keeps code next to its data (precise
+     * invalidation) and misses that code: the page stays write-watched
+     * for its code, so skip the code-drop path and the clean-page test, and
+     * set the other dirty bits only when someone has cleared them. 007
+     * Everything or Nothing: D3D's globals share a page with D3D code,
+     * 2.2 million stores a second came this way.
+     */
+    {
+        int fast = xbox_tb_store_fast(ram_addr, size);
+
+        if (fast) {
+            if (fast == 1) {
+                physical_memory_set_dirty_range(ram_addr, size,
+                                                DIRTY_CLIENTS_NOCODE);
+            }
+            return;
+        }
+    }
+#endif
 
     if (!physical_memory_get_dirty_flag(ram_addr, DIRTY_MEMORY_CODE)) {
         tb_invalidate_phys_range_fast(cpu, ram_addr, size, retaddr);

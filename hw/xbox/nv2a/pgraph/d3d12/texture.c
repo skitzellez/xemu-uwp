@@ -2531,13 +2531,30 @@ static bool zeta_surface_texture_compatible(
     }
 }
 
+/*
+ * Whether the texture covers the surface's pixels: the same size, or (linear
+ * surfaces only, same pitch) a smaller texture at the surface's address, whose
+ * bytes are then exactly the surface's top-left rectangle. 007 Everything or
+ * Nothing samples a 640x480 texture from its 1280x480 colour surface and a
+ * 256x256 depth texture from its 512x256 depth surface, about 400 times a
+ * frame; each one was a CPU readback with a full GPU wait (2-3 fps).
+ */
+static bool texture_size_fits_surface(const PGRAPHD3D12SurfaceBinding *surface,
+                                      const TextureShape *shape)
+{
+    if (surface->width == shape->width && surface->height == shape->height) {
+        return true;
+    }
+    return !surface->swizzle && surface->pitch == shape->pitch &&
+           shape->width <= surface->width && shape->height <= surface->height;
+}
+
 static bool texture_surface_compatible(
     const PGRAPHD3D12SurfaceBinding *surface, const TextureShape *shape)
 {
     if (surface == NULL ||
         (!surface->swizzle && surface->pitch != shape->pitch) ||
-        surface->width != shape->width ||
-        surface->height != shape->height ||
+        !texture_size_fits_surface(surface, shape) ||
         shape->border ||
         shape->cubemap ||
         shape->dimensionality != 2 ||
@@ -2741,7 +2758,7 @@ static bool surface_texture_gpu_copy_supported(
         shape->cubemap || shape->dimensionality != 2 ||
         texture_mip_levels_for_shape(shape) != 1 ||
         info->converted || info->compressed ||
-        surface->width != shape->width || surface->height != shape->height) {
+        !texture_size_fits_surface(surface, shape)) {
         return false;
     }
 
@@ -2832,8 +2849,8 @@ static void report_surface_texture_gpu_copy(
 static bool copy_surface_to_texture_resource(
     NV2AState *d, unsigned int stage, PGRAPHD3D12TextureBinding *binding,
     PGRAPHD3D12SurfaceBinding *surface, unsigned int subresource,
-    unsigned int src_x, unsigned int src_y, unsigned int src_size,
-    Error **errp)
+    unsigned int src_x, unsigned int src_y, unsigned int src_w,
+    unsigned int src_h, Error **errp)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHD3D12State *r = pg->d3d12_renderer_state;
@@ -2895,16 +2912,16 @@ static bool copy_surface_to_texture_resource(
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.SubresourceIndex = 0;
 
-    if (src_size != 0 &&
-        (src_x != 0 || src_y != 0 || src_size != surface->width ||
-         src_size != surface->height)) {
+    if (src_w != 0 &&
+        (src_x != 0 || src_y != 0 || src_w != surface->width ||
+         src_h != surface->height)) {
         unsigned int scale = MAX(pg->surface_scale_factor, 1);
         D3D12_BOX box = {
             .left = src_x * scale,
             .top = src_y * scale,
             .front = 0,
-            .right = (src_x + src_size) * scale,
-            .bottom = (src_y + src_size) * scale,
+            .right = (src_x + src_w) * scale,
+            .bottom = (src_y + src_h) * scale,
             .back = 1,
         };
 
@@ -4134,13 +4151,13 @@ static bool bind_texture_stage(NV2AState *d, unsigned int stage, Error **errp)
 
                 texture_level_dimensions(&shape, i % mip_levels, &level_w,
                                          &level_h, &level_d);
+                bool part = level_surface_count > 1 ||
+                            level_surfaces[i]->width != level_w ||
+                            level_surfaces[i]->height != level_h;
                 if (!copy_surface_to_texture_resource(
                         d, stage, binding, level_surfaces[i], i,
-                        level_x[i], level_y[i],
-                        level_surface_count > 1 ||
-                                level_surfaces[i]->width != level_w ?
-                            level_w : 0,
-                        errp)) {
+                        level_x[i], level_y[i], part ? level_w : 0,
+                        part ? level_h : 0, errp)) {
                     report_texture_shape_skip(
                         d, stage, TEXTURE_SKIP_UPLOAD, &shape, vram_addr,
                         length,

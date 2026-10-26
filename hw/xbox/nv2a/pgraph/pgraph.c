@@ -178,6 +178,8 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     PGRAPHState *pg = &d->pgraph;
 
     nv2a_reg_log_write(NV_PGRAPH, addr, size, val);
+    pg->state_generation++;
+    pg->merge_generation++;
 
 #ifdef XEMU_UWP
     /* The handler's writes without pg->lock too (see pgraph_read); pfifo.lock still orders them with
@@ -1073,6 +1075,19 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
         assert(graphics_class != 0x97);
     }
 
+    /* Vertex addresses, indices and begin/end keep a held-back draw open for
+     * merging; anything else records it first (see merge_generation). */
+    if (!(graphics_class == NV_KELVIN_PRIMITIVE &&
+          (method == NV097_ARRAY_ELEMENT16 || method == NV097_ARRAY_ELEMENT32 ||
+           method == NV097_SET_BEGIN_END ||
+           (method >= NV097_SET_VERTEX_DATA_ARRAY_OFFSET &&
+            method < NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x40)))) {
+        pg->merge_generation++;
+        if (pg->merge_pending) {
+            pg->merge_flush(d);
+        }
+    }
+
     /* ugly switch for now */
     switch (graphics_class) {
     case NV_BETA: {
@@ -1181,6 +1196,16 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
             pgraph_kelvin_methods[METHOD_ADDR_TO_INDEX(method)].handler;
         if (handler == NULL) {
             goto unhandled;
+        }
+        /* Pure data: indices, vertices, shader constants, begin/end. All
+         * else may change drawing state (see state_generation). */
+        if (!(method == NV097_ARRAY_ELEMENT16 || method == NV097_ARRAY_ELEMENT32 ||
+              method == NV097_DRAW_ARRAYS || method == NV097_INLINE_ARRAY ||
+              method == NV097_SET_BEGIN_END ||
+              method == NV097_SET_TRANSFORM_CONSTANT_LOAD ||
+              (method >= NV097_SET_TRANSFORM_CONSTANT &&
+               method < NV097_SET_TRANSFORM_CONSTANT + 0x80))) {
+            pg->state_generation++;
         }
         size_t num_words_consumed = 1;
         handler(d, pg, subchannel, method, parameter, parameters,
@@ -2158,6 +2183,7 @@ DEF_METHOD_INC(NV097, SET_PROJECTION_MATRIX)
     // pg->projection_matrix[slot] = *(float*)&parameter;
     unsigned int row = NV_IGRAPH_XF_XFCTX_PMAT0 + slot/4;
     pg->vsh_constants[row][slot%4] = parameter;
+    pg->vsh_constants_generation++;
     pg->vsh_constants_dirty[row] = true;
 }
 
@@ -2168,6 +2194,7 @@ DEF_METHOD_INC(NV097, SET_MODEL_VIEW_MATRIX)
     unsigned int entry = slot % 16;
     unsigned int row = NV_IGRAPH_XF_XFCTX_MMAT0 + matnum*8 + entry/4;
     pg->vsh_constants[row][entry % 4] = parameter;
+    pg->vsh_constants_generation++;
     pg->vsh_constants_dirty[row] = true;
 }
 
@@ -2178,6 +2205,7 @@ DEF_METHOD_INC(NV097, SET_INVERSE_MODEL_VIEW_MATRIX)
     unsigned int entry = slot % 16;
     unsigned int row = NV_IGRAPH_XF_XFCTX_IMMAT0 + matnum*8 + entry/4;
     pg->vsh_constants[row][entry % 4] = parameter;
+    pg->vsh_constants_generation++;
     pg->vsh_constants_dirty[row] = true;
 }
 
@@ -2186,6 +2214,7 @@ DEF_METHOD_INC(NV097, SET_COMPOSITE_MATRIX)
     int slot = (method - NV097_SET_COMPOSITE_MATRIX) / 4;
     unsigned int row = NV_IGRAPH_XF_XFCTX_CMAT0 + slot/4;
     pg->vsh_constants[row][slot%4] = parameter;
+    pg->vsh_constants_generation++;
     pg->vsh_constants_dirty[row] = true;
 }
 
@@ -2196,6 +2225,7 @@ DEF_METHOD_INC(NV097, SET_TEXTURE_MATRIX)
     unsigned int entry = slot % 16;
     unsigned int row = NV_IGRAPH_XF_XFCTX_T0MAT + tex*8 + entry/4;
     pg->vsh_constants[row][entry%4] = parameter;
+    pg->vsh_constants_generation++;
     pg->vsh_constants_dirty[row] = true;
 }
 
@@ -2220,6 +2250,7 @@ DEF_METHOD_INC(NV097, SET_TEXGEN_PLANE_S)
     unsigned int entry = slot % 16;
     unsigned int row = NV_IGRAPH_XF_XFCTX_TG0MAT + tex*8 + entry/4;
     pg->vsh_constants[row][entry%4] = parameter;
+    pg->vsh_constants_generation++;
     pg->vsh_constants_dirty[row] = true;
 }
 
@@ -2233,6 +2264,7 @@ DEF_METHOD_INC(NV097, SET_FOG_PLANE)
 {
     int slot = (method - NV097_SET_FOG_PLANE) / 4;
     pg->vsh_constants[NV_IGRAPH_XF_XFCTX_FOG][slot] = parameter;
+    pg->vsh_constants_generation++;
     pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_FOG] = true;
 }
 
@@ -2355,6 +2387,7 @@ DEF_METHOD_INC(NV097, SET_VIEWPORT_OFFSET)
 {
     int slot = (method - NV097_SET_VIEWPORT_OFFSET) / 4;
     pg->vsh_constants[NV_IGRAPH_XF_XFCTX_VPOFF][slot] = parameter;
+    pg->vsh_constants_generation++;
     pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_VPOFF] = true;
 }
 
@@ -2368,6 +2401,7 @@ DEF_METHOD_INC(NV097, SET_EYE_POSITION)
 {
     int slot = (method - NV097_SET_EYE_POSITION) / 4;
     pg->vsh_constants[NV_IGRAPH_XF_XFCTX_EYEP][slot] = parameter;
+    pg->vsh_constants_generation++;
     pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_EYEP] = true;
 }
 
@@ -2405,6 +2439,7 @@ DEF_METHOD_INC(NV097, SET_VIEWPORT_SCALE)
 {
     int slot = (method - NV097_SET_VIEWPORT_SCALE) / 4;
     pg->vsh_constants[NV_IGRAPH_XF_XFCTX_VPSCL][slot] = parameter;
+    pg->vsh_constants_generation++;
     pg->vsh_constants_dirty[NV_IGRAPH_XF_XFCTX_VPSCL] = true;
 }
 
@@ -2436,6 +2471,7 @@ DEF_METHOD_INC(NV097, SET_TRANSFORM_CONSTANT)
     pg->vsh_constants_dirty[const_load] |=
         (parameter != pg->vsh_constants[const_load][slot%4]);
     pg->vsh_constants[const_load][slot%4] = parameter;
+    pg->vsh_constants_generation++;
 
     if (slot % 4 == 3) {
         PG_SET_MASK(NV_PGRAPH_CHEOPS_OFFSET,

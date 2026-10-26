@@ -808,6 +808,10 @@ static void pgraph_d3d12_read_tune_file(PGRAPHD3D12State *r)
         flags = pgraph_d3d12_tune_text_flags(text);
         g_nv2a_stats.show_frame_number = tune_word(text, "framenum");
         r->evlog_draws = tune_word(text, "evdraw");
+        r->drawstat = tune_word(text, "drawstat");
+        r->merge_off = tune_word(text, "merge=off");
+        r->merge_nosync = tune_word(text, "mergesync=perdraw");
+        r->raw_fetch_off = tune_word(text, "rawfmt=off");
         /* A checkpoint origin implies the checkpoints. */
         r->cpk_enabled = tune_word(text, "cpk") ||
                          tune_value(text, "cpkxy=") != NULL;
@@ -1339,6 +1343,24 @@ static void pgraph_d3d12_perf_report(NV2AState *d)
         full_flush_mark = full_flushes;
     }
     pgraph_d3d12_report_surface_churn();
+    {
+        /* Where vertex setup goes for indexed draws, and how often a draw
+         * repeats the previous draw's binding / constants / pipeline. */
+        double us = uwp_prof_tick_hz() / 1e6;
+        unsigned int draws = MAX(r->perf.vtx_draws, 1);
+        unsigned int calls = MAX(r->perf.pso_calls, 1);
+        xbox_diag_printf(
+            "Direct3D 12 perf detail: per indexed draw us: scan=%.2f bind=%.2f "
+            "sync=%.2f index=%.2f | same as previous draw: vertex binding %u%%, "
+            "constants %u%%, pipeline %u%% (%u draws), reused without a key %u | constants changed in: inline %u%% vsh %u%% light %u%% misc %u%% fetch %u%% | merged %u into %u held, not merged: %u %u %u %u %u %u %u %u %u %u %u %u %u %u, not held: %u %u %u %u %u %u %u %u %u\n",
+            r->perf.vtx_scan_ticks / us / draws, r->perf.vtx_bind_ticks / us / draws,
+            r->perf.vtx_sync_ticks / us / draws, r->perf.vtx_index_ticks / us / draws,
+            r->perf.vtx_same * 100 / draws, r->perf.const_same * 100 / calls,
+            r->perf.pso_same * 100 / calls, r->perf.vtx_draws, r->perf.pso_reused,
+            r->perf.const_chg[0] * 100 / draws, r->perf.const_chg[1] * 100 / draws,
+            r->perf.const_chg[2] * 100 / draws, r->perf.const_chg[3] * 100 / draws,
+            r->perf.const_chg[4] * 100 / draws, r->perf.merged_draws, r->perf.merge_holds, r->perf.merge_fail[0], r->perf.merge_fail[1], r->perf.merge_fail[2], r->perf.merge_fail[3], r->perf.merge_fail[4], r->perf.merge_fail[5], r->perf.merge_fail[6], r->perf.merge_fail[7], r->perf.merge_fail[8], r->perf.merge_fail[9], r->perf.merge_fail[10], r->perf.merge_fail[11], r->perf.merge_fail[12], r->perf.merge_fail[13], r->perf.hold_fail[0], r->perf.hold_fail[1], r->perf.hold_fail[2], r->perf.hold_fail[3], r->perf.hold_fail[4], r->perf.hold_fail[5], r->perf.hold_fail[6], r->perf.hold_fail[7], r->perf.hold_fail[8]);
+    }
     memset(&r->perf, 0, sizeof(r->perf));
     pgraph_d3d12_read_tune_file(r);
     r->perf.last_report_us = now;
@@ -1918,6 +1940,7 @@ static void pgraph_d3d12_process_pending(NV2AState *d)
         pgraph_d3d12_shader_cache_pending(&d->pgraph)) {
         qemu_mutex_unlock(&d->pfifo.lock);
         qemu_mutex_lock(&d->pgraph.lock);
+        pgraph_d3d12_merge_flush(d);
         if (pgraph_d3d12_shader_cache_pending(&d->pgraph)) {
             pgraph_d3d12_shader_cache_process(&d->pgraph);
         }
@@ -2279,6 +2302,7 @@ static void pgraph_d3d12_flip_stall(NV2AState *d)
  */
 static void pgraph_d3d12_pre_savevm_trigger(NV2AState *d)
 {
+    pgraph_d3d12_merge_flush(d);
     /* Stashed and dirty images belong in the saved guest memory; the
      * surfaces stay resident at their current scale. */
     pgraph_d3d12_download_dirty_surfaces(d);
@@ -2293,6 +2317,7 @@ static void pgraph_d3d12_pre_savevm_wait(NV2AState *d)
 
 static void pgraph_d3d12_pre_shutdown_trigger(NV2AState *d)
 {
+    pgraph_d3d12_merge_flush(d);
     pgraph_d3d12_surface_flush(d);
     pgraph_d3d12_finish(&d->pgraph);
     pgraph_d3d12_flush_reports(d);
@@ -3699,6 +3724,8 @@ static void pgraph_d3d12_init(NV2AState *d, Error **errp)
 
     pg->d3d12_renderer_state = g_malloc0(sizeof(*pg->d3d12_renderer_state));
     pg->d3d12_renderer_state->pg = pg;
+    pg->merge_flush = pgraph_d3d12_merge_flush;
+    pg->merge_pending = false;
     pg->d3d12_renderer_state->tune_report_wait_head = true;
     /* PSO variant bits apply from the first draw, so the title's pipeline
      * list precompiles in the same form, and twintest measures that

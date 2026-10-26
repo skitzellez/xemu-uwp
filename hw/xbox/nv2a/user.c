@@ -61,7 +61,33 @@ uint64_t user_read(void *opaque, hwaddr addr, unsigned int size)
         }
     } else {
         /* PIO Mode */
+#ifdef XEMU_UWP
+        /* LOTR Fellowship read here while the channel was briefly out of DMA
+         * mode (5:47 into play) and xemu closed: answer with the same
+         * registers instead. */
+        static bool reported;
+        if (!reported) {
+            reported = true;
+            fprintf(stderr, "xemu: NV_USER read 0x%x with channel %u not in "
+                    "DMA mode (modes 0x%x): answered from the DMA registers\n",
+                    (unsigned)(addr & 0xFFFF), channel_id, channel_modes);
+        }
+        switch (addr & 0xFFFF) {
+        case NV_USER_DMA_PUT:
+            r = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT];
+            break;
+        case NV_USER_DMA_GET:
+            r = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
+            break;
+        case NV_USER_REF:
+            r = d->pfifo.regs[NV_PFIFO_CACHE1_REF];
+            break;
+        default:
+            break;
+        }
+#else
         assert(!"Failed to enter DMA mode - entered PIO mode");
+#endif
     }
 
     qemu_mutex_unlock(&d->pfifo.lock);
@@ -113,7 +139,31 @@ void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         }
     } else {
         /* PIO Mode */
+#ifdef XEMU_UWP
+        /* kept, but the pusher is not woken: it runs DMA channels only */
+        static bool reported;
+        if (!reported) {
+            reported = true;
+            fprintf(stderr, "xemu: NV_USER write 0x%x with channel %u not in "
+                    "DMA mode (modes 0x%x): kept, FIFO not woken\n",
+                    (unsigned)(addr & 0xFFFF), channel_id, channel_modes);
+        }
+        switch (addr & 0xFFFF) {
+        case NV_USER_DMA_PUT:
+            d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] = val;
+            break;
+        case NV_USER_DMA_GET:
+            d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET] = val;
+            break;
+        case NV_USER_REF:
+            d->pfifo.regs[NV_PFIFO_CACHE1_REF] = val;
+            break;
+        default:
+            break;
+        }
+#else
         assert(!"Failed to enter DMA mode - entered PIO mode");
+#endif
     }
 
     qemu_mutex_unlock(&d->pfifo.lock);

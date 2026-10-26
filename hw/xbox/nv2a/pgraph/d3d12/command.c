@@ -314,6 +314,10 @@ static bool close_and_execute_commands(PGRAPHD3D12State *r, HRESULT *hrp)
         return true;
     }
 
+    /* a held-back draw belongs to this list */
+    pgraph_d3d12_merge_emit(r);
+    r->submits++;
+
     if (r->gpu_timer_slot >= 0) {
         unsigned int slot = (unsigned int)r->gpu_timer_slot;
 
@@ -349,6 +353,7 @@ static bool close_and_execute_commands(PGRAPHD3D12State *r, HRESULT *hrp)
     r->command_list_open = false;
     r->vertex_ram_copies_in_list = false;
     r->draw_constants_cached = false;
+    r->vertex_fetch_cached = false;
     r->pixel_constants_cached = false;
     r->uber_constants_cached = false;
     r->perf.submits++;

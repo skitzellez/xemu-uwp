@@ -460,6 +460,7 @@ bool pgraph_d3d12_bind_vertex_attributes(NV2AState *d,
         const uint8_t *last_entry;
 
         r->vertex_attribute_to_description_location[i] = -1;
+        r->vertex_fetch_raw_bits[i] = 0;
 
         if (!attr->count) {
             pg->uniform_attrs |= 1 << i;
@@ -477,6 +478,16 @@ bool pgraph_d3d12_bind_vertex_attributes(NV2AState *d,
                        min_element, max_element,
                        attr->dma_select ? 'B' : 'A', (hwaddr)attr->offset);
             return false;
+        }
+
+        /* The run-time decode reads these formats from RAM itself: no
+         * per-draw conversion and upload (and the draw can merge). */
+        if (needs_cpu_expansion && !inline_data && attr->stride &&
+            pgraph_d3d12_vertex_pulling() && !r->raw_fetch_off &&
+            !(r->tune_flags & PGRAPH_D3D12_TUNE_VTXFMT_STATIC)) {
+            r->vertex_fetch_raw_bits[i] =
+                pgraph_d3d12_vertex_fetch_raw_bits(attr, d3d_swizzle);
+            needs_cpu_expansion = r->vertex_fetch_raw_bits[i] == 0;
         }
 
         if (inline_data) {

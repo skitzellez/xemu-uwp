@@ -2632,6 +2632,7 @@ typedef enum VertexFetchKind {
     VERTEX_FETCH_KIND_SNORM16,
     VERTEX_FETCH_KIND_CMP,      /* 11:11:10 */
     VERTEX_FETCH_KIND_SINT,
+    VERTEX_FETCH_KIND_SSCALED16, /* S32K: signed shorts as their values */
 } VertexFetchKind;
 
 /* The key-only check lets PSO workers decide from the key alone. */
@@ -2800,6 +2801,12 @@ static void append_vertex_fetch_dynamic_helpers(GString *source)
         "        case %u:\n"
         "            r = (float4)int4(asint(w.x), 0, 0, 1);\n"
         "            break;\n"
+        "        case %u:\n"
+        "            r = float4((float)(asint(w.x << 16u) >> 16),\n"
+        "                       (float)(asint(w.x) >> 16),\n"
+        "                       (float)(asint(w.y << 16u) >> 16),\n"
+        "                       (float)(asint(w.y) >> 16));\n"
+        "            break;\n"
         "        default:\n"
         "            break;\n"
         "        }\n"
@@ -2823,7 +2830,49 @@ static void append_vertex_fetch_dynamic_helpers(GString *source)
         VERTEX_FETCH_ALIGNED,
         VERTEX_FETCH_KIND_FLOAT, VERTEX_FETCH_KIND_UNORM8,
         VERTEX_FETCH_KIND_SNORM16, VERTEX_FETCH_KIND_CMP,
-        VERTEX_FETCH_KIND_SINT, VERTEX_FETCH_SWIZZLE);
+        VERTEX_FETCH_KIND_SINT, VERTEX_FETCH_KIND_SSCALED16,
+        VERTEX_FETCH_SWIZZLE);
+}
+
+/*
+ * vertexFetch[].w for attributes the run-time decode reads straight from
+ * RAM although the input assembler has no format for them; the values match
+ * the CPU conversion they replace (a missing 4th component reads 1.0, S32K
+ * shorts become floats of the same value).
+ */
+uint32_t pgraph_d3d12_vertex_fetch_raw_bits(const VertexAttribute *attr,
+                                            bool swizzle)
+{
+    VertexFetchKind kind;
+    unsigned int count = attr->count;
+    unsigned int dwords;
+
+    if (count < 1 || count > 4) {
+        return 0;
+    }
+    switch (attr->format) {
+    case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D:
+    case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_OGL:
+        kind = VERTEX_FETCH_KIND_UNORM8;
+        dwords = 1;
+        break;
+    case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S1:
+        kind = VERTEX_FETCH_KIND_SNORM16;
+        dwords = (count + 1) / 2;
+        swizzle = false;
+        break;
+    case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S32K:
+        kind = VERTEX_FETCH_KIND_SSCALED16;
+        dwords = (count + 1) / 2;
+        swizzle = false;
+        break;
+    default:
+        return 0;
+    }
+    return ((dwords - 1) << VERTEX_FETCH_DWORDS_SHIFT) |
+           ((uint32_t)kind << VERTEX_FETCH_KIND_SHIFT) |
+           ((count - 1) << VERTEX_FETCH_COUNT_SHIFT) |
+           (swizzle ? VERTEX_FETCH_SWIZZLE : 0);
 }
 
 static void append_vertex_fetch_component_loads(GString *source,
@@ -3355,8 +3404,15 @@ static const char vertex_draw_constants_hlsl[] =
         "    float4 lightLocalPosition[8];\n"
         "    float4 lightLocalAttenuation[8];\n"
         "    float4 fixedFunctionInfo;\n"
+#ifdef XEMU_UWP
+        "};\n"
+        "cbuffer VertexFetchConstants : register(b4) {\n"
         "    uint4 vertexFetch[16];\n"
         "};\n"
+#else
+        "    uint4 vertexFetch[16];\n"
+        "};\n"
+#endif
         "\n";
 
 static char *build_minimal_vertex_shader(
@@ -11665,7 +11721,11 @@ static void fill_draw_root_signature_desc(DrawRootSignatureDesc *rs,
     p->ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     p->Descriptor.ShaderRegister = 3;
     p->ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    QEMU_BUILD_BUG_ON(PGRAPH_D3D12_ROOT_UBER_CONSTANTS + 1 !=
+    p = &rs->parameters[PGRAPH_D3D12_ROOT_VERTEX_FETCH];
+    p->ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    p->Descriptor.ShaderRegister = 4;
+    p->ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    QEMU_BUILD_BUG_ON(PGRAPH_D3D12_ROOT_VERTEX_FETCH + 1 !=
                       PGRAPH_D3D12_ROOT_PARAMETER_COUNT);
 
     rs->desc.NumParameters = ARRAY_SIZE(rs->parameters);
@@ -13131,8 +13191,85 @@ static bool use_fallback_pipeline(PGRAPHD3D12State *r,
     return true;
 }
 
+typedef __typeof__(((PGRAPHD3D12State *)0)->pso_reuse) PSOReuseSnapshot;
+
+/* What a pipeline choice depends on besides guest state (see pso_reuse). */
+static void capture_pso_reuse(PGRAPHState *pg, PSOReuseSnapshot *s)
+{
+    PGRAPHD3D12State *r = pg->d3d12_renderer_state;
+    int n = r->num_active_vertex_attribute_descriptions;
+
+    memset(s, 0, sizeof(*s));
+    s->valid = true;
+    s->generation = pg->state_generation;
+    s->tune_flags = r->tune_flags;
+    s->primitive_mode = pg->primitive_mode;
+    s->uniform_attrs = pg->uniform_attrs;
+    s->swizzle_attrs = pg->swizzle_attrs;
+    s->compressed_attrs = pg->compressed_attrs;
+    s->color_binding = r->color_binding;
+    s->zeta_binding = r->zeta_binding;
+    s->color_format = r->color_binding ? r->color_binding->fmt.dxgi_format :
+                                         DXGI_FORMAT_UNKNOWN;
+    s->zeta_format = r->zeta_binding ? r->zeta_binding->fmt.dxgi_format :
+                                       DXGI_FORMAT_UNKNOWN;
+    s->num_attributes = n;
+    for (int i = 0; i >= 0 && i < n && i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
+        s->attribute_bits[i] =
+            r->vertex_attribute_descriptions[i].SemanticIndex |
+            ((uint32_t)r->vertex_attribute_descriptions[i].Format << 8);
+    }
+    memcpy(s->attribute_location, r->vertex_attribute_to_description_location,
+           sizeof(s->attribute_location));
+    for (unsigned int i = 0; i < NV2A_MAX_TEXTURES; i++) {
+        const PGRAPHD3D12TextureBinding *t = r->texture_binding[i];
+
+        if (t != NULL) {
+            s->textures[i].binding = t;
+            s->textures[i].replacement = t->replacement;
+            memcpy(&s->textures[i].shape, &t->shape, sizeof(t->shape));
+            s->textures[i].dxgi_format = t->dxgi_format;
+            s->textures[i].upload_bytes_per_pixel = t->upload_bytes_per_pixel;
+            s->textures[i].surface_to_texture = t->surface_to_texture;
+        }
+    }
+}
+
+static bool ensure_draw_pipeline_state_full(PGRAPHState *pg, bool *pending,
+                                            Error **errp);
+
+/*
+ * Most draws use the pipeline of the draw before (98% in 007 Everything or
+ * Nothing, 24,000 draws a frame), yet building and comparing the full key
+ * cost about 0.45 us each. When no state-changing method or register write
+ * came since (state_generation) and the bindings the key reads are the same,
+ * the previous choice stands.
+ */
 static bool ensure_draw_pipeline_state(PGRAPHState *pg, bool *pending,
                                        Error **errp)
+{
+    PGRAPHD3D12State *r = pg->d3d12_renderer_state;
+    PSOReuseSnapshot now;
+    bool ok;
+
+    capture_pso_reuse(pg, &now);
+    if (r->pso_reuse.valid && r->draw_pipeline_state != NULL &&
+        r->draw_pipeline_key_valid && !r->draw_pipeline_fallback &&
+        memcmp(&now, &r->pso_reuse, sizeof(now)) == 0) {
+        r->perf.pso_reused++;
+        return true;
+    }
+    r->pso_reuse.valid = false;
+    ok = ensure_draw_pipeline_state_full(pg, pending, errp);
+    if (ok && !*pending && r->draw_pipeline_state != NULL &&
+        r->draw_pipeline_key_valid && !r->draw_pipeline_fallback) {
+        r->pso_reuse = now;
+    }
+    return ok;
+}
+
+static bool ensure_draw_pipeline_state_full(PGRAPHState *pg, bool *pending,
+                                            Error **errp)
 {
     PGRAPHD3D12State *r = pg->d3d12_renderer_state;
     PGRAPHD3D12PipelineKey key;
@@ -13154,8 +13291,10 @@ static bool ensure_draw_pipeline_state(PGRAPHState *pg, bool *pending,
     }
 
     mode = pgraph_d3d12_fallback_mode(r->tune_flags);
+    r->perf.pso_calls++;
     if (r->draw_pipeline_state != NULL && r->draw_pipeline_key_valid &&
         memcmp(&r->draw_pipeline_key, &key, sizeof(key)) == 0) {
+        r->perf.pso_same++;
         if (!r->draw_pipeline_fallback ||
             mode == PGRAPH_D3D12_FALLBACK_DEBUG) {
             return true;
@@ -13907,7 +14046,17 @@ static bool upload_draw_constants(PGRAPHState *pg, uint64_t *offset,
             changed |= draw_constants_put(c->inline_value[i], src, sizeof(c->inline_value[i]));
         }
     }
-    changed |= draw_constants_put(c->vsh_constants, pg->vsh_constants, sizeof(c->vsh_constants));
+    bool chg_inline = changed;
+    /* 3 KB compared on every draw cost ~4% of the GPU thread; nothing wrote
+     * them since the cache took them = unchanged */
+    bool chg_vsh = false;
+    if (r->draw_constants_vsh_generation != pg->vsh_constants_generation + 1) {
+        chg_vsh = draw_constants_put(c->vsh_constants, pg->vsh_constants, sizeof(c->vsh_constants));
+        r->draw_constants_vsh_generation = pg->vsh_constants_generation + 1;
+    }
+    changed |= chg_vsh;
+    bool before_light = changed;
+    changed = false;
     changed |= draw_constants_put(c->ltctxa, pg->ltctxa, sizeof(pg->ltctxa));
     changed |= draw_constants_put(c->ltctxb, pg->ltctxb, sizeof(pg->ltctxb));
     changed |= draw_constants_put(c->ltc1, pg->ltc1, sizeof(pg->ltc1));
@@ -13922,6 +14071,8 @@ static bool upload_draw_constants(PGRAPHState *pg, uint64_t *offset,
         changed |= draw_constants_put(c->light_local_attenuation[i], pg->light_local_attenuation[i],
                                       sizeof(pg->light_local_attenuation[i]));
     }
+    bool chg_light = changed;
+    changed = false;
     {
         float clip_range[4] = { 0 };
         float surface_info[4];
@@ -13970,10 +14121,12 @@ static bool upload_draw_constants(PGRAPHState *pg, uint64_t *offset,
                 }
                 /* The same sources as the pipeline key format fields; set
                  * in every mode, the static decode only tests the aligned bit. */
-                format_bits = vertex_fetch_format_bits(
-                    r->vertex_attribute_descriptions[loc].Format,
-                    pg->compressed_attrs & (1u << i),
-                    pg->swizzle_attrs & (1u << i));
+                format_bits = r->vertex_fetch_raw_bits[i] ?
+                    r->vertex_fetch_raw_bits[i] :
+                    vertex_fetch_format_bits(
+                        r->vertex_attribute_descriptions[loc].Format,
+                        pg->compressed_attrs & (1u << i),
+                        pg->swizzle_attrs & (1u << i));
                 if (converted) {
                     base = r->vertex_attribute_offsets[i];
                     vertex_fetch[i][0] = 1;
@@ -13993,10 +14146,35 @@ static bool upload_draw_constants(PGRAPHState *pg, uint64_t *offset,
                     format_bits;
             }
         }
-        changed |= draw_constants_put(c->vertex_fetch, vertex_fetch, sizeof(vertex_fetch));
+        bool chg_misc = changed;
+        /* its own small buffer (b4): changes on most draws */
+        bool chg_fetch = !r->vertex_fetch_cached ||
+                         memcmp(r->vertex_fetch_cache, vertex_fetch, sizeof(vertex_fetch)) != 0;
+        if (chg_fetch) {
+            const void *fetch_chunks[] = { vertex_fetch };
+            const uint64_t fetch_sizes[] = { sizeof(vertex_fetch) };
+
+            r->vertex_fetch_cached = false;
+            if (!pgraph_d3d12_update_uniform_buffer(
+                    pg, fetch_chunks, fetch_sizes, 1,
+                    PGRAPH_D3D12_DRAW_CONSTANTS_ALIGNMENT,
+                    &r->vertex_fetch_offset, errp)) {
+                error_prepend(errp, "Direct3D 12 vertex fetch constants upload failed: ");
+                return false;
+            }
+            memcpy(r->vertex_fetch_cache, vertex_fetch, sizeof(vertex_fetch));
+            r->vertex_fetch_cached = true;
+        }
+        changed = chg_misc || chg_light || before_light;
+        r->perf.const_chg[0] += chg_inline;
+        r->perf.const_chg[1] += chg_vsh;
+        r->perf.const_chg[2] += chg_light;
+        r->perf.const_chg[3] += chg_misc;
+        r->perf.const_chg[4] += chg_fetch;
     }
 
     if (r->draw_constants_cached && !changed) {
+        r->perf.const_same++;
         *offset = r->draw_constants_cache_offset;
         return true;
     }
@@ -14102,10 +14280,12 @@ static bool upload_draw_constants(PGRAPHState *pg, uint64_t *offset,
             }
             /* The same sources as the pipeline key's format fields; set
              * in every mode, the static decode only tests the aligned bit. */
-            format_bits = vertex_fetch_format_bits(
-                r->vertex_attribute_descriptions[loc].Format,
-                pg->compressed_attrs & (1u << i),
-                pg->swizzle_attrs & (1u << i));
+            format_bits = r->vertex_fetch_raw_bits[i] ?
+                r->vertex_fetch_raw_bits[i] :
+                vertex_fetch_format_bits(
+                    r->vertex_attribute_descriptions[loc].Format,
+                    pg->compressed_attrs & (1u << i),
+                    pg->swizzle_attrs & (1u << i));
             if (converted) {
                 base = r->vertex_attribute_offsets[i];
                 constants.vertex_fetch[i][0] = 1;
@@ -15151,6 +15331,12 @@ bool pgraph_d3d12_begin_draw_commands(PGRAPHState *pg, bool *pending,
     }
     pgraph_d3d12_record_texture_bindings(pg);
     record_draw_constants(pg, draw_constants_offset);
+#ifdef XEMU_UWP
+    r->command_list->lpVtbl->SetGraphicsRootConstantBufferView(
+        r->command_list, PGRAPH_D3D12_ROOT_VERTEX_FETCH,
+        r->uniform_upload_buffer.resource->lpVtbl->GetGPUVirtualAddress(
+            r->uniform_upload_buffer.resource) + r->vertex_fetch_offset);
+#endif
     record_pixel_constants(pg, pixel_constants_offset);
     if (uber_ps) {
         r->command_list->lpVtbl->SetGraphicsRootConstantBufferView(

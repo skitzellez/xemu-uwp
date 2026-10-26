@@ -1004,7 +1004,7 @@ static void uwp_loop_note(TranslationBlock *tb, vaddr pc, bool nolast)
             break;
         }
     }
-    if (total % 1000000 == 0) {
+    if (total % 100000 == 0) {
         GString *g = g_string_new(NULL);
         for (int shown = 0; shown < 8; shown++) {
             int top = -1;

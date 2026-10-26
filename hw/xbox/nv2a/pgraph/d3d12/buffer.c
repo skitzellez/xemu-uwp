@@ -491,6 +491,7 @@ static bool ring_grow(PGRAPHState *pg, PGRAPHD3D12Buffer *buffer,
     if (buffer == &r->uniform_upload_buffer) {
         /* Cached constants offsets refer to the replaced resource. */
         r->draw_constants_cached = false;
+        r->vertex_fetch_cached = false;
         r->pixel_constants_cached = false;
         r->uber_constants_cached = false;
     }
@@ -579,7 +580,7 @@ bool pgraph_d3d12_ring_alloc(PGRAPHState *pg, PGRAPHD3D12Buffer *buffer,
         }
 
         /* No marks to wait on: submit the open list to create one, else grow. */
-        if (r->command_list_open) {
+        if (r->command_list_open && !r->ring_no_submit) {
             r->perf.submit_src[0]++;
             if (!pgraph_d3d12_submit_commands_async(pg, errp)) {
                 return false;
@@ -645,6 +646,7 @@ void pgraph_d3d12_discard_unrecorded_draw_uploads(PGRAPHD3D12State *r)
     ring_discard_unrecorded(&r->uniform_upload_buffer);
     if (uniform_reclaimed) {
         r->draw_constants_cached = false;
+        r->vertex_fetch_cached = false;
         r->pixel_constants_cached = false;
         r->uber_constants_cached = false;
     }

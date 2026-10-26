@@ -790,6 +790,132 @@ void pgraph_d3d12_process_color_checkpoints(PGRAPHD3D12State *r)
     }
 }
 
+/*
+ * Diagnostic (tune "drawstat"): for guest frames 2-4 after the switch is
+ * seen, one line per frame: draws by kind, elements per draw, primitive
+ * modes, and how many draws repeat the previous draw's pipeline, textures,
+ * targets, constants and vertex layout (only the vertex addresses and the
+ * elements differ), i.e. could be merged into it.
+ */
+static void draw_stat(PGRAPHState *pg)
+{
+    PGRAPHD3D12State *r = pg->d3d12_renderer_state;
+    static uint32_t frame0, last_frame;
+    static bool active;
+    static unsigned int done;
+    static uint32_t n, kind[4], sizes[7], prims[11], same, runs, pso_same,
+        tex_same, const_same, layout_same;
+    static uint32_t last_key, last_tex_hash, last_layout_hash;
+    static uint64_t last_dc, last_pc;
+    static const void *last_c, *last_z;
+    static unsigned int last_prim;
+    uint32_t frame = g_nv2a_stats.frame_count;
+
+    if (!r->drawstat) {
+        active = false;
+        done = 0;
+        return;
+    }
+    if (!active) {
+        /* again every 300 guest frames while the switch is on */
+        if (done >= 3 && frame - frame0 < 300) {
+            return;
+        }
+        done = 0;
+        active = true;
+        frame0 = frame;
+        last_frame = frame;
+        n = 0;
+    }
+    if (frame != last_frame) {
+        if (frame - frame0 >= 2 && n) {
+            uwp_log("drawstat frame %u: %u draws | kind I=%u A=%u V=%u B=%u | "
+                    "elements 1-3:%u 4-6:%u 7-12:%u 13-48:%u 49-192:%u "
+                    "193-1k:%u >1k:%u | prim 0-10:%u,%u,%u,%u,%u,%u,%u,%u,%u,"
+                    "%u,%u | mergeable %u (%u runs) | same pso %u tex %u "
+                    "const %u layout %u",
+                    last_frame, n, kind[0], kind[1], kind[2], kind[3],
+                    sizes[0], sizes[1], sizes[2], sizes[3], sizes[4],
+                    sizes[5], sizes[6], prims[0], prims[1], prims[2],
+                    prims[3], prims[4], prims[5], prims[6], prims[7],
+                    prims[8], prims[9], prims[10], same, runs, pso_same,
+                    tex_same, const_same, layout_same);
+            if (++done >= 3) {
+                active = false;
+            }
+        }
+        last_frame = frame;
+        n = 0;
+        memset(kind, 0, sizeof(kind));
+        memset(sizes, 0, sizeof(sizes));
+        memset(prims, 0, sizeof(prims));
+        same = runs = pso_same = tex_same = const_same = layout_same = 0;
+    }
+
+    unsigned int elements = 0;
+    if (pg->inline_elements_length) {
+        kind[0]++;
+        elements = pg->inline_elements_length;
+    } else if (pg->draw_arrays_length) {
+        kind[1]++;
+        for (int i = 0; i < pg->draw_arrays_length; i++) {
+            elements += pg->draw_arrays_count[i];
+        }
+    } else if (pg->inline_array_length) {
+        kind[2]++;
+        elements = pg->inline_array_length;
+    } else {
+        kind[3]++;
+        elements = pg->inline_buffer_length;
+    }
+    static const unsigned int bounds[] = { 3, 6, 12, 48, 192, 1024 };
+    unsigned int b = 0;
+    while (b < ARRAY_SIZE(bounds) && elements > bounds[b]) {
+        b++;
+    }
+    sizes[b]++;
+    prims[MIN((unsigned int)pg->primitive_mode, 10u)]++;
+
+    uint32_t key = (uint32_t)fast_hash((const uint8_t *)&r->draw_pipeline_key,
+                                       sizeof(r->draw_pipeline_key));
+    uint64_t tex_hash = 0;
+    for (unsigned int i = 0; i < NV2A_MAX_TEXTURES; i++) {
+        const PGRAPHD3D12TextureBinding *t = r->texture_binding[i];
+        tex_hash = tex_hash * 1099511628211ull ^
+                   ((r->texture_active_mask & (1u << i)) && t ?
+                        (uint64_t)(uintptr_t)t->resource : 0);
+    }
+    uint32_t layout = (uint32_t)fast_hash(
+        (const uint8_t *)r->vertex_attribute_strides,
+        sizeof(r->vertex_attribute_strides)) ^
+        r->num_active_vertex_attribute_descriptions;
+    bool s_pso = n && key == last_key && pg->primitive_mode == last_prim;
+    bool s_tex = n && (uint32_t)tex_hash == last_tex_hash;
+    bool s_const = n && r->draw_constants_cache_offset == last_dc &&
+                   r->pixel_constants_cache_offset == last_pc;
+    bool s_layout = n && layout == last_layout_hash;
+    bool s_rt = n && (const void *)r->color_binding == last_c &&
+                (const void *)r->zeta_binding == last_z;
+    pso_same += s_pso;
+    tex_same += s_tex;
+    const_same += s_const;
+    layout_same += s_layout;
+    if (s_pso && s_tex && s_const && s_layout && s_rt) {
+        same++;
+    } else {
+        runs++;
+    }
+    last_key = key;
+    last_prim = pg->primitive_mode;
+    last_tex_hash = (uint32_t)tex_hash;
+    last_dc = r->draw_constants_cache_offset;
+    last_pc = r->pixel_constants_cache_offset;
+    last_layout_hash = layout;
+    last_c = r->color_binding;
+    last_z = r->zeta_binding;
+    n++;
+}
+
 static bool begin_ready_draw(PGRAPHState *pg, D3D_PRIMITIVE_TOPOLOGY topology,
                              bool *pending, Error **errp)
 {
@@ -824,6 +950,7 @@ static bool begin_ready_draw(PGRAPHState *pg, D3D_PRIMITIVE_TOPOLOGY topology,
     }
     record_vertex_start(r, 0);
     pgraph_d3d12_capture_draw(pg, (unsigned int)topology);
+    draw_stat(pg);
     if (r->evlog_draws && r->evlog_frames_left > 0) {
         hwaddr tex[NV2A_MAX_TEXTURES] = { 0 };
         unsigned int res[NV2A_MAX_TEXTURES] = { 0 };
@@ -1132,6 +1259,17 @@ void pgraph_d3d12_draw_begin(NV2AState *d)
 
     r->num_vertex_ram_buffer_syncs = 0;
 
+    if (fragment_output && r->merge.active && !r->merge_off &&
+        pg->merge_generation == r->merge.generation) {
+        /* may merge into the held draw: put the surface update off until
+         * draw_end knows (pgraph_d3d12_merge_flush runs it if not) */
+        r->merge.surface_update_deferred = true;
+        r->merge.surface_color_write = color_write;
+        r->merge.surface_zeta_write = depth_test || stencil_test;
+        return;
+    }
+    pgraph_d3d12_merge_flush(d);
+
     if (fragment_output) {
         int64_t perf_start = uwp_prof_now(); /* once per draw: the cheap clock */
 
@@ -1141,6 +1279,325 @@ void pgraph_d3d12_draw_begin(NV2AState *d)
         r->perf.surface_update_ticks += uwp_prof_now() - perf_start;
     }
 }
+
+/*
+ * Draw merging. Particle and decal heavy titles send thousands of tiny
+ * indexed strips a frame that differ only in vertex addresses (007
+ * Everything or Nothing: 24,000 draws of 4-6 indices, 95% identical to the
+ * draw before); each paid the full binding cost. An indexed triangle draw
+ * is recorded with its indices as a triangle list in the index ring but its
+ * DrawIndexedInstanced is held back. While only vertex addresses, indices
+ * and begin/end methods follow (pg->merge_generation unchanged), the next
+ * draw's indices are rebased onto the held draw's vertex addresses and
+ * appended, so the batch shares one draw call. Anything else records the
+ * held draw first: pgraph_method, the pending-work entry points and closing
+ * the command list call pgraph_d3d12_merge_flush/emit.
+ */
+static bool merge_draw_eligible(PGRAPHState *pg)
+{
+    return pg->inline_elements_length >= 3 && !pg->draw_arrays_length &&
+           !pg->inline_array_length && !pg->inline_buffer_length &&
+           (pg->primitive_mode == NV097_SET_BEGIN_END_OP_TRIANGLES ||
+            pg->primitive_mode == NV097_SET_BEGIN_END_OP_TRIANGLE_STRIP) &&
+           /* the list order keeps the winding, not flat shading's provoking
+            * vertex */
+           (pgraph_reg_r(pg, NV_PGRAPH_CONTROL_3) &
+            NV_PGRAPH_CONTROL_3_SHADEMODE) &&
+           !pg->zpass_pixel_count_enable && !pg->clearing;
+}
+
+/* Triangle list indices of an indexed triangle or strip draw, plus k. */
+static size_t merge_list_indices(const uint32_t *in, size_t n,
+                                 unsigned int prim, int64_t k, uint32_t *out)
+{
+    size_t c = 0;
+
+    if (prim == NV097_SET_BEGIN_END_OP_TRIANGLES) {
+        for (size_t i = 0; i < n - n % 3; i++) {
+            out[c++] = (uint32_t)(in[i] + k);
+        }
+        return c;
+    }
+    for (size_t i = 0; i + 2 < n; i++) {
+        /* odd strip triangles as the strip orders them: i+1, i, i+2 */
+        out[c++] = (uint32_t)(in[i + (i & 1)] + k);
+        out[c++] = (uint32_t)(in[i + 1 - (i & 1)] + k);
+        out[c++] = (uint32_t)(in[i + 2] + k);
+    }
+    return c;
+}
+
+/* Copies the RAM pages the merged draws read that changed since their last
+ * copy; once per held draw, not per merged draw: each test-and-clear made the
+ * guest's next write to the page take the slow dirty-tracking path again. */
+static void merge_sync(PGRAPHD3D12State *r)
+{
+    PGRAPHState *pg = r->merge.pg;
+    NV2AState *d = container_of(pg, NV2AState, pgraph);
+    unsigned int n = r->merge.num_syncs;
+
+    r->merge.num_syncs = 0;
+    r->ring_no_submit = true;
+    for (unsigned int i = 0; i < n; i++) {
+        hwaddr addr = r->merge.syncs[i].addr;
+        hwaddr size = r->merge.syncs[i].size;
+        Error *local_err = NULL;
+        bool already_uploaded =
+            pgraph_d3d12_vertex_ram_range_uploaded(pg, addr, size);
+        bool dirty = memory_region_test_and_clear_dirty(d->vram, addr, size,
+                                                        DIRTY_MEMORY_NV2A);
+
+        if ((dirty || !already_uploaded ||
+             (r->tune_flags & PGRAPH_D3D12_TUNE_VTX_ALWAYS)) &&
+            !upload_vertex_ram_range(pg, addr, size, &local_err)) {
+            report_draw_error(local_err);
+            break;
+        }
+    }
+    r->ring_no_submit = false;
+}
+
+/* Adds the draw's queued vertex RAM ranges to the held draw's copy list. */
+static void merge_take_vertex_syncs(PGRAPHD3D12State *r)
+{
+    for (size_t i = 0; i < r->num_vertex_ram_buffer_syncs; i++) {
+        hwaddr start = r->vertex_ram_buffer_syncs[i].addr & TARGET_PAGE_MASK;
+        hwaddr end = ROUND_UP(r->vertex_ram_buffer_syncs[i].addr +
+                                  r->vertex_ram_buffer_syncs[i].size,
+                              TARGET_PAGE_SIZE);
+        unsigned int j;
+
+        if (end <= start) {
+            continue;
+        }
+        for (j = 0; j < r->merge.num_syncs; j++) {
+            PGRAPHD3D12MemorySync *s = &r->merge.syncs[j];
+
+            if (start <= s->addr + s->size && s->addr <= end) {
+                hwaddr s_end = MAX(s->addr + s->size, end);
+
+                s->addr = MIN(s->addr, start);
+                s->size = s_end - s->addr;
+                break;
+            }
+        }
+        if (j < r->merge.num_syncs) {
+            continue;
+        }
+        if (r->merge.num_syncs == ARRAY_SIZE(r->merge.syncs)) {
+            merge_sync(r);
+        }
+        r->merge.syncs[r->merge.num_syncs].addr = start;
+        r->merge.syncs[r->merge.num_syncs].size = end - start;
+        r->merge.num_syncs++;
+    }
+    r->num_vertex_ram_buffer_syncs = 0;
+}
+
+static void merge_record(PGRAPHD3D12State *r)
+{
+    merge_sync(r);
+    if (r->merge.index_count == 0) {
+        return;
+    }
+    if (r->vertex_ram_buffer.resource != NULL) {
+        /* the merged draws' vertex copies left the RAM copy in COPY_DEST,
+         * and a copy that grew it moved its GPU address */
+        D3D12_GPU_VIRTUAL_ADDRESS vertex_ram_address =
+            r->vertex_ram_buffer.resource->lpVtbl->GetGPUVirtualAddress(
+                r->vertex_ram_buffer.resource);
+
+        pgraph_d3d12_transition_resource(
+            r, &r->vertex_ram_buffer,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (r->record_vertex_ram_srv != vertex_ram_address) {
+            r->command_list->lpVtbl->SetGraphicsRootShaderResourceView(
+                r->command_list, PGRAPH_D3D12_ROOT_VERTEX_RAM_SRV,
+                vertex_ram_address);
+            r->record_vertex_ram_srv = vertex_ram_address;
+        }
+    }
+    record_index_buffer(r->merge.pg, r->merge.index_offset,
+                        (uint64_t)r->merge.index_count * sizeof(uint32_t));
+    r->command_list->lpVtbl->DrawIndexedInstanced(
+        r->command_list, r->merge.index_count, 1, 0, 0, 0);
+}
+
+void pgraph_d3d12_merge_emit(PGRAPHD3D12State *r)
+{
+    if (r == NULL || !r->merge.active) {
+        return;
+    }
+    r->merge.active = false;
+    r->merge.pg->merge_pending = false;
+    if (r->command_list_open) {
+        merge_record(r);
+    }
+}
+
+void pgraph_d3d12_merge_flush(NV2AState *d)
+{
+    PGRAPHD3D12State *r = d->pgraph.d3d12_renderer_state;
+
+    if (r == NULL) {
+        return;
+    }
+    pgraph_d3d12_merge_emit(r);
+    if (r->merge.surface_update_deferred) {
+        r->merge.surface_update_deferred = false;
+        pgraph_d3d12_surface_update(d, true, r->merge.surface_color_write,
+                                    r->merge.surface_zeta_write);
+    }
+}
+
+static void merge_hold(PGRAPHD3D12State *r, PGRAPHState *pg,
+                       uint64_t index_offset, uint32_t index_count)
+{
+    r->merge.active = true;
+    r->merge.pg = pg;
+    r->merge.generation = pg->merge_generation;
+    r->merge.submits = r->submits;
+    r->merge.index_offset = index_offset;
+    r->merge.index_count = index_count;
+    r->merge.primitive_mode = pg->primitive_mode;
+    r->merge.draws = 1;
+    r->merge.attr_mask = 0;
+    r->merge.dma_mask = 0;
+    for (int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
+        const VertexAttribute *attr = &pg->vertex_attributes[i];
+
+        r->merge.offsets[i] = attr->offset;
+        r->merge.strides[i] = attr->stride;
+        if (attr->count) {
+            r->merge.attr_mask |= 1u << i;
+            if (attr->dma_select) {
+                r->merge.dma_mask |= 1u << i;
+            }
+        }
+    }
+    pg->merge_pending = true;
+    r->perf.merge_holds++;
+}
+
+/* Appends the current draw to the held one; false when it cannot be. */
+#define MERGE_FAIL(n) do { r->perf.merge_fail[n]++; return false; } while (0)
+static bool merge_try(NV2AState *d)
+{
+    PGRAPHState *pg = &d->pgraph;
+    PGRAPHD3D12State *r = pg->d3d12_renderer_state;
+    Error *local_err = NULL;
+    int64_t k = 0;
+    bool have_k = false;
+    uint32_t min_element = (uint32_t)-1;
+    uint32_t max_element = 0;
+    uint64_t index_offset;
+    uint32_t *indices;
+    size_t count;
+
+    if (!r->merge.active) {
+        return false;
+    }
+    if (r->merge_off) {
+        MERGE_FAIL(1);
+    }
+    if (pg->merge_generation != r->merge.generation) {
+        MERGE_FAIL(2);
+    }
+    if (r->merge.submits != r->submits) {
+        MERGE_FAIL(3);
+    }
+    if (pg->primitive_mode != r->merge.primitive_mode) {
+        MERGE_FAIL(4);
+    }
+    if (!merge_draw_eligible(pg)) {
+        MERGE_FAIL(5);
+    }
+    for (int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
+        const VertexAttribute *attr = &pg->vertex_attributes[i];
+
+        if (!attr->count) {
+            if (r->merge.attr_mask & (1u << i)) {
+                MERGE_FAIL(6);
+            }
+            continue;
+        }
+        if (!(r->merge.attr_mask & (1u << i)) ||
+            attr->stride != r->merge.strides[i] ||
+            (attr->dma_select != 0) != ((r->merge.dma_mask >> i) & 1)) {
+            MERGE_FAIL(6);
+        }
+        int64_t delta = (int64_t)attr->offset - (int64_t)r->merge.offsets[i];
+        if (delta % attr->stride) {
+            MERGE_FAIL(7);
+        }
+        if (have_k && delta / attr->stride != k) {
+            MERGE_FAIL(8);
+        }
+        k = delta / attr->stride;
+        have_k = true;
+    }
+    for (int i = 0; i < pg->inline_elements_length; i++) {
+        max_element = MAX(pg->inline_elements[i], max_element);
+        min_element = MIN(pg->inline_elements[i], min_element);
+    }
+    if ((int64_t)min_element + k < 0 ||
+        (int64_t)max_element + k >= (int64_t)UINT32_MAX) {
+        MERGE_FAIL(9);
+    }
+
+    /* the vertex bytes still go to the GPU copy of RAM, and the attribute
+     * values left at the provoking vertex still update */
+    if (!pgraph_d3d12_bind_vertex_attributes(
+            d, min_element, max_element, false, 0,
+            pg->inline_elements[pg->inline_elements_length - 1],
+            &local_err) ||
+        /* the copies wait for the held draw (merge_sync); test switch
+         * "mergesync=perdraw": copy per merged draw, as before */
+        !(r->merge_nosync ? sync_vertex_ram_buffer(pg, &local_err) :
+                            (merge_take_vertex_syncs(r), true))) {
+        error_free(local_err);
+        MERGE_FAIL(10);
+    }
+    if (r->merge.submits != r->submits ||
+        r->converted_vertex_attribute_mask || r->vertex_fetch_inline_mask) {
+        MERGE_FAIL(11);
+    }
+
+    indices = expanded_index_scratch(r, (size_t)pg->inline_elements_length * 3);
+    count = merge_list_indices(pg->inline_elements, pg->inline_elements_length,
+                               pg->primitive_mode, k, indices);
+    if (count == 0) {
+        r->perf.merged_draws++;
+        r->merge.surface_update_deferred = false;
+        return true;
+    }
+    if (!pgraph_d3d12_update_index_buffer(pg, indices,
+                                          count * sizeof(uint32_t),
+                                          &index_offset, &local_err)) {
+        error_free(local_err);
+        MERGE_FAIL(12);
+    }
+    if (r->merge.submits != r->submits) {
+        /* the ring submitted: the held draw went with that list, and this
+         * one needs its bindings recorded again */
+        MERGE_FAIL(13);
+    }
+    if (index_offset != r->merge.index_offset +
+                            (uint64_t)r->merge.index_count * sizeof(uint32_t)) {
+        /* the ring wrapped: draw what is held, the bindings stay */
+        merge_record(r);
+        r->merge.index_offset = index_offset;
+        r->merge.index_count = 0;
+    }
+    r->merge.index_count += count;
+    r->merge.draws++;
+    pgraph_d3d12_draw_uploads_recorded(r);
+    r->perf.merged_draws++;
+    /* nothing that draw_begin's surface update looks at has changed */
+    r->merge.surface_update_deferred = false;
+    return true;
+}
+#undef MERGE_FAIL
 
 void pgraph_d3d12_draw_end(NV2AState *d)
 {
@@ -1184,6 +1641,11 @@ static void pgraph_d3d12_flush_draw_body(NV2AState *d)
     pgraph_d3d12_discard_unrecorded_draw_uploads(r);
     r->evlog_vtx_hash = 0;
     r->evlog_vtx_uploads = 0;
+
+    if (merge_try(d)) {
+        return;
+    }
+    pgraph_d3d12_merge_flush(d);
 
     if (!fragment_output) {
         return;
@@ -1284,13 +1746,31 @@ static void pgraph_d3d12_flush_draw_body(NV2AState *d)
         uint64_t index_offset = 0;
         uint32_t min_element = (uint32_t)-1;
         uint32_t max_element = 0;
+        /* recorded as a triangle list whose draw is held for merging */
+        bool hold = !expanded_topology && !r->merge_off &&
+                    merge_draw_eligible(pg);
+        if (!hold) {
+            /* diagnostic: why indexed draws are not held */
+            unsigned int why =
+                expanded_topology ? 0 :
+                r->merge_off ? 1 :
+                pg->inline_elements_length < 3 ? 2 :
+                (pg->primitive_mode != NV097_SET_BEGIN_END_OP_TRIANGLES &&
+                 pg->primitive_mode != NV097_SET_BEGIN_END_OP_TRIANGLE_STRIP) ? 3 :
+                !(pgraph_reg_r(pg, NV_PGRAPH_CONTROL_3) &
+                  NV_PGRAPH_CONTROL_3_SHADEMODE) ? 4 :
+                pg->zpass_pixel_count_enable ? 5 : 6;
+            r->perf.hold_fail[why]++;
+        }
 
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_ELEMENTS);
 
+        int64_t scan_start = uwp_prof_now();
         for (int i = 0; i < pg->inline_elements_length; i++) {
             max_element = MAX(pg->inline_elements[i], max_element);
             min_element = MIN(pg->inline_elements[i], min_element);
         }
+        r->perf.vtx_scan_ticks += uwp_prof_now() - scan_start;
 
         if (expanded_topology) {
             output_index_count = expanded_index_count_for_span(
@@ -1307,6 +1787,13 @@ static void pgraph_d3d12_flush_draw_body(NV2AState *d)
             append_expanded_indices_for_span(
                 pg, expanded_indices, &output_index_count,
                 pg->inline_elements, 0, pg->inline_elements_length);
+        } else if (hold) {
+            expanded_indices = expanded_index_scratch(
+                r, (size_t)pg->inline_elements_length * 3);
+            output_index_count = merge_list_indices(
+                pg->inline_elements, pg->inline_elements_length,
+                pg->primitive_mode, 0, expanded_indices);
+            topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         }
 
         index_data_size = output_index_count * sizeof(pg->inline_elements[0]);
@@ -1314,15 +1801,53 @@ static void pgraph_d3d12_flush_draw_body(NV2AState *d)
         bool vertices_ok = pgraph_d3d12_bind_vertex_attributes(
                 d, min_element, max_element, false, 0,
                 pg->inline_elements[pg->inline_elements_length - 1],
-                &local_err) &&
-            sync_vertex_ram_buffer(pg, &local_err) &&
+                &local_err);
+        int64_t bind_end = uwp_prof_now();
+        {
+            /* Diagnostic: the same vertex binding as the previous draw? */
+            static uint64_t last_offsets[NV2A_VERTEXSHADER_ATTRIBUTES];
+            static uint32_t last_strides[NV2A_VERTEXSHADER_ATTRIBUTES];
+            static int last_active = -1;
+            r->perf.vtx_draws++;
+            if (last_active == (int)r->num_active_vertex_attribute_descriptions &&
+                !memcmp(last_offsets, r->vertex_attribute_offsets, sizeof(last_offsets)) &&
+                !memcmp(last_strides, r->vertex_attribute_strides, sizeof(last_strides))) {
+                r->perf.vtx_same++;
+            }
+            memcpy(last_offsets, r->vertex_attribute_offsets, sizeof(last_offsets));
+            memcpy(last_strides, r->vertex_attribute_strides, sizeof(last_strides));
+            last_active = r->num_active_vertex_attribute_descriptions;
+        }
+        vertices_ok = vertices_ok && sync_vertex_ram_buffer(pg, &local_err);
+        int64_t sync_end = uwp_prof_now();
+        vertices_ok = vertices_ok &&
             pgraph_d3d12_update_index_buffer(
-                pg, expanded_topology ? expanded_indices : pg->inline_elements,
+                pg, expanded_topology || hold ? expanded_indices :
+                                                pg->inline_elements,
                 index_data_size, &index_offset, &local_err);
-        r->perf.vertex_setup_ticks += uwp_prof_now() - vertex_start;
+        int64_t index_end = uwp_prof_now();
+        r->perf.vtx_bind_ticks += bind_end - vertex_start;
+        r->perf.vtx_sync_ticks += sync_end - bind_end;
+        r->perf.vtx_index_ticks += index_end - sync_end;
+        r->perf.vertex_setup_ticks += index_end - vertex_start;
         if (!vertices_ok) {
             report_draw_error(local_err);
             return;
+        }
+        if (hold) {
+            /* only plain RAM attributes rebase by an index offset */
+            hold = !r->converted_vertex_attribute_mask &&
+                   !r->vertex_fetch_inline_mask;
+            if (!hold) {
+                r->perf.hold_fail[7]++;
+            }
+            for (int i = 0; hold && i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
+                hold = !pg->vertex_attributes[i].count ||
+                       pg->vertex_attributes[i].stride;
+                if (!hold) {
+                    r->perf.hold_fail[8]++;
+                }
+            }
         }
 
         pgraph_d3d12_prepare_zpass_queries(d);
@@ -1334,12 +1859,16 @@ static void pgraph_d3d12_flush_draw_body(NV2AState *d)
         }
 
         pgraph_d3d12_record_vertex_buffers(pg, 0, 0);
-        record_index_buffer(pg, index_offset, index_data_size);
         pgraph_d3d12_set_surface_dirty(pg, color_write,
                                        depth_test || stencil_test);
         pgraph_d3d12_begin_zpass_query(d);
-        r->command_list->lpVtbl->DrawIndexedInstanced(
-            r->command_list, output_index_count, 1, 0, 0, 0);
+        if (hold) {
+            merge_hold(r, pg, index_offset, output_index_count);
+        } else {
+            record_index_buffer(pg, index_offset, index_data_size);
+            r->command_list->lpVtbl->DrawIndexedInstanced(
+                r->command_list, output_index_count, 1, 0, 0, 0);
+        }
     } else if (pg->inline_buffer_length) {
         const void *data[NV2A_VERTEXSHADER_ATTRIBUTES];
         uint64_t sizes[NV2A_VERTEXSHADER_ATTRIBUTES];

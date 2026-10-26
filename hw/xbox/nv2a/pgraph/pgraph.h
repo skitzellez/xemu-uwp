@@ -327,6 +327,21 @@ typedef struct PGRAPHState {
         PGRAPHD3D12State *d3d12_renderer_state;
 #endif
     };
+    /* Raised by every method and register write that can change drawing
+     * state; not by vertex data, indices, shader constants or begin/end.
+     * Lets the D3D12 renderer reuse the previous draw's pipeline. */
+    uint32_t state_generation;
+    /* Raised by every write to vsh_constants (methods, RDI, state load), so
+     * the D3D12 renderer can skip comparing them on each draw. */
+    uint32_t vsh_constants_generation;
+    /* Raised by every method and register write except vertex addresses,
+     * indices and begin/end: while it stays the same, the next draw differs
+     * from the previous one only in those, so the D3D12 renderer may merge
+     * the two. merge_flush() records a draw the renderer is holding back
+     * (merge_pending) before anything else is recorded. */
+    uint32_t merge_generation;
+    bool merge_pending;
+    void (*merge_flush)(NV2AState *d);
 } PGRAPHState;
 
 void pgraph_init(NV2AState *d);

@@ -51,6 +51,7 @@ void pgraph_rdi_write(PGRAPHState *pg, unsigned int select,
         pg->vsh_constants_dirty[address / 4] |=
             (val != pg->vsh_constants[address / 4][3 - address % 4]);
         pg->vsh_constants[address / 4][3 - address % 4] = val;
+        pg->vsh_constants_generation++;
         break;
     default:
         NV2A_DPRINTF("unknown rdi write select 0x%x, address 0x%x, val 0x%08x\n",

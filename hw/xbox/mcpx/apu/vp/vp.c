@@ -1002,8 +1002,12 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         hwaddr addr = d->regs[NV_PAPU_VPSSLADDR] + page * 8;
         segment_offset = ldl_le_phys(&address_space_memory, addr);
         segment_length = ldl_le_phys(&address_space_memory, addr + 4);
+#ifndef XEMU_UWP
         assert(segment_length != 0);
-        if (segment_offset == 0) {
+#endif
+        /* An empty length is the same race as an empty offset (Star Wars:
+         * Obi-Wan stopped on this assert 9 minutes in): skip this cycle. */
+        if (segment_offset == 0 || segment_length == 0) {
             // SSL entry not yet populated by guest (timing race); skip this cycle
             DPRINTF("Voice %d: SSL entry page %d not ready "
                     "(offset=%"HWADDR_PRIx" length=%"PRIx32")\n",
@@ -1015,6 +1019,14 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         seg_cs = (segment_length >> 16) & 3;
         seg_spb = (segment_length >> 18) & 0x1f;
         seg_s = (segment_length >> 23) & 1;
+#ifdef XEMU_UWP
+        /* a half-written entry: skip this cycle rather than close xemu */
+        if (seg_cs != container_size_index ||
+            (seg_spb + 1) != samples_per_block || seg_s != stereo ||
+            seg_len == 0) {
+            return -1;
+        }
+#endif
         assert(seg_cs == container_size_index);
         assert((seg_spb + 1) == samples_per_block);
         assert(seg_s == stereo);

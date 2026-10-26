@@ -448,6 +448,10 @@ static int nv2a_post_load(void *opaque, int version_id)
      * Invalidate any renderer-local PVIDEO conversion after VRAM/registers
      * have been restored. */
     qatomic_inc(&d->pvideo.frame_generation);
+    /* registers and shader constants came back without methods */
+    d->pgraph.state_generation++;
+    d->pgraph.merge_generation++;
+    d->pgraph.vsh_constants_generation++;
     qatomic_set(&d->pgraph.flush_pending, true);
     nv2a_unlock_fifo(d);
     return 0;

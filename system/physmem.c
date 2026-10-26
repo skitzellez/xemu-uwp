@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/xemu-uwp.h"
 #include "exec/page-vary.h"
 #include "hw/core/cpu.h"
 #include "qapi/error.h"
@@ -1060,6 +1061,8 @@ void tlb_reset_dirty_range_all(ram_addr_t start, ram_addr_t length)
     end = TARGET_PAGE_ALIGN(start + length);
     start &= TARGET_PAGE_MASK;
 
+    xemu_uwp_counters[current_cpu ? UWP_CNT_TLB_RESET_VCPU :
+                                    UWP_CNT_TLB_RESET_OTHER]++;
     RCU_READ_LOCK_GUARD();
     block = qemu_get_ram_block(start);
     assert(block == qemu_get_ram_block(end - 1));
@@ -1072,6 +1075,9 @@ void tlb_reset_dirty_range_all(ram_addr_t start, ram_addr_t length)
 void physical_memory_dirty_bits_cleared(ram_addr_t start, ram_addr_t length)
 {
     if (tcg_enabled()) {
+#ifdef XBOX
+        xbox_tb_dirty_cleared(start, length);
+#endif
         tlb_reset_dirty_range_all(start, length);
     }
 }
