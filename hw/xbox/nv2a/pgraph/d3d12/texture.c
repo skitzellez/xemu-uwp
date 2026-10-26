@@ -728,6 +728,8 @@ static bool create_texture_resource(PGRAPHState *pg, unsigned int stage,
     unsigned int view_levels = texture_view_levels(shape);
     unsigned int resource_width;
     unsigned int resource_height;
+
+    r->perf.tex_creates++;
     unsigned int resource_depth;
     HRESULT hr;
     char device_removed_detail[128];

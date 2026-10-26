@@ -192,6 +192,7 @@ void pgraph_d3d12_finalize_command_objects(PGRAPHState *pg)
         QSIMPLEQ_REMOVE_HEAD(&r->deferred_releases, entry);
         if (release->resource != NULL) {
             release->resource->lpVtbl->Release(release->resource);
+            r->perf.res_releases++;
         }
         g_free(release);
     }
@@ -427,6 +428,7 @@ void pgraph_d3d12_process_deferred_releases(PGRAPHState *pg)
         QSIMPLEQ_REMOVE_HEAD(&r->deferred_releases, entry);
         if (release->resource != NULL) {
             release->resource->lpVtbl->Release(release->resource);
+            r->perf.res_releases++;
         }
         if (release->srv_descriptor_index >= 0) {
             pgraph_d3d12_free_srv_descriptor(

@@ -115,7 +115,7 @@ static inline bool pgraph_d3d12_swizzled_block_origin(
 #define PGRAPH_D3D12_DSV_HEAP_SIZE 1024
 #define PGRAPH_D3D12_CBV_SRV_UAV_HEAP_SIZE 16384
 #define PGRAPH_D3D12_SAMPLER_HEAP_SIZE 2048
-#define PGRAPH_D3D12_TEXTURE_CACHE_SIZE 512
+#define PGRAPH_D3D12_TEXTURE_CACHE_SIZE 1024 /* 512 thrashed: Vice City streets use 600+ a frame */
 #define PGRAPH_D3D12_BUFFER_FENCE_MARKS 64
 #define PGRAPH_D3D12_DRAWS_PER_SUBMIT 1024
 #define PGRAPH_D3D12_REPORTED_STATE_KEYS 16
@@ -974,6 +974,8 @@ typedef struct PGRAPHD3D12State {
         uint32_t tex_stash_retry;
         /* Stage binds that skipped revalidation. */
         uint32_t tex_fast;
+        uint32_t tex_creates;     /* texture resources created */
+        uint32_t res_releases;    /* resources freed by the deferred-release queue */
         /* Textures rebuilt on the GPU from a Z24S8 surface. */
         uint32_t tex_zeta_view;
         uint32_t stash_done_by[10];

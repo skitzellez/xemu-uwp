@@ -1073,7 +1073,7 @@ static void pgraph_d3d12_perf_report(NV2AState *d)
             "restore={none=%u abort_c=%u abort_z=%u cover=%u} "
             "report_wait={n=%u break=%u avg=%ums max=%ums lag=%u mode=%s} "
             "gpu_busy=%u%% (%u lists) "
-            "tex_stash={use=%u retry=%u} tex_fast=%u zeta_view=%u "
+            "tex_stash={use=%u retry=%u} tex_fast=%u tex_new=%u res_free=%u zeta_view=%u "
             "stash_done={ul=%u dl=%u tex=%u blit=%u range=%u cpu=%u sync=%u "
             "disp=%u cap=%u} "
             "surf_cb={calls=%" PRIu64 " waits=%" PRIu64
@@ -1161,7 +1161,8 @@ static void pgraph_d3d12_perf_report(NV2AState *d)
                                (uint64_t)MAX(elapsed, 1)) : 0,
             r->perf.gpu_lists_timed,
             r->perf.tex_from_stash, r->perf.tex_stash_retry,
-            r->perf.tex_fast, r->perf.tex_zeta_view,
+            r->perf.tex_fast, r->perf.tex_creates, r->perf.res_releases,
+            r->perf.tex_zeta_view,
             r->perf.stash_done_by[PGRAPH_D3D12_STASH_TRIGGER_UPLOAD],
             r->perf.stash_done_by[PGRAPH_D3D12_STASH_TRIGGER_DOWNLOAD],
             r->perf.stash_done_by[PGRAPH_D3D12_STASH_TRIGGER_TEXTURE],
