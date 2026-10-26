@@ -13,7 +13,8 @@ typedef struct RAMBlockNotifier RAMBlockNotifier;
 #define DIRTY_MEMORY_MIGRATION 2
 #define DIRTY_MEMORY_NV2A      3
 #define DIRTY_MEMORY_NV2A_TEX  4
-#define DIRTY_MEMORY_NUM       5        /* num of dirty bits */
+#define DIRTY_MEMORY_NV2A_VTX  5        /* D3D12 GPU copy of RAM for vertex reads */
+#define DIRTY_MEMORY_NUM       6        /* num of dirty bits */
 
 /* The dirty memory bitmap is split into fixed-size blocks to allow growth
  * under RCU.  The bitmap for a block can be accessed as follows:

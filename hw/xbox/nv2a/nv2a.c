@@ -245,6 +245,7 @@ static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
 
     memory_region_set_log(d->vram, true, DIRTY_MEMORY_NV2A);
     memory_region_set_log(d->vram, true, DIRTY_MEMORY_NV2A_TEX);
+    memory_region_set_log(d->vram, true, DIRTY_MEMORY_NV2A_VTX);
     memory_region_set_dirty(d->vram, 0, memory_region_size(d->vram));
 
     pgraph_init(d);

@@ -484,6 +484,7 @@ bool pgraph_d3d12_bind_vertex_attributes(NV2AState *d,
          * per-draw conversion and upload (and the draw can merge). */
         if (needs_cpu_expansion && !inline_data && attr->stride &&
             pgraph_d3d12_vertex_pulling() && !r->raw_fetch_off &&
+            !(r->raw_fetch_skip & (1u << attr->format)) &&
             !(r->tune_flags & PGRAPH_D3D12_TUNE_VTXFMT_STATIC)) {
             r->vertex_fetch_raw_bits[i] =
                 pgraph_d3d12_vertex_fetch_raw_bits(attr, d3d_swizzle);

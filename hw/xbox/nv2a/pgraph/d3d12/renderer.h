@@ -1199,6 +1199,7 @@ typedef struct PGRAPHD3D12State {
      * assembler lacks (3-component bytes and shorts, S32K); 0 for the rest */
     uint32_t vertex_fetch_raw_bits[NV2A_VERTEXSHADER_ATTRIBUTES];
     bool raw_fetch_off;         /* tune "rawfmt=off": CPU conversion */
+    uint32_t raw_fetch_skip;    /* tune "rawfmt=noub/nos1/nos32k": 1 << NV097 type */
     PGRAPHD3D12MemorySync vertex_ram_buffer_syncs[NV2A_VERTEXSHADER_ATTRIBUTES];
     size_t num_vertex_ram_buffer_syncs;
 

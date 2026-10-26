@@ -2856,11 +2856,9 @@ uint32_t pgraph_d3d12_vertex_fetch_raw_bits(const VertexAttribute *attr,
         kind = VERTEX_FETCH_KIND_UNORM8;
         dwords = 1;
         break;
-    case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S1:
-        kind = VERTEX_FETCH_KIND_SNORM16;
-        dwords = (count + 1) / 2;
-        swizzle = false;
-        break;
+    /* S1 stays on the CPU conversion: read raw, Project Gotham Racing 2's
+     * picture froze in its menus and races (3 shorts at a 10-byte stride)
+     * while the game ran on; 007 Everything or Nothing is as fast without. */
     case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S32K:
         kind = VERTEX_FETCH_KIND_SSCALED16;
         dwords = (count + 1) / 2;

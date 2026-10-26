@@ -567,10 +567,13 @@ static bool sync_vertex_ram_buffer(PGRAPHState *pg, Error **errp)
          * readback. bind_vertex_attributes() already tested the exact span,
          * and a readback there invalidates uploaded_bitmap.
          */
+        /* Its own dirty client: sharing DIRTY_MEMORY_NV2A with the surface
+         * and texture checks let them clear a vertex page's bit first, and
+         * draws read stale vertices (Project Gotham Racing 2 menus). */
         already_uploaded =
             pgraph_d3d12_vertex_ram_range_uploaded(pg, addr, size);
         dirty = memory_region_test_and_clear_dirty(d->vram, addr, size,
-                                                   DIRTY_MEMORY_NV2A);
+                                                   DIRTY_MEMORY_NV2A_VTX);
 
         r->evlog_vtx_uploads += dirty || !already_uploaded;
         if ((dirty || !already_uploaded ||
@@ -1345,7 +1348,7 @@ static void merge_sync(PGRAPHD3D12State *r)
         bool already_uploaded =
             pgraph_d3d12_vertex_ram_range_uploaded(pg, addr, size);
         bool dirty = memory_region_test_and_clear_dirty(d->vram, addr, size,
-                                                        DIRTY_MEMORY_NV2A);
+                                                        DIRTY_MEMORY_NV2A_VTX);
 
         if ((dirty || !already_uploaded ||
              (r->tune_flags & PGRAPH_D3D12_TUNE_VTX_ALWAYS)) &&

@@ -812,6 +812,14 @@ static void pgraph_d3d12_read_tune_file(PGRAPHD3D12State *r)
         r->merge_off = tune_word(text, "merge=off");
         r->merge_nosync = tune_word(text, "mergesync=perdraw");
         r->raw_fetch_off = tune_word(text, "rawfmt=off");
+        r->raw_fetch_skip =
+            (tune_word(text, "rawfmt=noub") ?
+                 (1u << NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D) |
+                 (1u << NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_OGL) : 0) |
+            (tune_word(text, "rawfmt=nos1") ?
+                 (1u << NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S1) : 0) |
+            (tune_word(text, "rawfmt=nos32k") ?
+                 (1u << NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S32K) : 0);
         /* A checkpoint origin implies the checkpoints. */
         r->cpk_enabled = tune_word(text, "cpk") ||
                          tune_value(text, "cpkxy=") != NULL;

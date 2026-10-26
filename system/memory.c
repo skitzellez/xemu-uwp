@@ -2267,7 +2267,8 @@ void memory_region_set_log(MemoryRegion *mr, bool log, unsigned client)
 #ifdef XBOX
     assert((client == DIRTY_MEMORY_VGA) \
         || (client == DIRTY_MEMORY_NV2A) \
-        || (client == DIRTY_MEMORY_NV2A_TEX));
+        || (client == DIRTY_MEMORY_NV2A_TEX) \
+        || (client == DIRTY_MEMORY_NV2A_VTX));
     if (mr->alias) {
         memory_region_set_log(mr->alias, log, client);
         return;

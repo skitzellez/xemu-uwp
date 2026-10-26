@@ -1130,11 +1130,12 @@ bool physical_memory_is_clean(ram_addr_t addr)
 {
     bool nv2a = physical_memory_get_dirty_flag(addr, DIRTY_MEMORY_NV2A);
     bool nv2a_tex = physical_memory_get_dirty_flag(addr, DIRTY_MEMORY_NV2A_TEX);
+    bool nv2a_vtx = physical_memory_get_dirty_flag(addr, DIRTY_MEMORY_NV2A_VTX);
     bool vga = physical_memory_get_dirty_flag(addr, DIRTY_MEMORY_VGA);
     bool code = physical_memory_get_dirty_flag(addr, DIRTY_MEMORY_CODE);
     bool migration =
         physical_memory_get_dirty_flag(addr, DIRTY_MEMORY_MIGRATION);
-    return !(nv2a && nv2a_tex && vga && code && migration);
+    return !(nv2a && nv2a_tex && nv2a_vtx && vga && code && migration);
 }
 
 static bool physical_memory_all_dirty(ram_addr_t start, ram_addr_t length,
@@ -1189,6 +1190,10 @@ uint8_t physical_memory_range_includes_clean(ram_addr_t start,
     if (mask & (1 << DIRTY_MEMORY_NV2A_TEX) &&
         !physical_memory_all_dirty(start, length, DIRTY_MEMORY_NV2A_TEX)) {
         ret |= (1 << DIRTY_MEMORY_NV2A_TEX);
+    }
+    if (mask & (1 << DIRTY_MEMORY_NV2A_VTX) &&
+        !physical_memory_all_dirty(start, length, DIRTY_MEMORY_NV2A_VTX)) {
+        ret |= (1 << DIRTY_MEMORY_NV2A_VTX);
     }
     if (mask & (1 << DIRTY_MEMORY_VGA) &&
         !physical_memory_all_dirty(start, length, DIRTY_MEMORY_VGA)) {
@@ -1269,6 +1274,10 @@ void physical_memory_set_dirty_range(ram_addr_t start, ram_addr_t length,
                 bitmap_set_atomic(blocks[DIRTY_MEMORY_NV2A_TEX]->blocks[idx],
                                   offset, next - page);
             }
+            if (unlikely(mask & (1 << DIRTY_MEMORY_NV2A_VTX))) {
+                bitmap_set_atomic(blocks[DIRTY_MEMORY_NV2A_VTX]->blocks[idx],
+                                  offset, next - page);
+            }
 
             page = next;
             idx++;
@@ -1338,6 +1347,7 @@ static void physical_memory_clear_dirty_range(ram_addr_t addr, ram_addr_t length
     physical_memory_test_and_clear_dirty(addr, length, DIRTY_MEMORY_CODE);
     physical_memory_test_and_clear_dirty(addr, length, DIRTY_MEMORY_NV2A);
     physical_memory_test_and_clear_dirty(addr, length, DIRTY_MEMORY_NV2A_TEX);
+    physical_memory_test_and_clear_dirty(addr, length, DIRTY_MEMORY_NV2A_VTX);
 }
 
 DirtyBitmapSnapshot *physical_memory_snapshot_and_clear_dirty
@@ -1455,6 +1465,7 @@ uint64_t physical_memory_set_dirty_lebitmap(unsigned long *bitmap,
                     qatomic_or(&blocks[DIRTY_MEMORY_VGA][idx][offset], temp);
                     qatomic_or(&blocks[DIRTY_MEMORY_NV2A][idx][offset], temp);
                     qatomic_or(&blocks[DIRTY_MEMORY_NV2A_TEX][idx][offset], temp);
+                    qatomic_or(&blocks[DIRTY_MEMORY_NV2A_VTX][idx][offset], temp);
 
                     if (global_dirty_tracking) {
                         qatomic_or(
