@@ -51,6 +51,17 @@ static void FileDialogCallbackWrapper(void *userdata,
     }
 }
 
+#ifdef XEMU_UWP
+/* the browser picks inside the menu's frame: the choice runs like SDL's dialog answer did, later and locked */
+static FileDialogCallback UwpOnMainThread(FileDialogCallback callback)
+{
+    return [callback = std::move(callback)](const char *path) {
+        std::string p = path;
+        RunOnMainThread([callback, p]() { callback(p.c_str()); });
+    };
+}
+#endif
+
 // Workaround SDL3 default_location handling:
 // - Linux: only supports folder paths, not file paths as documented
 // - Windows/macOS: directories need trailing separator for proper display
@@ -85,6 +96,10 @@ void ShowOpenFileDialog(const SDL_DialogFileFilter *filters, int nfilters,
                         const char *default_location,
                         FileDialogCallback callback)
 {
+#ifdef XEMU_UWP
+    UwpFileBrowserOpen(UwpFileBrowserMode::Open, filters, nfilters, default_location, UwpOnMainThread(callback));
+    return;
+#endif
     auto *cb = new FileDialogCallback(std::move(callback));
     std::string normalized = NormalizeDefaultLocation(default_location);
     SDL_ShowOpenFileDialog(FileDialogCallbackWrapper, cb, xemu_get_window(),
@@ -97,6 +112,10 @@ void ShowSaveFileDialog(const SDL_DialogFileFilter *filters, int nfilters,
                         const char *default_location,
                         FileDialogCallback callback)
 {
+#ifdef XEMU_UWP
+    UwpFileBrowserOpen(UwpFileBrowserMode::Save, filters, nfilters, default_location, UwpOnMainThread(callback));
+    return;
+#endif
     auto *cb = new FileDialogCallback(std::move(callback));
     SDL_ShowSaveFileDialog(FileDialogCallbackWrapper, cb, xemu_get_window(),
                            filters, nfilters, default_location);
@@ -105,6 +124,10 @@ void ShowSaveFileDialog(const SDL_DialogFileFilter *filters, int nfilters,
 void ShowOpenFolderDialog(const char *default_location,
                           FileDialogCallback callback)
 {
+#ifdef XEMU_UWP
+    UwpFileBrowserOpen(UwpFileBrowserMode::Folder, nullptr, 0, default_location, UwpOnMainThread(callback));
+    return;
+#endif
     auto *cb = new FileDialogCallback(std::move(callback));
     SDL_ShowOpenFolderDialog(FileDialogCallbackWrapper, cb,
                              xemu_get_window(), default_location, false);

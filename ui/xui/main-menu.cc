@@ -1595,7 +1595,21 @@ void MainMenuSystemView::Draw()
                });
     FilePicker("EEPROM", g_config.sys.files.eeprom_path,
                rom_file_filters, 3, false, [this](const char *path) {
+#ifdef XEMU_UWP
+                   /* a player's own EEPROM goes onto the console (ui/xemu.c) */
+                   const char *why = NULL;
+                   char *own = xemu_uwp_take_eeprom(path, &why);
+                   if (!own) {
+                       xemu_queue_error_message(why);
+                       return;
+                   }
+                   xemu_settings_set_string(&g_config.sys.files.eeprom_path, own);
+                   g_free(own);
+                   xemu_queue_notification("EEPROM copied onto the console. Restart xemu to use it. "
+                                           "Saves made with the old one may show as damaged.");
+#else
                    xemu_settings_set_string(&g_config.sys.files.eeprom_path, path);
+#endif
                    m_dirty = true;
                });
 }

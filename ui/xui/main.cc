@@ -703,6 +703,7 @@ void xemu_hud_update(void)
 #endif
     g_scene_mgr.Draw();
 #ifdef XEMU_UWP
+    UwpFileBrowserDraw();
     xemu_uwp_menu_open = g_scene_mgr.IsDisplayingScene();
 #endif
     if (!first_boot_window.is_open) notification_manager.Draw();

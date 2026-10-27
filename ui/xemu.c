@@ -5417,6 +5417,61 @@ static char *uwp_system_folder(void)
     return result;
 }
 
+char *xemu_uwp_system_folder(void);
+char *xemu_uwp_take_eeprom(const char *picked, const char **why);
+
+/* for the file browser (ui/xui/uwp-file-browser.cc): the console's Xbox files folder, or NULL */
+char *xemu_uwp_system_folder(void)
+{
+    return uwp_system_folder();
+}
+
+/*
+ * An EEPROM picked in xemu's menu (a player's own, copied off their real Xbox) is copied onto the console as
+ * "eeprom-own.bin" in the Xbox files folder: it keeps working without the USB drive, and xemu cannot open an
+ * EEPROM on a FAT32 / exFAT stick. The console's eeprom.bin stays as it is (the running Xbox still writes to
+ * it), so going back is picking that one again. Returns the path to use (g_free), or NULL: *why says why.
+ */
+static bool uwp_under(const char *path, const char *dir);
+
+char *xemu_uwp_take_eeprom(const char *picked, const char **why)
+{
+    gchar *data = NULL;
+    gsize size = 0;
+    if (!g_file_get_contents(picked, &data, &size, NULL)) {
+        *why = "The EEPROM file could not be read.";
+        return NULL;
+    }
+    if (size != 256) {
+        g_free(data);
+        uwp_log("EEPROM: %s is %u bytes, not an Xbox EEPROM (256)", picked, (unsigned)size);
+        *why = "That file is not an Xbox EEPROM (an EEPROM is 256 bytes).";
+        return NULL;
+    }
+    char *folder = uwp_system_folder();
+    if (!folder || uwp_under(picked, folder)) {
+        g_free(folder);
+        g_free(data);
+        return g_strdup(picked);
+    }
+    g_mkdir_with_parents(folder, 0755);
+    char *to = g_strdup_printf("%seeprom-own.bin", folder);
+    GError *err = NULL;
+    bool ok = g_file_set_contents(to, data, size, &err);
+    uwp_log("EEPROM: %s copied onto the console as %s: %s", picked, to, ok ? "ok" : err->message);
+    if (err) {
+        g_error_free(err);
+    }
+    g_free(folder);
+    g_free(data);
+    if (!ok) {
+        g_free(to);
+        *why = "The EEPROM could not be copied onto the console.";
+        return NULL;
+    }
+    return to;
+}
+
 /*
  * The log also goes to the publisher's shared folder as games\logs\<disc name>.log, written as it
  * goes (so a crash leaves it complete). Game Vault copies these to "Game Vault\logs" on the USB drive,

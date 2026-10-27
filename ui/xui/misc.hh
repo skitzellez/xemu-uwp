@@ -39,6 +39,18 @@ void ShowSaveFileDialog(const SDL_DialogFileFilter *filters, int nfilters,
 void ShowOpenFolderDialog(const char *default_location,
                           FileDialogCallback callback);
 
+#ifdef XEMU_UWP
+/* xemu's own file browser on the Xbox (uwp-file-browser.cc): the system's picker never opens there */
+enum class UwpFileBrowserMode { Open, Save, Folder };
+void UwpFileBrowserOpen(UwpFileBrowserMode mode, const SDL_DialogFileFilter *filters, int nfilters,
+                        const char *default_location, FileDialogCallback callback);
+void UwpFileBrowserDraw();
+extern "C" {
+char *xemu_uwp_system_folder(void);
+char *xemu_uwp_take_eeprom(const char *picked, const char **why);
+}
+#endif
+
 template<typename ... Args>
 std::string string_format( const std::string& format, Args ... args )
 {
