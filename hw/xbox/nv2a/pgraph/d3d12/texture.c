@@ -2151,8 +2151,12 @@ static void fill_sampler_desc(const TextureShape *shape, uint32_t filter,
         GET_MASK(address, NV_PGRAPH_TEXADDRESS0_ADDRV));
     desc->AddressW = texture_address_mode(
         GET_MASK(address, NV_PGRAPH_TEXADDRESS0_ADDRP));
-    desc->MipLODBias = pgraph_convert_lod_bias_to_float(
-        GET_MASK(filter, NV_PGRAPH_TEXFILTER0_MIPMAP_LOD_BIAS));
+    /* NV2A's bias field reaches 15.996 (0xfff); D3D12 allows -16..15.99, and the console's driver removes the
+     * device for a sampler outside that (Fatal Frame's palette textures use 0xfff). OpenGL clamps it itself. */
+    desc->MipLODBias = MIN(MAX(pgraph_convert_lod_bias_to_float(
+                                   GET_MASK(filter, NV_PGRAPH_TEXFILTER0_MIPMAP_LOD_BIAS)),
+                               D3D12_MIP_LOD_BIAS_MIN),
+                           D3D12_MIP_LOD_BIAS_MAX);
     desc->MaxAnisotropy =
         desc->Filter == D3D12_FILTER_ANISOTROPIC ? max_anisotropy : 1;
     desc->ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
