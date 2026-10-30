@@ -204,12 +204,77 @@ int nv2a_get_screen_off(void)
     return g_nv2a->vga.sr[VGA_SEQ_CLOCK_MODE] & VGA_SR01_SCREEN_OFF;
 }
 
+#ifdef XEMU_UWP
+bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
+
+/* bia-fixes-off.txt (testing): the old way for the held-back vblank here and the surface write-back
+ * check in the Direct3D 12 renderer, to compare */
+bool xemu_uwp_bia_fixes_off(void);
+bool xemu_uwp_bia_fixes_off(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        off = xemu_uwp_test_file_exists("bia-fixes-off.txt");
+    }
+    return off;
+}
+
+static void nv2a_uwp_deferred_vblank(void *opaque)
+{
+    NV2AState *d = opaque;
+    d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
+    d->pcrtc.raster = 0;
+    nv2a_update_irq(d);
+}
+
+/* FIFO thread: the renderer's flip work goes on to its frame pacing wait */
+void nv2a_uwp_flip_work_pacing(NV2AState *d);
+void nv2a_uwp_flip_work_pacing(NV2AState *d)
+{
+    qatomic_set(&d->pgraph.uwp_in_flip_work, 2);
+}
+
+/* FIFO thread, after the renderer's flip work: a vblank held back meanwhile is raised now */
+void nv2a_uwp_flip_work_done(NV2AState *d);
+void nv2a_uwp_flip_work_done(NV2AState *d)
+{
+    qatomic_set(&d->pgraph.uwp_in_flip_work, 0);
+    if (qatomic_xchg(&d->uwp_vblank_deferred, false) && d->uwp_vblank_bh) {
+        qemu_bh_schedule(d->uwp_vblank_bh);
+    }
+}
+#endif
+
 static void nv2a_vga_gfx_update(void *opaque)
 {
     VGACommonState *vga = opaque;
     vga->hw_ops->gfx_update(vga);
 
     NV2AState *d = container_of(vga, NV2AState, vga);
+#ifdef XEMU_UWP
+    /*
+     * On the Xbox a flip costs the GPU nothing, so a vblank never finds it still busy at a FLIP_STALL.
+     * Here the renderer's flip work can take a while now and then (the console's graphics driver holds
+     * up a submit for ~50 ms every few seconds; the frame pacing wait after it), and a game that
+     * busy-waits for its flips then misses the vblank. Brothers in Arms: Earned in Blood's loading
+     * screen (a time-critical thread) never got back in step after one such miss and starved its loader
+     * thread for good. Such a vblank waits until the flip work is done; the game just sees a longer
+     * frame. During the pacing wait two vblanks are never merged into one, so game time keeps going.
+     */
+    if (!xemu_uwp_bia_fixes_off()) {
+        int phase = qatomic_read(&d->pgraph.uwp_in_flip_work);
+        if (phase == 2 && qatomic_read(&d->uwp_vblank_deferred)) {
+            qatomic_set(&d->uwp_vblank_deferred, false);   /* a second one: no more waiting */
+        } else if (phase) {
+            qatomic_set(&d->uwp_vblank_deferred, true);
+            /* the flip work may have ended in between: then nobody else raises it */
+            if (qatomic_read(&d->pgraph.uwp_in_flip_work) ||
+                !qatomic_xchg(&d->uwp_vblank_deferred, false)) {
+                return;
+            }
+        }
+    }
+#endif
     d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
 #ifdef XEMU_UWP
     extern unsigned xemu_uwp_vblank_count;
@@ -644,6 +709,9 @@ void nv2a_init(PCIBus *bus, int devfn, MemoryRegion *ram)
     NV2AState *d = NV2A_DEVICE(dev);
     nv2a_init_memory(d, ram);
     nv2a_init_vga(d);
+#ifdef XEMU_UWP
+    d->uwp_vblank_bh = qemu_bh_new(nv2a_uwp_deferred_vblank, d);
+#endif
     ptimer_init(d);
     qemu_add_vm_change_state_handler(nv2a_vm_state_change, d);
 }

@@ -267,6 +267,11 @@ typedef struct PGRAPHState {
     bool clearing; // FIXME: Internal
     bool waiting_for_nop;
     bool waiting_for_flip;
+#ifdef XEMU_UWP
+    /* The FIFO thread is in the renderer's flip work (FLIP_STALL): 1 submit (a vblank waits for it),
+     * 2 frame pacing wait (a vblank waits, but two are never merged into one) */
+    int uwp_in_flip_work;
+#endif
     bool waiting_for_context_switch;
 
     bool flush_pending;

@@ -19,6 +19,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/cpu-common.h"
+#include "system/physmem.h"
 #include <math.h>
 #include "qapi/error.h"
 #include "hw/xbox/nv2a/pgraph/swizzle.h"
@@ -1780,6 +1782,75 @@ static void record_surface_download(
     }
 }
 
+
+#ifdef XEMU_UWP
+/*
+ * Guest memory under a GPU-owned surface written by something other than the vCPU (vCPU writes are
+ * watched and write the surface back first): disc or other device DMA after the game freed the render
+ * target and reused its memory. On the Xbox the GPU's pixels were in memory long before and the newer
+ * data won; writing the surface back now puts old pixels over it (Brothers in Arms: Earned in Blood
+ * loaded a sound bank where a 640x480 depth buffer had been, the depth buffer was then written back
+ * over it, and the game crashed reading the bank). The DIRTY_MEMORY_NV2A bits of the pages wholly
+ * inside the surface are cleared when the GPU takes the surface; one set at write-back time means
+ * such a write, and the memory's data wins.
+ */
+bool xemu_uwp_bia_fixes_off(void); /* hw/xbox/nv2a/nv2a.c */
+
+static void surface_ram_range(const PGRAPHD3D12SurfaceBinding *surface, hwaddr *start, hwaddr *end)
+{
+    *start = ROUND_UP(surface->vram_addr, TARGET_PAGE_SIZE);
+    *end = (surface->vram_addr + surface->size) & ~(hwaddr)(TARGET_PAGE_SIZE - 1);
+}
+
+static void surface_ram_now_gpu_owned(NV2AState *d, const PGRAPHD3D12SurfaceBinding *surface)
+{
+    hwaddr start, end;
+
+    surface_ram_range(surface, &start, &end);
+    if (end > start && !xemu_uwp_bia_fixes_off()) {
+        memory_region_test_and_clear_dirty(d->vram, start, end - start, DIRTY_MEMORY_NV2A);
+    }
+}
+
+static bool surface_ram_written_since_gpu(NV2AState *d, PGRAPHD3D12SurfaceBinding *surface)
+{
+    MemoryRegion *mr = d->vram;
+    hwaddr start, end;
+
+    if (!surface->draw_dirty || surface->size == 0 || mr->alias || xemu_uwp_bia_fixes_off()) {
+        return false;
+    }
+    surface_ram_range(surface, &start, &end);
+    ram_addr_t base = memory_region_get_ram_addr(mr);
+    for (hwaddr a = start; a < end; a += TARGET_PAGE_SIZE) {
+        if (physical_memory_get_dirty_flag(base + a, DIRTY_MEMORY_NV2A)) {
+            static unsigned reported;
+            if (reported++ < 16) {
+                fprintf(stderr, "Direct3D 12: %c surface 0x%" HWADDR_PRIx " %ux%u not written back: device "
+                        "wrote its memory at 0x%" HWADDR_PRIx " after the GPU\n",
+                        surface->color ? 'c' : 'z', surface->vram_addr, surface->width, surface->height, a);
+            }
+            surface->draw_dirty = false;
+            surface->download_pending = false;
+            surface->upload_pending = true;
+            surface->cleared = false;
+            surface->range_download_valid = false;
+            if (tcg_enabled() && surface->access_cb != NULL) {
+                mem_access_callback_set_enabled(qemu_get_cpu(0), surface->access_cb, false);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+#else
+static inline void surface_ram_now_gpu_owned(NV2AState *d, const PGRAPHD3D12SurfaceBinding *surface) {}
+static inline bool surface_ram_written_since_gpu(NV2AState *d, PGRAPHD3D12SurfaceBinding *surface)
+{
+    return false;
+}
+#endif
+
 static bool download_z24s8_surface_data(
     NV2AState *d, PGRAPHD3D12SurfaceBinding *surface,
     PGRAPHD3D12SurfaceDownloadReason reason, bool force, Error **errp)
@@ -1977,6 +2048,9 @@ static bool download_surface_data_impl(
                        surface->download_pending, force, (int)reason);
 
     if (!(surface->download_pending || force) || !surface->draw_dirty) {
+        return true;
+    }
+    if (surface_ram_written_since_gpu(d, surface)) {
         return true;
     }
 
@@ -2181,7 +2255,8 @@ static bool download_surfaces_batched(
             uint64_t bytes;
             uint64_t offset;
 
-            if (surface == NULL || !surface->draw_dirty) {
+            if (surface == NULL || !surface->draw_dirty ||
+                surface_ram_written_since_gpu(d, surface)) {
                 i++;
                 continue;
             }
@@ -2628,7 +2703,8 @@ bool pgraph_d3d12_download_surfaces_checked_reason(
              i < count && i < base + SURFACE_READBACK_BATCH_MAX; i++) {
             PGRAPHD3D12SurfaceBinding *surface = surfaces[i];
 
-            if (surface == NULL || !surface->draw_dirty) {
+            if (surface == NULL || !surface->draw_dirty ||
+                surface_ram_written_since_gpu(d, surface)) {
                 continue;
             }
             /* Older stashed bytes under the surface land first. */
@@ -2922,6 +2998,9 @@ static void restore_surface_from_stash(NV2AState *d,
     pgraph_d3d12_transition_raw_resource(r, target->resource, &target->state,
                                          target_state);
 
+    if (!target->draw_dirty) {
+        surface_ram_now_gpu_owned(d, target);
+    }
     target->draw_dirty = true;
     target->cleared = false;
     target->upload_pending = false;
@@ -2956,6 +3035,9 @@ static bool download_surface_rows(
     D3D12_TEXTURE_COPY_LOCATION src_loc;
     D3D12_BOX src_box;
 
+    if (surface_ram_written_since_gpu(d, surface)) {
+        return true;
+    }
     pgraph_apply_scaling_factor(pg, &scaled_width, &scaled_height);
 
     memset(&src_box, 0, sizeof(src_box));
@@ -4335,6 +4417,9 @@ static void apply_alias_copies(NV2AState *d)
         pgraph_d3d12_transition_raw_resource(r, target->resource,
                                              &target->state, target_state);
 
+        if (!target->draw_dirty) {
+            surface_ram_now_gpu_owned(d, target);
+        }
         target->draw_dirty = true;
         target->cleared = false;
         if (tcg_enabled() && target->access_cb != NULL) {
@@ -6005,6 +6090,7 @@ void pgraph_d3d12_set_surface_dirty(PGRAPHState *pg, bool color, bool zeta)
 
     if (r->color_binding) {
         if (color && !r->color_binding->draw_dirty) {
+            surface_ram_now_gpu_owned(container_of(pg, NV2AState, pgraph), r->color_binding);
             r->color_binding->draw_dirty = true;
             if (tcg_enabled()) {
                 mem_access_callback_set_enabled(
@@ -6020,6 +6106,7 @@ void pgraph_d3d12_set_surface_dirty(PGRAPHState *pg, bool color, bool zeta)
 
     if (r->zeta_binding) {
         if (zeta && !r->zeta_binding->draw_dirty) {
+            surface_ram_now_gpu_owned(container_of(pg, NV2AState, pgraph), r->zeta_binding);
             r->zeta_binding->draw_dirty = true;
             if (tcg_enabled()) {
                 mem_access_callback_set_enabled(

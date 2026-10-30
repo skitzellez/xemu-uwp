@@ -2267,6 +2267,12 @@ static void pgraph_d3d12_flip_stall(NV2AState *d)
         return;
     }
 
+    /* The wait below is the console's GPU pacing the frames: a vblank still waits for it, but two are
+     * never merged into one (hw/xbox/nv2a/nv2a.c). */
+    {
+        void nv2a_uwp_flip_work_pacing(NV2AState *d);
+        nv2a_uwp_flip_work_pacing(d);
+    }
     wait_start = g_get_monotonic_time();
     {
         uint64_t wait_value = r->last_flip_fence_value;

@@ -78,6 +78,10 @@ typedef struct NV2AState {
     VGACommonState vga;
     GraphicHwOps hw_ops;
     QEMUTimer *vblank_timer;
+#ifdef XEMU_UWP
+    QEMUBH *uwp_vblank_bh;      /* raises a vblank interrupt held back during flip work */
+    bool uwp_vblank_deferred;
+#endif
 
     MemoryRegion *vram;
     MemoryRegion vram_pci;

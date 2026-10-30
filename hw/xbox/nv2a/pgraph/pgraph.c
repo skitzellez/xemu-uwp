@@ -1342,8 +1342,17 @@ DEF_METHOD(NV097, FLIP_STALL)
 {
     trace_nv2a_pgraph_flip_stall();
     UWP_TRACE("frame end");
+#ifdef XEMU_UWP
+    qatomic_set(&pg->uwp_in_flip_work, 1);
+#endif
     d->pgraph.renderer->ops.surface_update(d, false, true, true);
     d->pgraph.renderer->ops.flip_stall(d);
+#ifdef XEMU_UWP
+    {
+        void nv2a_uwp_flip_work_done(NV2AState *d); /* hw/xbox/nv2a/nv2a.c */
+        nv2a_uwp_flip_work_done(d);
+    }
+#endif
     nv2a_profile_flip_stall();
     pg->waiting_for_flip = true;
 }
