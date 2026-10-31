@@ -2689,6 +2689,16 @@ static void uwp_press_poll(void)
     uint16_t mask = uwp_press_queue[uwp_press_next];
     int16_t trigger = uwp_press_trigger[uwp_press_next];
     uint16_t pause = uwp_press_pause[uwp_press_next++];
+    extern int xemu_uwp_latency_probe;
+    extern int64_t xemu_uwp_probe_press_us;
+    bool xemu_uwp_test_file_exists(const char *name);
+    if (xemu_uwp_latency_probe < 0) {
+        xemu_uwp_latency_probe = xemu_uwp_test_file_exists("latency-probe.txt") ? 1 : 0;
+    }
+    if (xemu_uwp_latency_probe == 1 && (mask || uwp_press_stick_axis[uwp_press_next - 1] >= 0)) {
+        xemu_uwp_probe_press_us = g_get_monotonic_time();   /* latency-probe.txt: ui/d3d12-presenter-compat.h */
+        uwp_log("probe: press %d (buttons 0x%x, stick %d)", uwp_press_next - 1, mask, uwp_press_stick_axis[uwp_press_next - 1]);
+    }
     uint16_t hold = uwp_press_hold_mask[uwp_press_next - 1];
     if (uwp_press_stick_axis[uwp_press_next - 1] >= 0) {
         extern int xemu_uwp_injected_stick_axis, xemu_uwp_injected_stick_value;
@@ -4948,6 +4958,8 @@ const char *xemu_uwp_config_mac(void)
 }
 
 /* a test file next to the log (LocalState/xemu/xemu); only the Device Portal can put one there */
+int xemu_uwp_latency_probe = -1;     /* testing: latency-probe.txt (ui/d3d12-presenter-compat.h) */
+int64_t xemu_uwp_probe_press_us = 0;
 bool xemu_uwp_test_file_exists(const char *name);
 bool xemu_uwp_test_file_exists(const char *name)
 {
