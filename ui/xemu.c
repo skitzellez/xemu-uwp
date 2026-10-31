@@ -5705,15 +5705,32 @@ static char *uwp_read_small(const char *path)
     return g_strstrip(g_strdup(buf));
 }
 
-/* The ID of a console disk, made the first time. */
+/* The ID of a console disk, made the first time. Only a missing (or empty) ID file gets a new one: a read that failed
+ * once (the file busy for a moment) made a new ID before, and Game Vault then took the USB drive's copy of the same
+ * disk for another one and copied all of it again (18 GB on the owner's console, 2026-10-30). */
 static char *uwp_disk_id(const char *disk)
 {
     char *file = g_strdup_printf("%s.id", disk);
-    char *id = uwp_read_small(file);
+    char *id = NULL;
+    DWORD err = 0;
+    for (int i = 0; i < 5; i++) {
+        SetLastError(0);
+        id = uwp_read_small(file);
+        err = GetLastError();
+        if (id || err == 0 || err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+            break;
+        }
+        g_usleep(100 * 1000);
+    }
     if (!id) {
         id = g_uuid_string_random();
-        if (!g_file_set_contents(file, id, -1, NULL)) {
-            uwp_log("hard disk: could not write its ID (%s)", file);
+        if (err == 0 || err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+            if (!g_file_set_contents(file, id, -1, NULL)) {
+                uwp_log("hard disk: could not write its ID (%s)", file);
+            }
+        } else {
+            uwp_log("hard disk: its ID could not be read (error %lu); kept as it is, this session goes without it",
+                    (unsigned long)err);
         }
     }
     g_free(file);
