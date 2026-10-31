@@ -48,6 +48,28 @@ uint64_t user_read(void *opaque, hwaddr addr, unsigned int size)
                 break;
             case NV_USER_DMA_GET:
                 r = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
+#ifdef XEMU_UWP
+                /*
+                 * While the GPU waits at a FLIP_STALL, the guest is told it is still where that frame began. The
+                 * Xbox's GPU takes real time to draw a frame, so a game that waits for its last flip finds the GPU
+                 * far behind and D3D puts the thread to sleep until the GPU gets there ("block on time"); here
+                 * the commands go through at once and the GPU sits at the stall, so D3D saw it a few bytes short
+                 * and busy-waited instead, a whole frame every frame. A loading screen's high-priority thread
+                 * then never let the loading thread run: Baldur's Gate: Dark Alliance II stayed on the screen
+                 * after its intro video for good. Once the flip is released the real position is answered
+                 * again. dmaget-real.txt (testing): always the real one.
+                 */
+                {
+                    static int real = -1;
+                    if (real < 0) {
+                        bool xemu_uwp_test_file_exists(const char *name);
+                        real = xemu_uwp_test_file_exists("dmaget-real.txt");
+                    }
+                    if (!real && d->pfifo.uwp_frame_get_valid && qatomic_read(&d->pgraph.waiting_for_flip)) {
+                        r = d->pfifo.uwp_frame_get;
+                    }
+                }
+#endif
                 break;
             case NV_USER_REF:
                 r = d->pfifo.regs[NV_PFIFO_CACHE1_REF];
@@ -121,6 +143,9 @@ void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
                 break;
             case NV_USER_DMA_GET:
                 d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET] = val;
+#ifdef XEMU_UWP
+                d->pfifo.uwp_frame_get_valid = false;   /* the guest moved it: the frame start no longer holds */
+#endif
                 break;
             case NV_USER_REF:
                 d->pfifo.regs[NV_PFIFO_CACHE1_REF] = val;

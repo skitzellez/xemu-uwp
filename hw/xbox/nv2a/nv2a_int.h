@@ -109,6 +109,12 @@ typedef struct NV2AState {
         bool halt;
         /* Time the FIFO thread spent waiting for work. */
         int64_t idle_us;
+#ifdef XEMU_UWP
+        /* DMA_GET when the last flip stall was released: where the frame now waiting at a FLIP_STALL began
+         * (user.c answers the guest with it while that stall lasts) */
+        uint32_t uwp_frame_get;
+        bool uwp_frame_get_valid;
+#endif
     } pfifo;
 
     /*

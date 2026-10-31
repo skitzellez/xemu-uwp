@@ -151,6 +151,10 @@ static bool pfifo_stall_for_flip(NV2AState *d)
             should_stall = true;
         } else {
             d->pgraph.waiting_for_flip = false;
+#ifdef XEMU_UWP
+            d->pfifo.uwp_frame_get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
+            d->pfifo.uwp_frame_get_valid = true;
+#endif
         }
         qemu_mutex_unlock(&d->pgraph.lock);
     }

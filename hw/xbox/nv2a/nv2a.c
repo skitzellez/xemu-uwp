@@ -400,6 +400,9 @@ static void nv2a_reset(NV2AState *d)
 
     d->pgraph.waiting_for_nop = false;
     d->pgraph.waiting_for_flip = false;
+#ifdef XEMU_UWP
+    d->pfifo.uwp_frame_get_valid = false;
+#endif
     d->pgraph.waiting_for_context_switch = false;
 
     d->pmc.pending_interrupts = 0;
