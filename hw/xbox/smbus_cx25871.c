@@ -46,6 +46,8 @@ typedef struct SMBusCX25871Device {
     uint8_t cmd;
 } SMBusCX25871Device;
 
+static SMBusCX25871Device *conexant_device;
+
 static void smbus_cx25871_quick_cmd(SMBusDevice *dev, uint8_t read)
 {
     DPRINTF("smbus_cx25871_quick_cmd: addr=0x%02x read=%d\n", dev->i2c.address, read);
@@ -116,4 +118,21 @@ void smbus_cx25871_init(I2CBus *smbus, int address)
     dev = qdev_new(TYPE_SMBUS_CX25871);
     qdev_prop_set_uint8(dev, "address", address);
     qdev_realize_and_unref(dev, (BusState *)smbus, &error_fatal);
+    conexant_device = SMBUS_CX25871(dev);
+}
+
+/*
+ * From upstream PR #2537 (abaire, open): the Conexant's FIELD_CNT (register 0x06, low nibble) counts fields, one
+ * per vblank. Xbox D3D compares its low bit with its own frame counter after a Reset and bumps the counter when they
+ * differ; with the register stuck at 0, DreamWorks: Over the Hedge's counter could step past a flip's target frame
+ * before its intro videos, and the flip never came (black screen, upstream #1962). Not saved in snapshots, so quick
+ * saves stay loadable both ways.
+ */
+void smbus_cx25871_notify_vblank(void)
+{
+    if (unlikely(!conexant_device)) {
+        return;
+    }
+    uint8_t r = conexant_device->registers[0x06];
+    conexant_device->registers[0x06] = (r & ~0x0F) | ((r + 1) & 0x0F);
 }

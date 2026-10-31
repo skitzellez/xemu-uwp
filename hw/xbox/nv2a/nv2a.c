@@ -20,6 +20,7 @@
  */
 
 #include "hw/xbox/nv2a/nv2a_int.h"
+#include "hw/xbox/smbus.h"
 #include "qemu/main-loop.h"
 
 #ifdef XEMU_UWP
@@ -223,6 +224,7 @@ static void nv2a_uwp_deferred_vblank(void *opaque)
 {
     NV2AState *d = opaque;
     d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
+    smbus_cx25871_notify_vblank();
     d->pcrtc.raster = 0;
     nv2a_update_irq(d);
 }
@@ -276,6 +278,7 @@ static void nv2a_vga_gfx_update(void *opaque)
     }
 #endif
     d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
+    smbus_cx25871_notify_vblank();
 #ifdef XEMU_UWP
     extern unsigned xemu_uwp_vblank_count;
     xemu_uwp_vblank_count++;
