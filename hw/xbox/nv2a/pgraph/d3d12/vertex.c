@@ -612,6 +612,10 @@ void pgraph_d3d12_bind_vertex_attributes_inline(NV2AState *d)
     for (int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
         VertexAttribute *attr = &pg->vertex_attributes[i];
 
+        /* Inline vertices are always float4: an array draw's raw decode for this
+         * attribute (e.g. S32K shorts) must not carry over to them. */
+        r->vertex_fetch_raw_bits[i] = 0;
+
         if (attr->inline_buffer_populated) {
             r->vertex_attribute_to_description_location[i] =
                 r->num_active_vertex_attribute_descriptions;
