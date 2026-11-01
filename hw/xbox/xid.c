@@ -112,6 +112,23 @@ void update_input(USBXIDGamepadState *s)
     s->in_state.sThumbLY = state->axis[CONTROLLER_AXIS_LSTICK_Y];
     s->in_state.sThumbRX = state->axis[CONTROLLER_AXIS_RSTICK_X];
     s->in_state.sThumbRY = state->axis[CONTROLLER_AXIS_RSTICK_Y];
+#ifdef XEMU_UWP
+    {
+        /* latency-probe.txt (testing): when the game first reads a newly pressed button after a test press */
+        extern int xemu_uwp_latency_probe;
+        extern int64_t xemu_uwp_probe_press_us;
+        void uwp_log(const char *fmt, ...);
+        static uint32_t last_buttons;
+        uint32_t newly = state->buttons & ~last_buttons;
+        last_buttons = state->buttons;
+        if (newly && xemu_uwp_latency_probe == 1 && xemu_uwp_probe_press_us) {
+            int64_t since = g_get_monotonic_time() - xemu_uwp_probe_press_us;
+            if (since >= 0 && since < 1500000) {
+                uwp_log("probe: game read the press %+lld ms (buttons 0x%x)", (long long)(since / 1000), newly);
+            }
+        }
+    }
+#endif
 }
 
 void usb_xid_handle_reset(USBDevice *dev)

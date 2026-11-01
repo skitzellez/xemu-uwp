@@ -1355,6 +1355,22 @@ DEF_METHOD(NV097, FLIP_STALL)
 #endif
     nv2a_profile_flip_stall();
     pg->waiting_for_flip = true;
+#ifdef XEMU_UWP
+    {
+        /* latency-probe.txt (testing): each frame the GPU finishes in the 1.5 s after a test press, and how much
+         * of the game's command buffer still waits behind it (the CPU running ahead of the GPU) */
+        extern int xemu_uwp_latency_probe;
+        extern int64_t xemu_uwp_probe_press_us;
+        if (xemu_uwp_latency_probe == 1 && xemu_uwp_probe_press_us) {
+            int64_t since = g_get_monotonic_time() - xemu_uwp_probe_press_us;
+            if (since >= 0 && since < 1500000) {
+                uint32_t get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET], put = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT];
+                uwp_log("probe: gpu frame end %+lld ms, commands waiting %d bytes", (long long)(since / 1000),
+                        (int)(put >= get ? put - get : -1));
+            }
+        }
+    }
+#endif
 }
 
 // TODO: these should be loading the dma objects from ramin here?
