@@ -5270,6 +5270,13 @@ static char *uwp_take_activation_disc(void)
                 uwp_log("link: controller mapping refused");
             }
         }
+        if (!strncmp(p, "fps60=", 6)) {
+            /* the game's details in Game Vault: "60 FPS (experimental)" for a game locked to 30 (hw/xbox/nv2a/nv2a.c
+               nv2a_uwp_vblank2x): for this session only */
+            extern bool nv2a_uwp_fps60;
+            nv2a_uwp_fps60 = p[6] == '1';
+            uwp_log("link: 60 fps %s", nv2a_uwp_fps60 ? "on" : "off");
+        }
         if (!strncmp(p, "fit=", 4)) {
             /* how the picture fills the TV, chosen in Game Vault (Menu > Picture): for this session only */
             const char *v = p + 4;
