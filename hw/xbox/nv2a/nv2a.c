@@ -229,6 +229,43 @@ static void nv2a_uwp_deferred_vblank(void *opaque)
     nv2a_update_irq(d);
 }
 
+/* vblank2x.txt (testing, Turok: Evolution 60 fps): one more vblank halfway between the screen's own, so a
+ * game that shows a frame every second vblank (30 fps) shows one every 16.7 ms. Whether its game speed
+ * follows the clock or the vblank count is what the test is for. */
+static bool nv2a_uwp_vblank2x(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = xemu_uwp_test_file_exists("vblank2x.txt");
+    }
+    return on;
+}
+
+static QEMUTimer *s_uwp_half_vblank;
+static int64_t s_uwp_last_vblank_ns;
+
+static void nv2a_uwp_half_vblank(void *opaque)
+{
+    nv2a_uwp_deferred_vblank(opaque);
+}
+
+static void nv2a_uwp_vblank2x_after_vblank(NV2AState *d)
+{
+    if (!nv2a_uwp_vblank2x()) {
+        return;
+    }
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    int64_t gap = s_uwp_last_vblank_ns ? now - s_uwp_last_vblank_ns : 16666667;
+    s_uwp_last_vblank_ns = now;
+    if (gap < 8000000 || gap > 40000000) {
+        gap = 16666667;
+    }
+    if (!s_uwp_half_vblank) {
+        s_uwp_half_vblank = timer_new_ns(QEMU_CLOCK_REALTIME, nv2a_uwp_half_vblank, d);
+    }
+    timer_mod(s_uwp_half_vblank, now + gap / 2);
+}
+
 /* FIFO thread: the renderer's flip work goes on to its frame pacing wait */
 void nv2a_uwp_flip_work_pacing(NV2AState *d);
 void nv2a_uwp_flip_work_pacing(NV2AState *d)
@@ -286,6 +323,9 @@ static void nv2a_vga_gfx_update(void *opaque)
     d->pcrtc.raster = 0;
 
     nv2a_update_irq(d);
+#ifdef XEMU_UWP
+    nv2a_uwp_vblank2x_after_vblank(d);
+#endif
 }
 
 static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
