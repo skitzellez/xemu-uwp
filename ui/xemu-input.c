@@ -628,6 +628,35 @@ bool xemu_uwp_game_input_held(const ControllerState *state)
 }
 #endif
 
+#ifdef XEMU_UWP
+/* Game Vault: refresh SDL's pad readings when the game reads the controller (see xemu_input_update_controller),
+ * at most once per 2 ms for all pads. "input-fresh-off.txt" next to the log turns it off (a test). */
+static void xemu_uwp_fresh_pad_read(int64_t now)
+{
+    static int64_t last_us, window_us;
+    static int off = -1;
+    static unsigned reads;
+    bool xemu_uwp_test_file_exists(const char *name);
+    if (off < 0) {
+        off = xemu_uwp_test_file_exists("input-fresh-off.txt") ? 1 : 0;
+        fprintf(stderr, "input: controller read when the game asks: %s\n", off ? "off (test file)" : "on");
+    }
+    if (off || now - last_us < 2000) {
+        return;
+    }
+    last_us = now;
+    SDL_UpdateJoysticks();
+    reads++;
+    if (now - window_us >= 60 * 1000000LL) {
+        if (window_us) {
+            fprintf(stderr, "input: %u fresh controller reads in the last minute\n", reads);
+        }
+        window_us = now;
+        reads = 0;
+    }
+}
+#endif
+
 void xemu_input_update_controller(ControllerState *state)
 {
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
@@ -639,6 +668,12 @@ void xemu_input_update_controller(ControllerState *state)
     if (state->type == INPUT_DEVICE_SDL_KEYBOARD) {
         xemu_input_update_sdl_kbd_controller_state(state);
     } else if (state->type == INPUT_DEVICE_SDL_GAMEPAD) {
+#ifdef XEMU_UWP
+        /* Game Vault: the controller as it is now. SDL reads the pads only when the screen's thread pumps its
+         * events, once a picture (~17 ms), so the game (which asks every 4 ms) got a reading 8 ms old on average,
+         * up to a whole frame: in every game. SDL_UpdateJoysticks may be called from any thread (SDL 3.2). */
+        xemu_uwp_fresh_pad_read(now);
+#endif
         xemu_input_update_sdl_controller_state(state);
     }
 #ifdef XEMU_UWP
