@@ -2915,10 +2915,18 @@ DEF_METHOD_INC(NV097, SET_VERTEX_DATA_ARRAY_FORMAT)
         attr->size = 4;
         assert(attr->count == 1);
         break;
-    default:
-        fprintf(stderr, "Unknown vertex type: 0x%x\n", attr->format);
-        assert(!"Unknown vertex type");
+    default: {
+        /* Game Vault: a vertex format the NV2A does not have (Tony Hawk's Pro Skater 2x, 2026-10-31, type 0x8): the
+         * assert closed xemu. The attribute is turned off instead (size 0 is "off" on the NV2A); logged once. */
+        static uint16_t logged;
+        if (!(logged & (1u << (attr->format & 15)))) {
+            logged |= 1u << (attr->format & 15);
+            fprintf(stderr, "nv2a: unknown vertex type 0x%x, attribute %d turned off\n", attr->format, slot);
+        }
+        attr->size = 4;
+        attr->count = 0;
         break;
+    }
     }
 
     if (attr->format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_CMP) {
@@ -3016,7 +3024,18 @@ DEF_METHOD(NV097, SET_BEGIN_END)
             NV2A_DPRINTF("Begin without End!\n");
             return;
         }
-        assert(parameter <= NV097_SET_BEGIN_END_OP_POLYGON);
+        if (parameter > NV097_SET_BEGIN_END_OP_POLYGON) {
+            /* Game Vault: a primitive type the NV2A does not have. The Xbox Live sign-up keyboard (Insignia account,
+             * 2026-10-31) and Ninja Gaiden Black sent one, and the assert closed xemu. The draw is skipped (its End
+             * finds no Begin, which is handled); logged once per value. */
+            static uint32_t logged[4];
+            uint32_t bit = parameter & 127;
+            if (!(logged[bit / 32] & (1u << (bit % 32)))) {
+                logged[bit / 32] |= 1u << (bit % 32);
+                fprintf(stderr, "nv2a: draw with an unknown primitive type %u skipped\n", parameter);
+            }
+            return;
+        }
         pg->primitive_mode = parameter;
         pgraph_reset_inline_buffers(pg);
         d->pgraph.renderer->ops.draw_begin(d);

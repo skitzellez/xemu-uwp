@@ -443,10 +443,14 @@ static void pfifo_run_pusher(NV2AState *d)
             } else {
                 NV2A_DPRINTF("pb reserved cmd 0x%x - 0x%x\n",
                              dma_get_v, word);
-                SET_MASK(*dma_state, NV_PFIFO_CACHE1_DMA_STATE_ERROR,
-                         NV_PFIFO_CACHE1_DMA_STATE_ERROR_RESERVED_CMD);
-                // break;
-                assert(!"Reserved pb command - invalid GPU command. Check logs for more info");
+                /* Game Vault: a word that is no command (Hitman: Blood Money, 2026-10-31): the assert closed xemu,
+                 * and setting the error state stops the GPU for good (the game freezes). The word is skipped and
+                 * the commands after it run; the first few are logged. */
+                static int logged;
+                if (logged < 5) {
+                    logged++;
+                    fprintf(stderr, "nv2a: unknown command word 0x%08x at 0x%x skipped\n", word, dma_get_v - 4);
+                }
             }
         }
 
