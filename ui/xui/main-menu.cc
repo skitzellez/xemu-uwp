@@ -1073,6 +1073,19 @@ static void PortDialDraw()
         return;
     }
 
+    /* The A press that opened the dial is still this frame's press: answering it closed the dial at once (only Y
+     * seemed to open it). Keys count from the next frame, and A only once it has been let go. */
+    static bool wait_release;
+    if (ImGui::IsWindowAppearing()) {
+        wait_release = true;
+        ImGui::EndPopup();
+        return;
+    }
+    if (wait_release && !ImGui::IsKeyDown(ImGuiKey_GamepadFaceDown) && !ImGui::IsKeyDown(ImGuiKey_Enter) &&
+        !ImGui::IsKeyDown(ImGuiKey_KeypadEnter)) {
+        wait_release = false;
+    }
+
     static const int place[5] = { 10000, 1000, 100, 10, 1 };
     if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft) || ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
         s_port_dial_digit = (s_port_dial_digit + 4) % 5;
@@ -1130,9 +1143,9 @@ static void PortDialDraw()
                            "A port is 1 to 65535   Up/Down: change   B: cancel");
     }
 
-    bool ok = ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown, false) ||
-              ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
-              ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
+    bool ok = !wait_release && (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown, false) ||
+                                ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+                                ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
     bool cancel = ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
                   ImGui::IsKeyPressed(ImGuiKey_Escape, false);
     if ((ok && valid) || cancel) {
