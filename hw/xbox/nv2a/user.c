@@ -21,6 +21,9 @@
 
 #include "nv2a_int.h"
 
+/* the running game's own title ID, read from its XBE by ui/xemu.c every 2 s (0 = not known) */
+uint32_t nv2a_uwp_xbe_title;
+
 /* USER - PFIFO MMIO and DMA submission area */
 uint64_t user_read(void *opaque, hwaddr addr, unsigned int size)
 {
@@ -59,13 +62,28 @@ uint64_t user_read(void *opaque, hwaddr addr, unsigned int size)
                  * after its intro video for good. Once the flip is released the real position is answered
                  * again. dmaget-real.txt (testing): always the real one.
                  */
+                /*
+                 * Only for the game that needs it (Dark Alliance II, title 4950000A): the Xbox dashboard, and the
+                 * Xbox Live sign-up keyboard in games, overwrote commands the GPU had not read yet when told the
+                 * frame's start, and xemu closed on the garbage (2026-11-01). dmaget-frame.txt (testing): for
+                 * every game, as 0.9.1007.0 did.
+                 */
                 {
-                    static int real = -1;
+                    static int real = -1, every = -1;
                     if (real < 0) {
                         bool xemu_uwp_test_file_exists(const char *name);
                         real = xemu_uwp_test_file_exists("dmaget-real.txt");
+                        every = xemu_uwp_test_file_exists("dmaget-frame.txt");
                     }
-                    if (!real && d->pfifo.uwp_frame_get_valid && qatomic_read(&d->pgraph.waiting_for_flip)) {
+                    extern uint32_t nv2a_uwp_xbe_title;   /* ui/xemu.c: the running game's own title ID */
+                    if (!every && qatomic_read(&d->pgraph.shader_cache.title_id) != 0x4950000Au &&
+                        qatomic_read(&nv2a_uwp_xbe_title) != 0x4950000Au) {
+                        break;
+                    }
+                    /* and only while the frame's start is behind the real position (after the command buffer
+                     * wrapped back to its beginning it would lie ahead) */
+                    if (!real && d->pfifo.uwp_frame_get_valid && qatomic_read(&d->pgraph.waiting_for_flip) &&
+                        d->pfifo.uwp_frame_get <= r) {
                         r = d->pfifo.uwp_frame_get;
                     }
                 }

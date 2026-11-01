@@ -48,6 +48,7 @@
 #include "d3d12-presenter.h"
 #endif
 #include "xemu-input.h"
+#include "xemu-xbe.h"
 #include "xemu-settings.h"
 #include "xemu-snapshots.h"
 #include "xemu-notifications.h"
@@ -6428,6 +6429,22 @@ int main(int argc, char **argv)
             Sleep(8000);
         }
         uwp_poll_activation();
+        if ((uwp_frames % 120) == 0) {
+            /* the running game's own title ID, every 2 s (hw/xbox/nv2a/user.c: Dark Alliance II's flip answer,
+             * also when no Game Vault tid= came with the link) */
+            extern uint32_t nv2a_uwp_xbe_title;
+            uint32_t tid = 0;
+            xemu_main_loop_lock();
+            struct xbe *xbe = xemu_get_xbe_info();
+            if (xbe && xbe->cert) {
+                tid = ldl_le_p(&xbe->cert->m_titleid);
+            }
+            xemu_main_loop_unlock();
+            if (tid != qatomic_read(&nv2a_uwp_xbe_title)) {
+                qatomic_set(&nv2a_uwp_xbe_title, tid);
+                uwp_log("running title %08x", tid);
+            }
+        }
 #ifdef CONFIG_D3D12
         if (m_use_d3d12) {
             /* New graphics: its pipeline list is kept per game (Game Vault's tid=), and built at the start */
