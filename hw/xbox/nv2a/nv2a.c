@@ -229,16 +229,31 @@ static void nv2a_uwp_deferred_vblank(void *opaque)
     nv2a_update_irq(d);
 }
 
-/* vblank2x.txt (testing, Turok: Evolution 60 fps): one more vblank halfway between the screen's own, so a
- * game that shows a frame every second vblank (30 fps) shows one every 16.7 ms. Whether its game speed
- * follows the clock or the vblank count is what the test is for. */
+/* 60 fps for games locked to 30: one more vblank halfway between the screen's own, so a game that shows a
+ * frame every second vblank (30 fps) shows one every 16.7 ms. Only for games whose game speed follows the
+ * clock, not the vblank count (checked on the console, 2026-11-01):
+ *   41430004 Turok: Evolution (USA): 59-60 fps in gameplay, intro timings unchanged, "it feels smooth".
+ * vblank2x.txt (testing) turns it on for every game, vblank2x-off.txt off for all. */
+extern uint32_t nv2a_uwp_xbe_title; /* ui/xemu.c: the running game's title ID */
 static bool nv2a_uwp_vblank2x(void)
 {
-    static int on = -1;
-    if (on < 0) {
-        on = xemu_uwp_test_file_exists("vblank2x.txt");
+    static int forced = -1, off = -1;
+    if (forced < 0) {
+        forced = xemu_uwp_test_file_exists("vblank2x.txt");
+        off = xemu_uwp_test_file_exists("vblank2x-off.txt");
     }
-    return on;
+    if (off) {
+        return false;
+    }
+    if (forced) {
+        return true;
+    }
+    switch (qatomic_read(&nv2a_uwp_xbe_title)) {
+    case 0x41430004: /* Turok: Evolution (USA) */
+        return true;
+    default:
+        return false;
+    }
 }
 
 static QEMUTimer *s_uwp_half_vblank;
