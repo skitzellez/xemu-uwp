@@ -1038,6 +1038,127 @@ void MainMenuNetworkView::DrawPcapOptions(bool appearing)
     }
 }
 
+#ifdef XEMU_UWP
+/* Controller (UWP): a port is set with a dial, as the console has no keyboard for the text boxes.
+ * A on the port opens it; left/right picks a digit, up/down turns it, A keeps the port, B leaves it.
+ * The dial reads the d-pad itself (NoNavInputs), so the menu behind it does not move. */
+static int *s_port_dial_target;
+static int s_port_dial_value, s_port_dial_digit;
+static bool s_port_dial_open_next;
+
+static void PortDialButton(const char *id, int *port)
+{
+    char label[32];
+    snprintf(label, sizeof(label), "%d%s", *port, id);
+    if (ImGui::Button(label, ImVec2(ImGui::GetColumnWidth(), 0))) {
+        s_port_dial_target = port;
+        s_port_dial_value = *port;
+        s_port_dial_digit = 4; /* the ones */
+        s_port_dial_open_next = true;
+    }
+}
+
+static void PortDialDraw()
+{
+    if (s_port_dial_open_next) {
+        ImGui::OpenPopup("Set port###port_dial");
+        s_port_dial_open_next = false;
+    }
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always,
+                            ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("Set port###port_dial", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
+                                    ImGuiWindowFlags_NoSavedSettings |
+                                    ImGuiWindowFlags_NoNavInputs)) {
+        return;
+    }
+
+    /* The A press that opened the dial is still this frame's press: answering it closed the dial at once (only Y
+     * seemed to open it). Keys count from the next frame, and A only once it has been let go. */
+    static bool wait_release;
+    if (ImGui::IsWindowAppearing()) {
+        wait_release = true;
+        ImGui::EndPopup();
+        return;
+    }
+    if (wait_release && !ImGui::IsKeyDown(ImGuiKey_GamepadFaceDown) && !ImGui::IsKeyDown(ImGuiKey_Enter) &&
+        !ImGui::IsKeyDown(ImGuiKey_KeypadEnter)) {
+        wait_release = false;
+    }
+
+    static const int place[5] = { 10000, 1000, 100, 10, 1 };
+    if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft) || ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
+        s_port_dial_digit = (s_port_dial_digit + 4) % 5;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight) || ImGui::IsKeyPressed(ImGuiKey_RightArrow)) {
+        s_port_dial_digit = (s_port_dial_digit + 1) % 5;
+    }
+    int step = 0;
+    if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadUp) || ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
+        step = 1;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadDown) || ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
+        step = -1;
+    }
+    if (step) {
+        /* turn one digit 0-9 and around, the others stay */
+        int unit = place[s_port_dial_digit];
+        int d = (s_port_dial_value / unit) % 10;
+        int nd = (d + step + 10) % 10;
+        s_port_dial_value += (nd - d) * unit;
+    }
+    for (int k = ImGuiKey_0; k <= ImGuiKey_9; k++) {
+        /* a USB keyboard can still type the digits */
+        if (ImGui::IsKeyPressed((ImGuiKey)k, false)) {
+            int unit = place[s_port_dial_digit];
+            int d = (s_port_dial_value / unit) % 10;
+            s_port_dial_value += ((k - ImGuiKey_0) - d) * unit;
+            s_port_dial_digit = (s_port_dial_digit + 1) % 5;
+        }
+    }
+
+    ImGui::TextUnformatted("Port (1-65535)");
+    ImGui::PushFont(g_font_mgr.m_menu_font_medium);
+    char digits[6];
+    snprintf(digits, sizeof(digits), "%05d", s_port_dial_value);
+    for (int i = 0; i < 5; i++) {
+        if (i) {
+            ImGui::SameLine();
+        }
+        bool sel = i == s_port_dial_digit;
+        if (sel) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_NavCursor));
+        }
+        ImGui::Text(sel ? "[%c]" : " %c ", digits[i]);
+        if (sel) {
+            ImGui::PopStyleColor();
+        }
+    }
+    ImGui::PopFont();
+    bool valid = s_port_dial_value >= 1 && s_port_dial_value <= 65535;
+    if (valid) {
+        ImGui::TextDisabled("Left/Right: digit   Up/Down: change   A: OK   B: cancel");
+    } else {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f),
+                           "A port is 1 to 65535   Up/Down: change   B: cancel");
+    }
+
+    bool ok = !wait_release && (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceDown, false) ||
+                                ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+                                ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
+    bool cancel = ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
+                  ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+    if ((ok && valid) || cancel) {
+        if (ok && valid && s_port_dial_target) {
+            *s_port_dial_target = s_port_dial_value;
+        }
+        s_port_dial_target = nullptr;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+#endif
+
 void MainMenuNetworkView::DrawNatOptions(bool appearing)
 {
     static ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg;
@@ -1083,6 +1204,14 @@ void MainMenuNetworkView::DrawNatOptions(bool appearing)
 
         ImGui::TableNextRow();
 
+#ifdef XEMU_UWP
+        static int host_port = 1234, guest_port = 1234;
+        ImGui::TableSetColumnIndex(0);
+        PortDialButton("###hostport", &host_port);
+
+        ImGui::TableSetColumnIndex(1);
+        PortDialButton("###guestport", &guest_port);
+#else
         ImGui::TableSetColumnIndex(0);
         static char buf[8] = {"1234"};
         ImGui::SetNextItemWidth(ImGui::GetColumnWidth());
@@ -1092,6 +1221,7 @@ void MainMenuNetworkView::DrawNatOptions(bool appearing)
         static char buf2[8] = {"1234"};
         ImGui::SetNextItemWidth(ImGui::GetColumnWidth());
         ImGui::InputText("###guestport", buf2, sizeof(buf2));
+#endif
 
         ImGui::TableSetColumnIndex(2);
         static CONFIG_NET_NAT_FORWARD_PORTS_PROTOCOL protocol =
@@ -1102,16 +1232,23 @@ void MainMenuNetworkView::DrawNatOptions(bool appearing)
 
         ImGui::TableSetColumnIndex(3);
         if (ImGui::Button("Add")) {
+#ifdef XEMU_UWP
+            add_net_nat_forward_ports(host_port, guest_port, protocol);
+#else
             int host, guest;
             if (sscanf(buf, "%d", &host) == 1 &&
                 sscanf(buf2, "%d", &guest) == 1) {
                 add_net_nat_forward_ports(host, guest, protocol);
             }
+#endif
         }
 
         ImGui::EndTable();
     }
     ImGui::PopStyleVar();
+#ifdef XEMU_UWP
+    PortDialDraw();
+#endif
 }
 
 void MainMenuNetworkView::DrawUdpOptions(bool appearing)
