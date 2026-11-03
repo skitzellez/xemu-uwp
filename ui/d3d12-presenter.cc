@@ -33,6 +33,7 @@ extern "C" {
 #include "ui/d3d12-fsr.h"
 #include "ui/d3d12-presenter-compat.h"
 #include "ui/xemu-widescreen.h"
+#include "ui/xemu-uwp-hdmi.h"
 
 #define XEMU_D3D12_BACKBUFFER_COUNT 3
 /* One present waiting at most, as with Mesa (2 buffers, glFinish before each swap): with 2 the controller
@@ -54,7 +55,7 @@ extern "C" {
 #define XEMU_D3D12_FSR_UPSCALE_SRV_INDEX (XEMU_D3D12_FSR_COMPOSE_SRV_INDEX + 1)
 #define XEMU_D3D12_FSR_COMPOSE_RTV_INDEX XEMU_D3D12_BACKBUFFER_COUNT
 #define XEMU_D3D12_FSR_UPSCALE_RTV_INDEX (XEMU_D3D12_BACKBUFFER_COUNT + 1)
-#define XEMU_D3D12_RTV_COUNT (XEMU_D3D12_BACKBUFFER_COUNT + 2)
+#define XEMU_D3D12_RTV_COUNT (XEMU_D3D12_BACKBUFFER_COUNT + 4)   /* + FSR 1 (2), frame generation (2) */
 #define XEMU_D3D12_PALETTE_ENTRIES 256
 /* 32-bit values in the display shader's DisplayConstants. */
 #define XEMU_D3D12_DISPLAY_CONSTANTS 28
@@ -159,6 +160,31 @@ struct XemuD3D12Presenter {
     UINT fsr_output_width;
     UINT fsr_output_height;
     bool fsr_unavailable;
+
+    /* Frame generation (d3d12-framegen.inc): two history pictures at source size, their brightness at a
+     * quarter of it, the motion per block, and the picture made between them. */
+    ID3D12RootSignature *fg_cs_root;
+    ID3D12PipelineState *fg_luma_pso;
+    ID3D12PipelineState *fg_motion_pso;
+    ID3D12PipelineState *fg_smooth_pso;
+    ID3D12PipelineState *fg_mid_pso;
+    ID3D12PipelineState *fg_blit_pso;
+    ID3D12Resource *fg_frame[2];
+    ID3D12Resource *fg_luma[2];
+    ID3D12Resource *fg_mv[2];
+    ID3D12Resource *fg_mid;
+    UINT fg_width;
+    UINT fg_height;
+    int fg_cur;
+    bool fg_have_prev;
+    bool fg_pending;
+    bool fg_unavailable;
+    bool fg_asked_tv;
+    uint64_t fg_last_ready;
+    uint64_t fg_presents;
+    uint64_t fg_last_fresh_present;
+    uint64_t fg_made;
+    uint64_t fg_logged_at;
 
     char *pending_screenshot_path;
     char error[512];
@@ -2069,6 +2095,8 @@ static void draw_fsr(XemuD3D12Presenter *p, const D3D12_RECT *output)
     cl->DrawInstanced(3, 1, 0, 0);
 }
 
+#include "ui/d3d12-framegen.inc"
+
 static bool render_display_frame(XemuD3D12Presenter *p,
                                  XemuD3D12PresenterFrame *frame_ctx,
                                  const NV2ADisplayFrame *frame)
@@ -2330,7 +2358,9 @@ static bool render_display_frame(XemuD3D12Presenter *p,
                           XEMU_D3D12_SOURCE_SRV_INDEX(p->frame_index)));
     p->command_list->SetGraphicsRoot32BitConstants(
         1, XEMU_D3D12_DISPLAY_CONSTANTS, constants, 0);
-    if (fsr) {
+    if (fg_draw(p, frame, compose_width, compose_height, &viewport, &scissor)) {
+        /* frame generation drew it (d3d12-framegen.inc) */
+    } else if (fsr) {
         draw_fsr(p, &scissor);
     } else {
         p->command_list->RSSetViewports(1, &viewport);
@@ -2369,6 +2399,7 @@ void xemu_d3d12_presenter_destroy(XemuD3D12Presenter *p)
     release_stream_captures(p);
     release_backbuffers(p);
     release_fsr_targets(p);
+    fg_release(p);
     if (p->fence_event != NULL) {
         CloseHandle(p->fence_event);
     }

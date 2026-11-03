@@ -36,6 +36,7 @@ xemu_ss.add(files(
   'xemu-uwp-audio.c',
   'xemu-uwp-dash.c',
   'xemu-uwp-wheel.c',
+  'xemu-uwp-hdmi.c',
   'xemu-data.c',
   'xemu-snapshots.c',
   'xemu-thumbnail.cc',

@@ -27,7 +27,7 @@ typedef struct XemuD3D12Presenter XemuD3D12Presenter;
 
 /* Leading slots of the shared SRV heap used by the presenter; the HUD
  * allocates its textures after them. */
-#define XEMU_D3D12_PRESENTER_SRV_COUNT 12
+#define XEMU_D3D12_PRESENTER_SRV_COUNT 28   /* frame generation uses 12-23 */
 
 XemuD3D12Presenter *xemu_d3d12_presenter_create(SDL_Window *window);
 void xemu_d3d12_presenter_destroy(XemuD3D12Presenter *presenter);
