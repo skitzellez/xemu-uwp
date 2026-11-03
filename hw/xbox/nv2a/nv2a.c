@@ -253,6 +253,42 @@ static void nv2a_uwp_half_vblank(void *opaque)
     nv2a_uwp_deferred_vblank(opaque);
 }
 
+/* A game that already shows a frame at every vblank (60 fps, e.g. JSRF) and steps its game once per frame ran
+ * at twice its speed with the extra vblanks (user 2026-11-02: "watch how fast they go"). So every 30 real
+ * vblanks (half a second) the frames shown are counted: about 2 per real vblank = such a game, the extra
+ * vblanks pause; while paused, about 1 every 2nd real vblank = a 30 fps stretch (Turok's gameplay), they come
+ * back. Its 60 fps menus and the like just stay at their own speed. */
+static bool s_uwp_v2x_paused;
+static int s_uwp_v2x_vblanks;
+static unsigned int s_uwp_v2x_frames0;
+
+static bool nv2a_uwp_vblank2x_paused(void)
+{
+    void uwp_log(const char *fmt, ...);
+    static bool started;
+    if (!started) {   /* the count starts here, not at 0 */
+        started = true;
+        s_uwp_v2x_frames0 = g_nv2a_stats.frame_count;
+        s_uwp_v2x_vblanks = 0;
+        return false;
+    }
+    if (++s_uwp_v2x_vblanks < 30) {
+        return s_uwp_v2x_paused;
+    }
+    unsigned int frames = g_nv2a_stats.frame_count;
+    unsigned int shown = frames - s_uwp_v2x_frames0;
+    s_uwp_v2x_frames0 = frames;
+    s_uwp_v2x_vblanks = 0;
+    if (!s_uwp_v2x_paused && shown > 45) {
+        s_uwp_v2x_paused = true;
+        uwp_log("60 fps: paused, the game already shows a frame every vblank (%u in 30)", shown);
+    } else if (s_uwp_v2x_paused && shown < 21) {
+        s_uwp_v2x_paused = false;
+        uwp_log("60 fps: on again, the game shows a frame every 2nd vblank (%u in 30)", shown);
+    }
+    return s_uwp_v2x_paused;
+}
+
 static void nv2a_uwp_vblank2x_after_vblank(NV2AState *d)
 {
     if (!nv2a_uwp_vblank2x()) {
@@ -261,6 +297,9 @@ static void nv2a_uwp_vblank2x_after_vblank(NV2AState *d)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     int64_t gap = s_uwp_last_vblank_ns ? now - s_uwp_last_vblank_ns : 16666667;
     s_uwp_last_vblank_ns = now;
+    if (nv2a_uwp_vblank2x_paused()) {
+        return;
+    }
     if (gap < 8000000 || gap > 40000000) {
         gap = 16666667;
     }
