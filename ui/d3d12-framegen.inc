@@ -400,6 +400,10 @@ static void fg_output(XemuD3D12Presenter *p, int srv, const D3D12_VIEWPORT *view
     cl->OMSetRenderTargets(1, &rtv, FALSE, NULL);
     cl->SetGraphicsRootDescriptorTable(0, gpu_descriptor(p->srv_heap, p->srv_descriptor_size, srv));
     cl->SetGraphicsRoot32BitConstants(1, XEMU_D3D12_DISPLAY_CONSTANTS, constants, 0);
+    if (p->fg_fsr) {   /* FSR 1 on (and the picture enlarged): sharpened as the plain draw would be */
+        draw_fsr_upscale(p, scissor, (UINT)srv);
+        return;
+    }
     cl->RSSetViewports(1, viewport);
     cl->RSSetScissorRects(1, scissor);
     cl->DrawInstanced(3, 1, 0, 0);
@@ -408,13 +412,14 @@ static void fg_output(XemuD3D12Presenter *p, int srv, const D3D12_VIEWPORT *view
 /* Instead of the plain draw: expects the display pipeline, source table and display constants bound, as the
  * plain draw does. False when frame generation does not take this frame (then the caller draws as before). */
 static bool fg_draw(XemuD3D12Presenter *p, const NV2ADisplayFrame *frame, UINT compose_width, UINT compose_height,
-                    const D3D12_VIEWPORT *viewport, const D3D12_RECT *scissor)
+                    const D3D12_VIEWPORT *viewport, const D3D12_RECT *scissor, bool fsr)
 {
     ID3D12GraphicsCommandList *cl = p->command_list;
     bool fresh;
     uint64_t gap;
 
     p->fg_presents++;
+    p->fg_fsr = fsr;
     if (frame->type != NV2A_DISPLAY_FRAME_D3D12_RESOURCE || !fg_wanted(p) ||
         compose_width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION || compose_height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
         p->fg_have_prev = false;

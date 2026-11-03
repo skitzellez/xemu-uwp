@@ -286,7 +286,6 @@ static bool nv2a_uwp_vblank2x_paused(void)
     int window = s_uwp_v2x_window;
     s_uwp_v2x_frames0 = frames;
     s_uwp_v2x_vblanks = 0;
-    s_uwp_v2x_window = 30;
     if (!s_uwp_v2x_paused && shown * 2 > (unsigned)window * 3) {   /* more than 1.5 per real vblank */
         s_uwp_v2x_paused = true;
         s_uwp_v2x_steady = 0;
@@ -296,10 +295,11 @@ static bool nv2a_uwp_vblank2x_paused(void)
         if (s_uwp_v2x_steady >= 4) {
             s_uwp_v2x_paused = false;
             s_uwp_v2x_steady = 0;
-            s_uwp_v2x_window = 10;   /* checked again soon */
             uwp_log("60 fps: on again, the game shows a frame every 2nd vblank for 2 s (%u in 30)", shown);
         }
     }
+    /* while the extra vblanks are on, every sixth of a second: a 60 fps game doubles up at most that long */
+    s_uwp_v2x_window = s_uwp_v2x_paused ? 30 : 10;
     return s_uwp_v2x_paused;
 }
 

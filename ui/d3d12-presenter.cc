@@ -181,6 +181,7 @@ struct XemuD3D12Presenter {
     bool fg_unavailable;
     bool fg_asked_tv;
     bool fg_held;
+    bool fg_fsr;   /* this frame's picture goes through FSR 1 (as the plain draw would) */
     D3D12_VIEWPORT fg_held_viewport;
     D3D12_RECT fg_held_scissor;
     uint64_t fg_last_ready;
@@ -2011,6 +2012,8 @@ static bool use_fsr(XemuD3D12Presenter *p, UINT input_width,
 
 /* Expects the display pipeline, source table and display constants bound;
  * leaves the backbuffer bound for the HUD. */
+static void draw_fsr_upscale(XemuD3D12Presenter *p, const D3D12_RECT *output, UINT input_srv);
+
 static void draw_fsr(XemuD3D12Presenter *p, const D3D12_RECT *output)
 {
     ID3D12GraphicsCommandList *cl = p->command_list;
@@ -2043,7 +2046,26 @@ static void draw_fsr(XemuD3D12Presenter *p, const D3D12_RECT *output)
     cl->DrawInstanced(3, 1, 0, 0);
     transition_resource(cl, p->fsr_compose, &compose_state,
                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    draw_fsr_upscale(p, output, XEMU_D3D12_FSR_COMPOSE_SRV_INDEX);
+}
 
+/* EASU from any picture at the FSR input size (an SRV slot) into fsr_upscale, then RCAS into the display
+ * rectangle of the backbuffer. Expects the display root signature and heap bound. */
+static void draw_fsr_upscale(XemuD3D12Presenter *p, const D3D12_RECT *output, UINT input_srv)
+{
+    ID3D12GraphicsCommandList *cl = p->command_list;
+    D3D12_RESOURCE_STATES upscale_state =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    float in_w = (float)p->fsr_input_width;
+    float in_h = (float)p->fsr_input_height;
+    float out_w = (float)p->fsr_output_width;
+    float out_h = (float)p->fsr_output_height;
+    float constants[XEMU_D3D12_FSR_CONSTANTS] = {};
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv;
+    D3D12_VIEWPORT viewport = {};
+    D3D12_RECT scissor = {};
+
+    viewport.MaxDepth = 1.0f;
     /* EASU: output pixel to source position, then the gather origins
      * relative to the top-left of the nearest texel. */
     constants[0] = in_w / out_w;
@@ -2077,7 +2099,7 @@ static void draw_fsr(XemuD3D12Presenter *p, const D3D12_RECT *output)
     cl->SetPipelineState(p->fsr_easu_pso);
     cl->SetGraphicsRootDescriptorTable(
         0, gpu_descriptor(p->srv_heap, p->srv_descriptor_size,
-                          XEMU_D3D12_FSR_COMPOSE_SRV_INDEX));
+                          input_srv));
     cl->SetGraphicsRoot32BitConstants(1, XEMU_D3D12_FSR_CONSTANTS,
                                       constants, 0);
     cl->DrawInstanced(3, 1, 0, 0);
@@ -2361,7 +2383,7 @@ static bool render_display_frame(XemuD3D12Presenter *p,
                           XEMU_D3D12_SOURCE_SRV_INDEX(p->frame_index)));
     p->command_list->SetGraphicsRoot32BitConstants(
         1, XEMU_D3D12_DISPLAY_CONSTANTS, constants, 0);
-    if (fg_draw(p, frame, compose_width, compose_height, &viewport, &scissor)) {
+    if (fg_draw(p, frame, compose_width, compose_height, &viewport, &scissor, fsr)) {
         /* frame generation drew it (d3d12-framegen.inc) */
     } else if (fsr) {
         draw_fsr(p, &scissor);
