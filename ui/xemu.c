@@ -1032,6 +1032,21 @@ static void d3d12_render_frame(struct xemu_console *scon)
     if (scon->d3d12_presenter) {
         /* before taking the frame, so the one shown is the newest */
         xemu_d3d12_presenter_wait_frame_latency(scon->d3d12_presenter);
+        /* frame generation at 120 Hz: the game frame held back after a made picture, without asking the game
+         * for one (that waits for its next frame) */
+        if (xemu_d3d12_presenter_has_held_frame(scon->d3d12_presenter)) {
+            if (xemu_d3d12_presenter_begin_frame(scon->d3d12_presenter, NULL)) {
+                xemu_main_loop_lock();
+                xemu_hud_update();
+                xemu_main_loop_unlock();
+                xemu_hud_render_d3d12(xemu_d3d12_presenter_get_command_list(scon->d3d12_presenter));
+                if (!xemu_d3d12_presenter_end_frame(scon->d3d12_presenter, g_config.display.window.vsync)) {
+                    d3d12_report_error(scon, "end frame");
+                }
+            }
+            qatomic_set(&rendering, false);
+            return;
+        }
     }
     UWP_PROF_BEGIN(t_getfb);
     bool acquired = nv2a_get_display_frame(&frame);

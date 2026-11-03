@@ -42,6 +42,8 @@ const char *xemu_d3d12_presenter_get_error(XemuD3D12Presenter *presenter);
 /* Waits until the swapchain can take another frame. */
 void xemu_d3d12_presenter_wait_frame_latency(XemuD3D12Presenter *presenter);
 
+/* Frame generation: a game frame waits to be shown at the next refresh (begin_frame with NULL shows it). */
+bool xemu_d3d12_presenter_has_held_frame(XemuD3D12Presenter *presenter);
 void *xemu_d3d12_presenter_get_device(XemuD3D12Presenter *presenter);
 void *xemu_d3d12_presenter_get_command_queue(XemuD3D12Presenter *presenter);
 void *xemu_d3d12_presenter_get_command_list(XemuD3D12Presenter *presenter);

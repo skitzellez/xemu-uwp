@@ -476,7 +476,11 @@ static bool fg_draw(XemuD3D12Presenter *p, const NV2ADisplayFrame *frame, UINT c
     if (mid_test < 0) {
         mid_test = xemu_uwp_test_file_exists("framegen-mid.txt");
     }
-    if (p->fg_have_prev && (gap == 2 || mid_test)) {
+    /* the TV at 120 Hz (asked for at the start): the made picture now, the newer frame at the next refresh,
+     * shown by xemu_d3d12_presenter_present_held without asking the game for a frame (asking waits for the
+     * game's next one, so it would be 60 a second) */
+    bool tv120 = xemu_uwp_hdmi_refresh_rate() >= 100.0;
+    if (p->fg_have_prev && (tv120 || gap == 2 || mid_test)) {
         int prev = p->fg_cur ^ 1, cur = p->fg_cur;
         fg_dispatch(p, p->fg_motion_pso, XEMU_D3D12_FG_LUMA_SRV(prev), XEMU_D3D12_FG_LUMA_SRV(cur), -1,
                     XEMU_D3D12_FG_MV_UAV(0), p->fg_mv[0], c, bw, bh);
@@ -489,6 +493,9 @@ static bool fg_draw(XemuD3D12Presenter *p, const NV2ADisplayFrame *frame, UINT c
                     XEMU_D3D12_FG_MV_SRV(1), XEMU_D3D12_FG_MID_UAV, p->fg_mid, c, compose_width, compose_height);
         fg_output(p, XEMU_D3D12_FG_MID_SRV, viewport, scissor);
         p->fg_pending = !mid_test;
+        p->fg_held = tv120 && !mid_test;
+        p->fg_held_viewport = *viewport;
+        p->fg_held_scissor = *scissor;
         p->fg_made++;
     } else {
         fg_output(p, XEMU_D3D12_FG_FRAME_SRV(p->fg_cur), viewport, scissor);
@@ -503,5 +510,19 @@ static bool fg_draw(XemuD3D12Presenter *p, const NV2ADisplayFrame *frame, UINT c
         p->fg_logged_at = p->fg_presents;
         p->fg_made = 0;
     }
+    return true;
+}
+
+/* The newer frame held back after a made picture, shown at the next refresh (called from begin_frame with no
+ * game frame). False when nothing is held. */
+static bool fg_draw_held(XemuD3D12Presenter *p)
+{
+    if (!p->fg_held || !p->fg_frame[p->fg_cur]) {
+        return false;
+    }
+    p->fg_held = false;
+    p->fg_pending = false;
+    p->fg_presents++;
+    fg_output(p, XEMU_D3D12_FG_FRAME_SRV(p->fg_cur), &p->fg_held_viewport, &p->fg_held_scissor);
     return true;
 }

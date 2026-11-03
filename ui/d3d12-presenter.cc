@@ -180,6 +180,9 @@ struct XemuD3D12Presenter {
     bool fg_pending;
     bool fg_unavailable;
     bool fg_asked_tv;
+    bool fg_held;
+    D3D12_VIEWPORT fg_held_viewport;
+    D3D12_RECT fg_held_scissor;
     uint64_t fg_last_ready;
     uint64_t fg_presents;
     uint64_t fg_last_fresh_present;
@@ -2497,7 +2500,9 @@ bool xemu_d3d12_presenter_begin_frame(XemuD3D12Presenter *p,
      * unsupported format) skips the scanout for this frame only; the HUD
      * and Present still run, so the list is closed and the next frame
      * starts from a clean allocator. */
-    if (frame != NULL && !render_display_frame(p, frame_ctx, frame)) {
+    if (frame == NULL) {
+        fg_draw_held(p);   /* the frame held back after a made picture (d3d12-framegen.inc) */
+    } else if (!render_display_frame(p, frame_ctx, frame)) {
         fprintf(stderr, "Direct3D 12 presenter: display frame skipped: %s\n",
                 p->error);
     }
@@ -2906,3 +2911,10 @@ uint64_t xemu_d3d12_presenter_get_font_srv_gpu(XemuD3D12Presenter *p)
 }
 
 #endif
+
+/* Frame generation at 120 Hz: a game frame is held back after a made picture; true while one waits to be shown
+ * (xemu_d3d12_presenter_begin_frame with no frame shows it). */
+bool xemu_d3d12_presenter_has_held_frame(XemuD3D12Presenter *p)
+{
+    return p != NULL && p->fg_held;
+}
