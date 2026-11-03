@@ -45,6 +45,8 @@ static_assert(XEMU_D3D12_FG_SRV_END <= XEMU_D3D12_PRESENTER_SRV_COUNT,
 
 extern "C" bool xemu_uwp_test_file_exists(const char *name); /* ui/xemu.c */
 extern "C" bool nv2a_uwp_fps60;                            /* hw/xbox/nv2a/nv2a.c */
+/* made pictures so far, for the frame counter (ui/xui/xemu-uwp-overlay.inc: "FPS 120 / 120") */
+extern "C" { volatile uint32_t xemu_fg_made_count = 0; }
 
 static const char *xemu_d3d12_fg_cs_source =
     "Texture2D<float4> tex0 : register(t0);\n"
@@ -88,7 +90,8 @@ static const char *xemu_d3d12_fg_cs_source =
     "        float e = block_err(base, v, 1);\n"
     "        if (e < best) { best = e; bv = v; }\n"
     "    }\n"
-    "    out0[id.xy] = float4(bv, best, 0);\n"
+    /* z: how badly even the best step fits, without the small preference for short steps */
+    "    out0[id.xy] = float4(bv, best - 0.0015 * length(bv), 0);\n"
     "}\n"
     "float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }\n"
     "float med9(float v[9]) {\n"
@@ -103,12 +106,24 @@ static const char *xemu_d3d12_fg_cs_source =
     "        float2 v = tex0.Load(int3(clamp(int2(id.xy) + int2(x, y), int2(0, 0), int2(w - 1, h - 1)), 0)).xy;\n"
     "        vx[k] = v.x; vy[k] = v.y; k++;\n"
     "    }\n"
-    "    out0[id.xy] = float4(med9(vx), med9(vy), 0, 0);\n"
+    "    out0[id.xy] = float4(med9(vx), med9(vy), tex0.Load(int3(id.xy, 0)).z, 0);\n"
     "}\n"
-    /* c0.xy: source size, c0.zw: 1 / source size. tex0 older, tex1 newer frame, tex2 block steps. */
-    "[numthreads(8, 8, 1)] void cs_mid(uint3 id : SV_DispatchThreadID) {\n"
-    "    if (id.x >= (uint)c0.x || id.y >= (uint)c0.y) return;\n"
+    /* c0.xy: source size, c0.zw: 1 / source size. tex0 older, tex1 newer frame, tex2 block steps.
+     * c1.y: pixel mismatch limit, c1.z: block mismatch limit, c1.w: share of such blocks above which the whole
+     * picture is the newer frame (a cut, a fade, a fast sweep past the search reach: a repeated frame there
+     * instead of a picture broken into blocks; user 11-03 JSRF "slight texture issues"). Every group counts the
+     * blocks itself, so no extra pass or buffer is needed. */
+    "groupshared uint g_bad;\n"
+    "[numthreads(8, 8, 1)] void cs_mid(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {\n"
     "    uint bw, bh; tex2.GetDimensions(bw, bh);\n"
+    "    if (gi == 0) g_bad = 0;\n"
+    "    GroupMemoryBarrierWithGroupSync();\n"
+    "    uint nb = bw * bh, mine = 0;\n"
+    "    for (uint i = gi; i < nb; i += 64) mine += tex2.Load(int3(i % bw, i / bw, 0)).z > c1.z ? 1 : 0;\n"
+    "    InterlockedAdd(g_bad, mine);\n"
+    "    GroupMemoryBarrierWithGroupSync();\n"
+    "    if (id.x >= (uint)c0.x || id.y >= (uint)c0.y) return;\n"
+    "    if ((float)g_bad > (float)nb * c1.w) { out0[id.xy] = float4(tex1.SampleLevel(lin, (float2(id.xy) + 0.5) * c0.zw, 0).rgb, 1); return; }\n"
     "    float2 p = float2(id.xy) + 0.5;\n"
     "    int2 b0 = int2(floor(p / 16.0));\n"
     "    float bestE = 1e9; float3 bestC = 0;\n"
@@ -492,7 +507,9 @@ static bool fg_draw(XemuD3D12Presenter *p, const NV2ADisplayFrame *frame, UINT c
         fg_dispatch(p, p->fg_smooth_pso, XEMU_D3D12_FG_MV_SRV(0), -1, -1, XEMU_D3D12_FG_MV_UAV(1), p->fg_mv[1], c,
                     bw, bh);
         c[2] = 1.0f / compose_width;
-        c[5] = 1.5f;   /* above this mismatch (9 samples, centre twice, RGB summed) the newer frame is shown */
+        c[5] = 0.9f;   /* above this mismatch (9 samples, centre twice, RGB summed) the newer frame is shown */
+        c[6] = 0.05f;  /* a block whose best step still differs this much (mean brightness) does not fit */
+        c[7] = 0.08f;  /* more than this share of such blocks: the whole picture is the newer frame */
         c[3] = 1.0f / compose_height;
         fg_dispatch(p, p->fg_mid_pso, XEMU_D3D12_FG_FRAME_SRV(prev), XEMU_D3D12_FG_FRAME_SRV(cur),
                     XEMU_D3D12_FG_MV_SRV(1), XEMU_D3D12_FG_MID_UAV, p->fg_mid, c, compose_width, compose_height);
@@ -502,6 +519,7 @@ static bool fg_draw(XemuD3D12Presenter *p, const NV2ADisplayFrame *frame, UINT c
         p->fg_held_viewport = *viewport;
         p->fg_held_scissor = *scissor;
         p->fg_made++;
+        xemu_fg_made_count++;
     } else {
         fg_output(p, XEMU_D3D12_FG_FRAME_SRV(p->fg_cur), viewport, scissor);
     }

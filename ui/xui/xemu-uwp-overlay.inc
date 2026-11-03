@@ -5,6 +5,7 @@
 extern "C" int xemu_uwp_thread_busy(const char *name, int slot);
 extern "C" void uwp_log(const char *fmt, ...);
 extern "C" bool xemu_uwp_renderer_is_d3d12(void);
+extern "C" volatile uint32_t xemu_fg_made_count; // ui/d3d12-framegen.inc
 
 static void uwp_overlay(void)
 {
@@ -12,6 +13,8 @@ static void uwp_overlay(void)
     static int head = 0, filled = 0;
     static uint32_t next_sample = 0, next_cpu = 0;
     static int cpu = -1, gpu = -1;
+    static uint32_t made_seen = 0;
+    static int made_ps = 0; // pictures made between the game's frames last second (frame generation at 120 Hz)
     uint32_t now = SDL_GetTicks();
     if (now >= next_sample) {
         next_sample = now + 250;
@@ -47,6 +50,9 @@ static void uwp_overlay(void)
         next_cpu = now + 1000;
         cpu = xemu_uwp_thread_busy("vcpu", 0);
         gpu = xemu_uwp_thread_busy("pfifo", 0);
+        uint32_t m = xemu_fg_made_count;
+        made_ps = (int)(m - made_seen);
+        made_seen = m;
     }
     if (filled == 0) {
         return;
@@ -78,11 +84,18 @@ static void uwp_overlay(void)
     dl->AddRectFilled(o, ImVec2(o.x + w, o.y + h), IM_COL32(0, 0, 0, 170), 10 * s);
 
     char line[128];
-    snprintf(line, sizeof line, "FPS %.0f / %.0f", fps, target);
+    // frame generation on (TV at 120 Hz): the pictures the TV gets, the game's own and the made ones
+    // (user 11-03: "i want to see the 120 mode")
+    bool fg = made_ps > 10;
+    if (fg) {
+        snprintf(line, sizeof line, "FPS %.0f / %.0f", fps + made_ps, target * 2);
+    } else {
+        snprintf(line, sizeof line, "FPS %.0f / %.0f", fps, target);
+    }
     dl->AddText(font, 52 * s, ImVec2(o.x + 16 * s, o.y + 8 * s), col, line);
     {
         /* which graphics draw the game, top right of the box: players' screenshots then say it */
-        const char *gfx = xemu_uwp_renderer_is_d3d12() ? "D3D12" : "MESA";
+        const char *gfx = !xemu_uwp_renderer_is_d3d12() ? "MESA" : fg ? "D3D12  120 Hz" : "D3D12";
         ImVec2 tw = font->CalcTextSizeA(22 * s, FLT_MAX, 0.0f, gfx);
         dl->AddText(font, 22 * s, ImVec2(o.x + w - 16 * s - tw.x, o.y + 8 * s), IM_COL32(150, 200, 255, 255), gfx);
     }
