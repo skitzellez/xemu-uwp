@@ -256,10 +256,16 @@ static void nv2a_uwp_half_vblank(void *opaque)
 /* A game that already shows a frame at every vblank (60 fps, e.g. JSRF) and steps its game once per frame ran
  * at twice its speed with the extra vblanks (user 2026-11-02: "watch how fast they go"). So every 30 real
  * vblanks (half a second) the frames shown are counted: about 2 per real vblank = such a game, the extra
- * vblanks pause; while paused, about 1 every 2nd real vblank = a 30 fps stretch (Turok's gameplay), they come
- * back. Its 60 fps menus and the like just stay at their own speed. */
+ * vblanks pause; while paused, a steady 1 every 2nd real vblank for 2 s = a 30 fps stretch (Turok's
+ * gameplay), they come back. Its 60 fps menus and the like just stay at their own speed.
+ * A 60 fps game that cannot keep up (JSRF at render scale 3 dipped to ~32 fps) looks like a 30 fps one: with
+ * a half-second test it ran double speed for half a second now and then. So coming back needs 4 steady
+ * windows in a row, and the first 10 real vblanks after it are checked again (a game doubling up pauses
+ * them at once: at most a sixth of a second). */
 static bool s_uwp_v2x_paused;
 static int s_uwp_v2x_vblanks;
+static int s_uwp_v2x_window = 10;   /* the first check soon: a 60 fps game is caught within a sixth of a second */
+static int s_uwp_v2x_steady;
 static unsigned int s_uwp_v2x_frames0;
 
 static bool nv2a_uwp_vblank2x_paused(void)
@@ -272,19 +278,27 @@ static bool nv2a_uwp_vblank2x_paused(void)
         s_uwp_v2x_vblanks = 0;
         return false;
     }
-    if (++s_uwp_v2x_vblanks < 30) {
+    if (++s_uwp_v2x_vblanks < s_uwp_v2x_window) {
         return s_uwp_v2x_paused;
     }
     unsigned int frames = g_nv2a_stats.frame_count;
     unsigned int shown = frames - s_uwp_v2x_frames0;
+    int window = s_uwp_v2x_window;
     s_uwp_v2x_frames0 = frames;
     s_uwp_v2x_vblanks = 0;
-    if (!s_uwp_v2x_paused && shown > 45) {
+    s_uwp_v2x_window = 30;
+    if (!s_uwp_v2x_paused && shown * 2 > (unsigned)window * 3) {   /* more than 1.5 per real vblank */
         s_uwp_v2x_paused = true;
-        uwp_log("60 fps: paused, the game already shows a frame every vblank (%u in 30)", shown);
-    } else if (s_uwp_v2x_paused && shown < 21) {
-        s_uwp_v2x_paused = false;
-        uwp_log("60 fps: on again, the game shows a frame every 2nd vblank (%u in 30)", shown);
+        s_uwp_v2x_steady = 0;
+        uwp_log("60 fps: paused, the game already shows a frame every vblank (%u in %d)", shown, window);
+    } else if (s_uwp_v2x_paused) {
+        s_uwp_v2x_steady = shown >= 13 && shown <= 17 ? s_uwp_v2x_steady + 1 : 0;
+        if (s_uwp_v2x_steady >= 4) {
+            s_uwp_v2x_paused = false;
+            s_uwp_v2x_steady = 0;
+            s_uwp_v2x_window = 10;   /* checked again soon */
+            uwp_log("60 fps: on again, the game shows a frame every 2nd vblank for 2 s (%u in 30)", shown);
+        }
     }
     return s_uwp_v2x_paused;
 }
