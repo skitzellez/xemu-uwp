@@ -5239,6 +5239,20 @@ static char *uwp_take_activation_disc(void)
             xemu_uwp_rumble_off = p[7] == '0';
             uwp_log("link: rumble %s", p[7] == '1' ? "on" : "off");
         }
+        if (!strncmp(p, "ldead=", 6) || !strncmp(p, "rdead=", 6) || !strncmp(p, "lanti=", 6) || !strncmp(p, "ranti=", 6)) {
+            extern int xemu_uwp_stick_dead[2], xemu_uwp_stick_anti[2]; /* ui/xemu-input.c */
+            int v = atoi(p + 6);
+            if (v >= 0 && v <= 50) {
+                (p[1] == 'd' ? xemu_uwp_stick_dead : xemu_uwp_stick_anti)[p[0] == 'r'] = v;
+                uwp_log("link: %s stick %s %d%%", p[0] == 'r' ? "right" : "left",
+                        p[1] == 'd' ? "dead zone" : "anti-dead zone", v);
+            }
+        }
+        if (!strncmp(p, "lshape=", 7) || !strncmp(p, "rshape=", 7)) {
+            extern bool xemu_uwp_stick_axial[2]; /* ui/xemu-input.c */
+            xemu_uwp_stick_axial[p[0] == 'r'] = !strcmp(p + 7, "axial");
+            uwp_log("link: %s stick dead zone shape %s", p[0] == 'r' ? "right" : "left", p + 7);
+        }
         if (!strncmp(p, "scale=", 6)) {
             int v = atoi(p + 6);
             if (v >= 1 && v <= 10) {
