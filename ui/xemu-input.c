@@ -578,6 +578,10 @@ uint64_t xemu_uwp_held_until;
  */
 bool xemu_uwp_menu_open;
 bool xemu_uwp_rumble_off;   /* "rumble=0" in the launch link (ui/xemu.c) */
+/* per stick (left, right), from Game Vault's Xemu setup: ldead= rdead= lanti= ranti= (percent) and lshape= rshape=
+ * (radial, axial) in the launch link */
+int xemu_uwp_stick_dead[2], xemu_uwp_stick_anti[2];
+bool xemu_uwp_stick_axial[2];
 
 /*
  * The button map from Game Vault's Xemu setup (Controller mapping), "pad=" in the launch link: for every gamepad,
@@ -903,6 +907,44 @@ void xemu_input_update_sdl_controller_state(ControllerState *state)
 #undef SDL_GET_AXIS
 
 #ifdef XEMU_UWP
+    /*
+     * Dead zone and anti-dead zone, each stick, round the centre and only when the player set them (Xemu setup,
+     * RobotsWake 2026-11-05: Halo 2's sticks feel slow to start). Dead zone: that much of the push does nothing and
+     * the rest is spread over the full range. Anti-dead zone: the smallest push counted starts at that value, to get
+     * past a dead zone inside the game. A stick at rest wobbles a little, and that must not jump to the anti-dead
+     * zone value, so at least 3% is ignored with it on. Radial (the default) measures the push round the centre;
+     * axial treats up/down and left/right each on its own, for games that check them that way.
+     */
+    for (int s = 0; s < 2; s++) {
+        int dead = xemu_uwp_stick_dead[s], anti = xemu_uwp_stick_anti[s];
+        if (!dead && !anti) {
+            continue;
+        }
+        int ix = s ? CONTROLLER_AXIS_RSTICK_X : CONTROLLER_AXIS_LSTICK_X;
+        int iy = s ? CONTROLLER_AXIS_RSTICK_Y : CONTROLLER_AXIS_LSTICK_Y;
+        float x = state->axis[ix] / 32767.0f, y = state->axis[iy] / 32767.0f;
+        float r = sqrtf(x * x + y * y), inner = dead / 100.0f, start = anti / 100.0f;
+        if (anti && inner < 0.03f) {
+            inner = 0.03f;
+        }
+        if (xemu_uwp_stick_axial[s]) {
+            float v[2] = { x, y };
+            for (int a = 0; a < 2; a++) {
+                float m = fabsf(v[a]);
+                m = m <= inner ? 0.0f : start + (1.0f - start) * ((m > 1.0f ? 1.0f : m) - inner) / (1.0f - inner);
+                state->axis[a ? iy : ix] = (int16_t)lrintf((v[a] < 0 ? -m : m) * 32767.0f);
+            }
+            continue;
+        }
+        if (r <= inner) {
+            state->axis[ix] = state->axis[iy] = 0;
+            continue;
+        }
+        float out = ((r > 1.0f ? 1.0f : r) - inner) / (1.0f - inner);
+        float k = (start + (1.0f - start) * out) / r;
+        state->axis[ix] = (int16_t)lrintf(CLAMP(x * k, -1.0f, 1.0f) * 32767.0f);
+        state->axis[iy] = (int16_t)lrintf(CLAMP(y * k, -1.0f, 1.0f) * 32767.0f);
+    }
     /*
      * Round sticks to the square range of the original Xbox controller. Today's pads reach only about 71% on each
      * axis when pushed fully into a corner; the Duke and Controller S reported (close to) full on both. Games that
