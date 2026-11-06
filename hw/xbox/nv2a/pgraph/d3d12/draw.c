@@ -919,6 +919,27 @@ static void draw_stat(PGRAPHState *pg)
     n++;
 }
 
+/*
+ * Prince of Persia: The Sands of Time (USA) ends each frame by blending a
+ * blurred, quarter-size copy of the picture over the whole screen. Both the
+ * D3D12 and OpenGL renderers draw it, and it leaves the game blurred at any
+ * render scale. The additive glow before it stays.
+ */
+static bool is_soft_focus_overlay(PGRAPHState *pg)
+{
+    PGRAPHD3D12State *r = pg->d3d12_renderer_state;
+    const PGRAPHD3D12TextureBinding *t = r->texture_binding[0];
+    const unsigned int src_alpha_blend = 0x54a;
+
+    return r->shader_title == 0x5553001d &&
+           pg->primitive_mode == PRIM_TYPE_QUADS &&
+           pg->inline_buffer_length == 4 && r->color_binding != NULL &&
+           r->texture_active_mask == 1 && t != NULL &&
+           t->surface_to_texture &&
+           t->shape.width * 2 <= r->color_binding->width &&
+           pgraph_reg_r(pg, NV_PGRAPH_BLEND) == src_alpha_blend;
+}
+
 static bool begin_ready_draw(PGRAPHState *pg, D3D_PRIMITIVE_TOPOLOGY topology,
                              bool *pending, Error **errp)
 {
@@ -942,6 +963,10 @@ static bool begin_ready_draw(PGRAPHState *pg, D3D_PRIMITIVE_TOPOLOGY topology,
         }
     }
     if (!pgraph_d3d12_begin_draw_commands(pg, pending, errp)) {
+        return false;
+    }
+    if (is_soft_focus_overlay(pg)) {
+        *pending = true;
         return false;
     }
 
