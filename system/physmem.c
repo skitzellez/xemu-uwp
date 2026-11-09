@@ -874,11 +874,33 @@ int mem_access_callback_address_matches(CPUState *cpu, hwaddr addr, hwaddr len)
 bool xemu_uwp_skip_cb_flush;
 #endif
 
+#ifdef XEMU_UWP
+void tlb_flush_host_range(CPUState *cpu, uintptr_t start, uintptr_t length);   /* accel/tcg/cputlb.c */
+
+/* The TLB entries of the watched pages only, by the host memory they point to, so every guest address that maps
+ * them goes. Done in the same exclusive step as the list change: no CPU write can slip in between. Emptying the
+ * whole TLB here (as before) also emptied the jump cache, 100+ times a second in Halo 2: each time thousands of
+ * jumps looked their target up again (11-07). */
+static void uwp_flush_callback_pages(CPUState *cpu, MemAccessCallback *cb)
+{
+    if (xemu_uwp_skip_cb_flush) {
+        return;
+    }
+    uintptr_t host = (uintptr_t)memory_region_get_ram_ptr(cb->mr) + (cb->addr - memory_region_get_ram_addr(cb->mr));
+    tlb_flush_host_range(cpu, host, cb->len);
+}
+#endif
+
 static void do_mem_access_callback_insert(CPUState *cpu, run_on_cpu_data data)
 
 {
     MemAccessCallback *cb = (MemAccessCallback *)data.host_ptr;
     QTAILQ_INSERT_TAIL(&cpu->mem_access_callbacks, cb, entry);
+#ifdef XEMU_UWP
+    if (qatomic_read(&cb->enabled)) {
+        uwp_flush_callback_pages(cpu, cb);
+    }
+#endif
 }
 
 MemAccessCallback *mem_access_callback_insert(CPUState *cpu, MemoryRegion *mr,
@@ -899,12 +921,10 @@ MemAccessCallback *mem_access_callback_insert(CPUState *cpu, MemoryRegion *mr,
     async_safe_run_on_cpu(cpu, do_mem_access_callback_insert,
                           RUN_ON_CPU_HOST_PTR(cb));
 
+#ifndef XEMU_UWP
     // FIXME: flush only applicable pages
-#ifdef XEMU_UWP
-    /* measuring aid (link parameter noflush=1): what do these flushes cost? NOT correct to run with. */
-    if (!xemu_uwp_skip_cb_flush)
-#endif
     tlb_flush_all_cpus_synced(cpu);
+#endif
 
     return cb;
 }
@@ -964,6 +984,9 @@ static void do_mem_access_callback_remove_by_ref(CPUState *cpu,
 {
     MemAccessCallback *cb = (MemAccessCallback *)data.host_ptr;
     QTAILQ_REMOVE(&cpu->mem_access_callbacks, cb, entry);
+#ifdef XEMU_UWP
+    uwp_flush_callback_pages(cpu, cb);   /* back to the fast path for these pages */
+#endif
     g_free(cb);
 }
 
@@ -976,12 +999,10 @@ void mem_access_callback_remove_by_ref(CPUState *cpu, MemAccessCallback *cb)
     async_safe_run_on_cpu(cpu, do_mem_access_callback_remove_by_ref,
                           RUN_ON_CPU_HOST_PTR(cb));
 
+#ifndef XEMU_UWP
     // FIXME: flush only applicable pages
-#ifdef XEMU_UWP
-    /* measuring aid (link parameter noflush=1): what do these flushes cost? NOT correct to run with. */
-    if (!xemu_uwp_skip_cb_flush)
-#endif
     tlb_flush_all_cpus_synced(cpu);
+#endif
 }
 
 void mem_check_access_callback_vaddr(CPUState *cpu,
