@@ -3982,10 +3982,8 @@ static const char *uwp_exception_words(EXCEPTION_RECORD *r, char *out, size_t n)
  *    memory, and the controller as it was held at that moment;
  *  - "INPUT" lines whenever the player's controller (port 1) changes: buttons pressed and let go,
  *    sticks and triggers rounded to a few levels (at most 10 lines a second for those);
- *  - small pictures of the screen (320x240 PNG) every 10 seconds and at every event, in
- *    "<game> screens" next to the log, named by the time into the session. Only the newest session
- *    of a game is kept, and a session stops at 360 pictures or 40 MB (from then on one a minute,
- *    and none past 600), so a long session cannot fill a drive.
+ *  - (until 0.9.1018: small pictures of the screen every 10 seconds in "<game> screens"; turned off
+ *    2026-11-14, see uwp_shots_start - the code stays for a test build that wants them again).
  */
 #define UWP_SHOTS_SOFT 360
 #define UWP_SHOTS_HARD 600
@@ -4087,18 +4085,22 @@ static void uwp_shots_start(const char *share_log_path)
     if (dot) {
         *dot = '\0';
     }
-    uwp_shot_dir = g_strdup_printf("%s screens", dir);
+    /* 2026-11-14: no more pictures of the screen (they were not used, and taking them cost time). An older
+     * version's folder of pictures is emptied and removed; uwp_shot_dir stays NULL, so xemu_uwp_shot_wanted()
+     * never asks for one and uwp_shots_tick() does nothing. */
+    char *old_dir = g_strdup_printf("%s screens", dir);
     g_free(dir);
-    g_mkdir_with_parents(uwp_shot_dir, 0755);
-    GDir *d = g_dir_open(uwp_shot_dir, 0, NULL);
+    GDir *d = g_dir_open(old_dir, 0, NULL);
     for (const char *f; d && (f = g_dir_read_name(d));) {
-        char *p = g_strdup_printf("%s\\%s", uwp_shot_dir, f);
+        char *p = g_strdup_printf("%s\\%s", old_dir, f);
         remove(p);
         g_free(p);
     }
     if (d) {
         g_dir_close(d);
+        g_rmdir(old_dir);
     }
+    g_free(old_dir);
 }
 
 /* every 10 s a picture, fewer once the session has many */
