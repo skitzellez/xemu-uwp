@@ -5452,6 +5452,61 @@ static char *uwp_system_folder(void)
     return result;
 }
 
+/*
+ * Save signing keys for Game Vault (owner 2026-11-14: a USA save pack for Jet Set Radio Future did not load on the
+ * Europe game). An Xbox save is signed with a key the kernel works out from the running game's certificate, so the
+ * USA and Europe versions of a game sign differently. While a game runs, its key is noted in the shared Xbox folder
+ * as "savekeys.txt" (<title ID> <key>, one line per game); Game Vault signs a save from another version of the game
+ * with it. Nothing is shipped: each console gets the key from its own BIOS while the player's game runs.
+ */
+static void uwp_note_save_key(void)
+{
+    static uint32_t noted;
+    uint32_t title = 0;
+    uint8_t key[16];
+    if (!runstate_is_running() || !xemu_get_save_key(&title, key) || title == noted) {
+        return;
+    }
+    noted = title;
+    char *folder = uwp_system_folder();
+    if (!folder) {
+        return;
+    }
+    char *path = g_strdup_printf("%ssavekeys.txt", folder);
+    char hex[33];
+    for (int i = 0; i < 16; i++) {
+        snprintf(hex + 2 * i, 3, "%02x", key[i]);
+    }
+    char *line = g_strdup_printf("%08x %s", title, hex), *old = NULL;
+    GString *out = g_string_new(NULL);
+    bool same = false;
+    if (g_file_get_contents(path, &old, NULL, NULL)) {
+        char **lines = g_strsplit(old, "\n", -1);
+        for (int i = 0; lines[i]; i++) {
+            g_strstrip(lines[i]);
+            if (!lines[i][0]) {
+                continue;
+            }
+            if (!g_ascii_strncasecmp(lines[i], line, 8)) {
+                same = !g_ascii_strcasecmp(lines[i], line);
+                continue;
+            }
+            g_string_append_printf(out, "%s\n", lines[i]);
+        }
+        g_strfreev(lines);
+        g_free(old);
+    }
+    if (!same) {
+        g_string_append_printf(out, "%s\n", line);
+        g_file_set_contents(path, out->str, out->len, NULL);
+        uwp_log("save key noted for title %08x", title);
+    }
+    g_string_free(out, TRUE);
+    g_free(line);
+    g_free(path);
+    g_free(folder);
+}
+
 char *xemu_uwp_system_folder(void);
 char *xemu_uwp_take_eeprom(const char *picked, const char **why);
 
@@ -6525,6 +6580,7 @@ int main(int argc, char **argv)
             uwp_session_sample(g_nv2a_stats.increment_fps);
             uwp_story_sample(g_nv2a_stats.increment_fps);
             uwp_log_memory();   /* every 3 s: a log that just stops shows how close to the limit it was */
+            uwp_note_save_key();
             {
                 extern unsigned int xemu_uwp_prim_hist[16];
                 static const char *const names[16] = { "points", "lines", "lineloop", "linestrip", "tris",

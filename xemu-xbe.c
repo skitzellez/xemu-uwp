@@ -79,6 +79,38 @@ static ssize_t virt_dma_memory_read(vaddr vaddr, void *buf, size_t len)
     return num_bytes_read;
 }
 
+bool xemu_get_save_key(uint32_t *title_id, uint8_t key[16])
+{
+    const vaddr kernel = 0x80010000;
+    uint8_t mz[0x40];
+    if (virt_dma_memory_read(kernel, mz, sizeof(mz)) != sizeof(mz) || mz[0] != 'M' || mz[1] != 'Z') {
+        return false;
+    }
+    uint32_t pe = ldl_le_p(mz + 0x3c), exp_rva = 0;
+    uint8_t dir[0x28];
+    if (pe > 0x1000 || virt_dma_memory_read(kernel + pe + 0x78, &exp_rva, 4) != 4 || !exp_rva ||
+        virt_dma_memory_read(kernel + exp_rva, dir, sizeof(dir)) != sizeof(dir)) {
+        return false;
+    }
+    uint32_t base = ldl_le_p(dir + 0x10), count = ldl_le_p(dir + 0x14), funcs = ldl_le_p(dir + 0x1c), rva = 0;
+    if (325 < base || 325 - base >= count ||
+        virt_dma_memory_read(kernel + funcs + 4 * (325 - base), &rva, 4) != 4 || !rva ||
+        virt_dma_memory_read(kernel + rva, key, 16) != 16) {
+        return false;
+    }
+    struct xbe *xbe = xemu_get_xbe_info();
+    if (!xbe || !xbe->cert) {
+        return false;
+    }
+    *title_id = ldl_le_p(&xbe->cert->m_titleid);
+    for (int i = 0; i < 16; i++) {
+        if (key[i]) {
+            return *title_id != 0;
+        }
+    }
+    return false;
+}
+
 struct xbe *xemu_get_xbe_info(void)
 {
     vaddr hdr_addr_virt = 0x10000;

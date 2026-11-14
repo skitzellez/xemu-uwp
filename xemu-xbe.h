@@ -107,6 +107,9 @@ extern "C" {
 
 // Get current XBE info
 struct xbe *xemu_get_xbe_info(void);
+/* Game Vault: the running game's save signing key (the kernel's XboxSignatureKey, export 325, which the
+ * kernel works out from the game's certificate when it starts it) and its title ID. False when no game runs. */
+bool xemu_get_save_key(uint32_t *title_id, uint8_t key[16]);
 
 #ifdef __cplusplus
 }
