@@ -23,6 +23,7 @@
 #define XEMU_XBE_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 // http://www.caustik.com/cxbx/download/xbe.htm
 #pragma pack(1)
