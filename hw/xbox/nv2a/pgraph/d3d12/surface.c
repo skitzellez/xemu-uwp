@@ -23,6 +23,7 @@
 #include "system/physmem.h"
 #include <math.h>
 #include "qapi/error.h"
+#include "qemu/xemu-uwp.h"
 #include "hw/xbox/nv2a/pgraph/swizzle.h"
 #include "renderer.h"
 #include "cpu-stats-compat.h"
@@ -5959,9 +5960,27 @@ static void pgraph_d3d12_surface_update_internal(
         }
     }
 
-    if (r->color_binding && r->zeta_binding) {
-        assert(r->color_binding->width == r->zeta_binding->width);
-        assert(r->color_binding->height == r->zeta_binding->height);
+    if (r->color_binding && r->zeta_binding &&
+        (r->color_binding->width != r->zeta_binding->width ||
+         r->color_binding->height != r->zeta_binding->height)) {
+        /*
+         * Only a draw needs equal sizes, and the upload path rebinds depth
+         * to the colour target's size (buffer_dirty). The download path
+         * (semaphore release, flush) can rebind colour alone and leave the
+         * old depth buffer bound until the next draw: harmless, nothing is
+         * drawn with the pair. It used to abort here (Fable TLC, Oakvale).
+         */
+        static unsigned int size_mismatch_logs;
+        if (upload) {
+            assert(r->color_binding->width == r->zeta_binding->width);
+            assert(r->color_binding->height == r->zeta_binding->height);
+        } else if (size_mismatch_logs < 5) {
+            size_mismatch_logs++;
+            uwp_log("new graphics: colour %ux%u and depth %ux%u differ "
+                    "between draws; depth is rebound at the next draw",
+                    r->color_binding->width, r->color_binding->height,
+                    r->zeta_binding->width, r->zeta_binding->height);
+        }
     }
 
     /* The new targets have their guest bytes; carry over aliased pixels
