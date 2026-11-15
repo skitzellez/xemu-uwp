@@ -4801,7 +4801,7 @@ typedef struct {
     bool set;
     int toml, link;
 } UwpLinkSetting;
-static UwpLinkSetting uwp_ov_skipboot, uwp_ov_scale, uwp_ov_aspect, uwp_ov_fit;
+static UwpLinkSetting uwp_ov_skipboot, uwp_ov_scale, uwp_ov_aspect, uwp_ov_fit, uwp_ov_fsr;
 
 static void uwp_link_setting(UwpLinkSetting *o, int now, int link)
 {
@@ -4815,11 +4815,11 @@ static void uwp_link_setting(UwpLinkSetting *o, int now, int link)
 /* swap: xemu.toml's own values in before saving (back = false), the session's values back after (true) */
 static void uwp_link_settings_swap(bool back)
 {
-    static int saved[4];
-    UwpLinkSetting *o[4] = { &uwp_ov_skipboot, &uwp_ov_scale, &uwp_ov_aspect, &uwp_ov_fit };
-    int cur[4] = { g_config.general.skip_boot_anim, g_config.display.quality.surface_scale,
-                   g_config.display.ui.aspect_ratio, g_config.display.ui.fit };
-    for (int i = 0; i < 4; i++) {
+    static int saved[5];
+    UwpLinkSetting *o[5] = { &uwp_ov_skipboot, &uwp_ov_scale, &uwp_ov_aspect, &uwp_ov_fit, &uwp_ov_fsr };
+    int cur[5] = { g_config.general.skip_boot_anim, g_config.display.quality.surface_scale,
+                   g_config.display.ui.aspect_ratio, g_config.display.ui.fit, g_config.display.fsr };
+    for (int i = 0; i < 5; i++) {
         int v = cur[i];
         if (!back) {
             saved[i] = cur[i];
@@ -4833,7 +4833,8 @@ static void uwp_link_settings_swap(bool back)
         case 0: g_config.general.skip_boot_anim = v; break;
         case 1: g_config.display.quality.surface_scale = v; break;
         case 2: g_config.display.ui.aspect_ratio = v; break;
-        default: g_config.display.ui.fit = v; break;
+        case 3: g_config.display.ui.fit = v; break;
+        default: g_config.display.fsr = v; break;
         }
     }
 }
@@ -5144,6 +5145,13 @@ static char *uwp_take_activation_disc(void)
         }
         if (!strcmp(p, "fps=1")) {
             fps = true;
+        }
+        if (!strcmp(p, "fsr=1")) {
+            /* Game Vault's "Sharper picture (FSR)": the D3D12 presenter's FSR 1 for this session only (the
+             * player's own setting is what is saved, see uwp_link_settings_swap) */
+            uwp_link_setting(&uwp_ov_fsr, g_config.display.fsr, 1);
+            g_config.display.fsr = true;
+            uwp_log("link: Sharper picture (FSR) on");
         }
         if (!strcmp(p, "autoscale=0")) {
             /* Game Vault, an Xbox game's details, LT: the player's render scale exactly, never lowered */
