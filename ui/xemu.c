@@ -4802,6 +4802,9 @@ typedef struct {
     int toml, link;
 } UwpLinkSetting;
 static UwpLinkSetting uwp_ov_skipboot, uwp_ov_scale, uwp_ov_aspect, uwp_ov_fit, uwp_ov_fsr;
+/* Game Vault's FSR strength ("fsrs=<percent>"): fsr_sharpness for the session; the toml keeps its own */
+static bool uwp_ov_fsrs_set;
+static float uwp_ov_fsrs_toml, uwp_ov_fsrs_link, uwp_ov_fsrs_saved;
 
 static void uwp_link_setting(UwpLinkSetting *o, int now, int link)
 {
@@ -4836,6 +4839,14 @@ static void uwp_link_settings_swap(bool back)
         case 3: g_config.display.ui.fit = v; break;
         default: g_config.display.fsr = v; break;
         }
+    }
+    if (!back) {
+        uwp_ov_fsrs_saved = g_config.display.fsr_sharpness;
+        if (uwp_ov_fsrs_set && g_config.display.fsr_sharpness == uwp_ov_fsrs_link) {
+            g_config.display.fsr_sharpness = uwp_ov_fsrs_toml;
+        }
+    } else {
+        g_config.display.fsr_sharpness = uwp_ov_fsrs_saved;
     }
 }
 
@@ -5152,6 +5163,19 @@ static char *uwp_take_activation_disc(void)
             uwp_link_setting(&uwp_ov_fsr, g_config.display.fsr, 1);
             g_config.display.fsr = true;
             uwp_log("link: Sharper picture (FSR) on");
+        }
+        if (!strncmp(p, "fsrs=", 5)) {
+            /* Game Vault's FSR strength in percent (10..100): the presenter's RCAS sharpness 0.1..1.0 */
+            int pct = atoi(p + 5);
+            if (pct > 0 && pct <= 100) {
+                if (!uwp_ov_fsrs_set) {
+                    uwp_ov_fsrs_set = true;
+                    uwp_ov_fsrs_toml = g_config.display.fsr_sharpness;
+                }
+                uwp_ov_fsrs_link = pct / 100.0f;
+                g_config.display.fsr_sharpness = uwp_ov_fsrs_link;
+                uwp_log("link: FSR strength %d%%", pct);
+            }
         }
         if (!strcmp(p, "autoscale=0")) {
             /* Game Vault, an Xbox game's details, LT: the player's render scale exactly, never lowered */
