@@ -648,11 +648,22 @@ static bool allocate_texture_descriptors(PGRAPHD3D12State *r,
 }
 
 /*
- * Texture cache adapter budget. The cache shares the 512 MiB console adapter
- * with render targets, the surface pool and the stash; least recently used
- * entries are released before a new resource would exceed it.
+ * Texture cache budget: least recently used entries are released before a new
+ * resource would exceed it. The cache shares the adapter with render targets,
+ * the surface pool and the stash, so it takes a fifth of the DXGI budget,
+ * at least 192 MiB and at most 768 MiB. The console reports 512 MiB dedicated
+ * but a ~4 GiB budget: a fixed 192 MiB held only ~190 of Need for Speed: Most
+ * Wanted's textures at 3x (about 1 MiB each), so driving re-created 130 a second
+ * and a rainy chase 1,600 a second, each one waiting on the GPU (8 fps).
  */
-#define TEXTURE_CACHE_BUDGET_BYTES (192ull * 1024 * 1024)
+#define TEXTURE_CACHE_BUDGET_MIN (192ull * 1024 * 1024)
+#define TEXTURE_CACHE_BUDGET_MAX (768ull * 1024 * 1024)
+static uint64_t texture_cache_budget(const PGRAPHD3D12State *r)
+{
+    uint64_t budget = MAX(r->video_memory_budget, (uint64_t)r->dedicated_video_memory) / 5;
+
+    return MIN(MAX(budget, TEXTURE_CACHE_BUDGET_MIN), TEXTURE_CACHE_BUDGET_MAX);
+}
 
 /* Hands a binding's resource and SRV slot to the deferred-release queue. */
 static void release_texture_resource(PGRAPHState *pg,
@@ -689,12 +700,13 @@ static unsigned int trim_texture_cache(PGRAPHD3D12State *r,
     Lru *lru = &r->texture_cache;
     LruNode *node, *prev;
     unsigned int evicted = 0;
+    const uint64_t budget = texture_cache_budget(r);
 
     QTAILQ_FOREACH_REVERSE_SAFE(node, &lru->global, next_global, prev) {
         /* needed may be UINT64_MAX (out of memory: evict up to count whatever the budget): no wrapping sum */
         if (evicted >= count ||
-            (needed <= TEXTURE_CACHE_BUDGET_BYTES &&
-             r->texture_cache_bytes <= TEXTURE_CACHE_BUDGET_BYTES - needed)) {
+            (needed <= budget &&
+             r->texture_cache_bytes <= budget - needed)) {
             break;
         }
         if (node == &keep->node || !lru_is_node_in_use(lru, node) ||
