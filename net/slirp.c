@@ -113,12 +113,170 @@ static void slirp_smb_cleanup(SlirpState *s);
 static inline void slirp_smb_cleanup(SlirpState *s) { }
 #endif
 
+#ifdef XEMU_UWP
+/*
+ * Game Vault: Xbox Live lookups go to the network the game plays on (ui/xemu.c, uwp_xnet_switch). A DNS question
+ * from the Xbox for a name under xboxlive.com is sent to that network's resolver, whatever DNS server the Xbox has
+ * set (Insignia's, or xemu's own), and the answer comes back looking as if that server sent it. Other names are
+ * left alone: XB Online's resolver answers only its own service names.
+ */
+extern int xemu_uwp_xnet;
+extern uint32_t xemu_uwp_xnet_dns(void);
+
+typedef struct {
+    uint16_t port, id;
+    uint32_t orig;
+    bool used;
+} XnetAsk;
+static XnetAsk xnet_asks[64];
+static unsigned xnet_next;
+
+static uint16_t xnet_sum16(const uint8_t *p, size_t len, uint32_t sum)
+{
+    for (size_t i = 0; i + 1 < len; i += 2) {
+        sum += (uint32_t)p[i] << 8 | p[i + 1];
+    }
+    if (len & 1) {
+        sum += (uint32_t)p[len - 1] << 8;
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (uint16_t)sum;
+}
+
+/* IPv4 header and UDP checksums again after an address change */
+static void xnet_fix_sums(uint8_t *ip, size_t ihl, size_t total)
+{
+    ip[10] = ip[11] = 0;
+    uint16_t s = ~xnet_sum16(ip, ihl, 0);
+    ip[10] = s >> 8;
+    ip[11] = s & 0xFF;
+    uint8_t *udp = ip + ihl;
+    size_t ulen = total - ihl;
+    udp[6] = udp[7] = 0;
+    uint8_t pseudo[12];
+    memcpy(pseudo, ip + 12, 8);
+    pseudo[8] = 0;
+    pseudo[9] = 17;
+    pseudo[10] = ulen >> 8;
+    pseudo[11] = ulen & 0xFF;
+    uint32_t sum = xnet_sum16(pseudo, sizeof(pseudo), 0);
+    uint16_t u = ~xnet_sum16(udp, ulen, sum);
+    if (!u) {
+        u = 0xFFFF;
+    }
+    udp[6] = u >> 8;
+    udp[7] = u & 0xFF;
+}
+
+/* the first question's name ends in xboxlive.com */
+static bool xnet_live_name(const uint8_t *dns, size_t len)
+{
+    char name[256];
+    size_t at = 12, n = 0;
+    if (len < 17 || (dns[4] == 0 && dns[5] == 0)) {
+        return false;
+    }
+    while (at < len && dns[at]) {
+        size_t l = dns[at++];
+        if (l > 63 || at + l > len || n + l + 1 >= sizeof(name)) {
+            return false;
+        }
+        if (n) {
+            name[n++] = '.';
+        }
+        for (size_t i = 0; i < l; i++) {
+            name[n++] = g_ascii_tolower(dns[at + i]);
+        }
+        at += l;
+    }
+    name[n] = 0;
+    return g_str_has_suffix(name, "xboxlive.com");
+}
+
+/* an Ethernet frame's IPv4/UDP parts; false when it is not IPv4 UDP */
+static bool xnet_udp(const uint8_t *buf, size_t size, size_t *ihl, size_t *total)
+{
+    if (size < 14 + 20 + 8 || buf[12] != 0x08 || buf[13] != 0x00) {
+        return false;
+    }
+    const uint8_t *ip = buf + 14;
+    *ihl = (ip[0] & 0x0F) * 4;
+    *total = (size_t)ip[2] << 8 | ip[3];
+    return (ip[0] >> 4) == 4 && ip[9] == 17 && *ihl >= 20 && *total >= *ihl + 8 && 14 + *total <= size &&
+           !(ip[6] & 0x3F) && !ip[7];
+}
+
+/* from the Xbox: a Live lookup goes to the chosen network's resolver; returns a changed copy or NULL */
+static uint8_t *xnet_out(const uint8_t *buf, size_t size)
+{
+    size_t ihl, total;
+    uint32_t to = xemu_uwp_xnet ? xemu_uwp_xnet_dns() : 0;
+    if (!to || !xnet_udp(buf, size, &ihl, &total)) {
+        return NULL;
+    }
+    const uint8_t *udp = buf + 14 + ihl;
+    if ((udp[2] << 8 | udp[3]) != 53 || !xnet_live_name(udp + 8, total - ihl - 8)) {
+        return NULL;
+    }
+    uint32_t orig;
+    memcpy(&orig, buf + 14 + 16, 4);
+    if (orig == to) {
+        return NULL;
+    }
+    XnetAsk *a = &xnet_asks[xnet_next++ % G_N_ELEMENTS(xnet_asks)];
+    a->port = udp[0] << 8 | udp[1];
+    a->id = udp[8] << 8 | udp[9];
+    a->orig = orig;
+    a->used = true;
+    uint8_t *copy = g_memdup2(buf, size);
+    memcpy(copy + 14 + 16, &to, 4);
+    xnet_fix_sums(copy + 14, ihl, total);
+    return copy;
+}
+
+/* to the Xbox: the answer from that resolver looks as if it came from the server the Xbox asked */
+static uint8_t *xnet_in(const uint8_t *buf, size_t size)
+{
+    size_t ihl, total;
+    uint32_t from = xemu_uwp_xnet ? xemu_uwp_xnet_dns() : 0;
+    if (!from || !xnet_udp(buf, size, &ihl, &total)) {
+        return NULL;
+    }
+    const uint8_t *udp = buf + 14 + ihl;
+    uint32_t src;
+    memcpy(&src, buf + 14 + 12, 4);
+    if ((udp[0] << 8 | udp[1]) != 53 || src != from || total < ihl + 8 + 12) {
+        return NULL;
+    }
+    uint16_t port = udp[2] << 8 | udp[3], id = udp[8] << 8 | udp[9];
+    for (size_t i = 0; i < G_N_ELEMENTS(xnet_asks); i++) {
+        XnetAsk *a = &xnet_asks[i];
+        if (a->used && a->port == port && a->id == id) {
+            a->used = false;
+            uint8_t *copy = g_memdup2(buf, size);
+            memcpy(copy + 14 + 12, &a->orig, 4);
+            xnet_fix_sums(copy + 14, ihl, total);
+            return copy;
+        }
+    }
+    return NULL;
+}
+#endif
+
 static ssize_t net_slirp_send_packet(const void *pkt, size_t pkt_len,
                                      void *opaque)
 {
     SlirpState *s = opaque;
     uint8_t min_pkt[ETH_ZLEN];
     size_t min_pktsz = sizeof(min_pkt);
+#ifdef XEMU_UWP
+    g_autofree uint8_t *xnet = xnet_in(pkt, pkt_len);
+    if (xnet) {
+        pkt = xnet;
+    }
+#endif
 
     if (net_peer_needs_padding(&s->nc)) {
         if (eth_pad_short_frame(min_pkt, &min_pktsz, pkt, pkt_len)) {
@@ -134,6 +292,13 @@ static ssize_t net_slirp_receive(NetClientState *nc, const uint8_t *buf, size_t 
 {
     SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
 
+#ifdef XEMU_UWP
+    g_autofree uint8_t *xnet = xnet_out(buf, size);
+    if (xnet) {
+        slirp_input(s->slirp, xnet, size);
+        return size;
+    }
+#endif
     slirp_input(s->slirp, buf, size);
 
     return size;

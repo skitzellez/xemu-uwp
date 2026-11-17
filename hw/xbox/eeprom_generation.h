@@ -55,6 +55,8 @@ typedef enum {
 } XboxEEPROMVersion;
 
 bool xbox_eeprom_generate(const char *file, XboxEEPROMVersion ver);
+/* Game Vault: the hard disk key out of an EEPROM image (any kernel family); false when it does not decode */
+bool xbox_eeprom_decode(const uint8_t *image, size_t len, uint8_t hdd_key[16]);
 
 #endif
 

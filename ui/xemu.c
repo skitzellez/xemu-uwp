@@ -5234,6 +5234,11 @@ static char *uwp_take_activation_disc(void)
         if (!strcmp(p, "clearcache=1")) {
             uwp_clear_cache_wanted = true;
         }
+        if (!strncmp(p, "xnet=", 5)) {
+            /* the Xbox Live network for this game (Insignia or XB Online); see uwp_xnet_switch */
+            extern int xemu_uwp_xnet;
+            xemu_uwp_xnet = !strcmp(p + 5, "xbl") ? 2 : !strcmp(p + 5, "insignia") ? 1 : 0;
+        }
         if (!strcmp(p, "prep=1")) {
             /* Game Vault's Xemu setup, Experimental: prepare all shaders before the game starts */
             uwp_prep_wanted = true;
@@ -6158,6 +6163,7 @@ static void uwp_startup_disc(void)
  * While running (the app was left open and the launcher starts a game): the
  * same disc just continues; another disc is swapped in and the console reset.
  */
+static void uwp_xnet_switch(void);
 static void uwp_poll_activation(void)
 {
     char *disc = uwp_take_activation_disc();
@@ -6183,6 +6189,7 @@ static void uwp_poll_activation(void)
             error_free(err);
         } else {
             uwp_log("disc changed by launcher: %s", disc);
+            uwp_xnet_switch();
             qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
             uwp_watch_start();
             /* the new game's shaders get ready first, as at a fresh start: without the hold its whole list
@@ -6195,6 +6202,451 @@ static void uwp_poll_activation(void)
 }
 #endif
 
+#ifdef XEMU_UWP
+/*
+ * Game Vault: the Xbox Live network a game plays on, from Game Vault's link: "xnet=insignia" (Insignia,
+ * insignia.live) or "xnet=xbl" (XB Online, xb.live). Each network has its own accounts in the Xbox hard disk's
+ * config area (disk sectors 8..15: 8 network settings, 9 the console's machine account, 10..15 the gamertags). Before
+ * the Xbox starts, the sectors of the network last used are kept in that network's file next to the EEPROM
+ * (xnet_insignia.bin / xnet_xbl.bin) and the wanted network's are put in: Insignia's back byte for byte (its records
+ * are signed by Insignia and cannot be made again), XB Online's made from the account Game Vault signed in with
+ * (xbo_account.txt: gamertag, xuid, user_key, machine_key, serial). net/slirp.c then sends the Xbox's Xbox Live
+ * name lookups (*.xboxlive.com) to that network's resolver. Sector 8 (the Xbox's own network settings) stays.
+ * The XB Online records follow xbl-online (https://github.com/x11x00x00x/xbl-online, MIT License, Copyright (c)
+ * 2026 x11x00x00x), the library xb.live publishes for this.
+ */
+#include <bcrypt.h>
+#include "hw/xbox/eeprom_generation.h"
+
+int xemu_uwp_xnet;   /* 0 = as the disk is, 1 = Insignia, 2 = XB Online */
+
+#define XNET_LBA 8
+#define XNET_COUNT 8
+#define XNET_SEC 512
+#define XNET_DATA 492
+
+static const char *uwp_xnet_name(int n)
+{
+    return n == 2 ? "xbl" : "insignia";
+}
+
+/* the resolver for Xbox Live names on the chosen network, network byte order; xnet_dns.txt can override */
+uint32_t xemu_uwp_xnet_dns(void)
+{
+    static uint32_t cached[3];
+    static bool loaded;
+    if (!loaded) {
+        loaded = true;
+        cached[1] = inet_addr("46.101.64.175");
+        cached[2] = inet_addr("159.223.51.240");
+        char *own = SDL_GetPrefPath("xemu", "xemu");
+        char *path = g_strdup_printf("%sxnet_dns.txt", own ? own : "");
+        gchar *text = NULL;
+        if (g_file_get_contents(path, &text, NULL, NULL)) {
+            gchar **lines = g_strsplit(text, "\n", 0);
+            for (int i = 0; lines[i]; i++) {
+                gchar *l = g_strstrip(lines[i]);
+                if (!strncmp(l, "insignia=", 9)) {
+                    cached[1] = inet_addr(l + 9);
+                } else if (!strncmp(l, "xbl=", 4)) {
+                    cached[2] = inet_addr(l + 4);
+                }
+            }
+            g_strfreev(lines);
+            g_free(text);
+        }
+        g_free(path);
+        SDL_free(own);
+    }
+    return (xemu_uwp_xnet == 1 || xemu_uwp_xnet == 2) ? cached[xemu_uwp_xnet] : 0;
+}
+
+static char *uwp_xnet_file(const char *name)
+{
+    const char *ee = g_config.sys.files.eeprom_path;
+    char *dir = ee && ee[0] ? g_path_get_dirname(ee) : NULL;
+    char *path = dir ? g_build_filename(dir, name, NULL) : NULL;
+    g_free(dir);
+    return path;
+}
+
+/* the XB Online account Game Vault wrote next to the EEPROM, else a copy in xemu's own folder (tests) */
+static char *uwp_xnet_account_path(void)
+{
+    char *path = uwp_xnet_file("xbo_account.txt");
+    if (!path || !g_file_test(path, G_FILE_TEST_EXISTS)) {
+        char *own = SDL_GetPrefPath("xemu", "xemu");
+        g_free(path);
+        path = g_strdup_printf("%sxbo_account.txt", own ? own : "");
+        SDL_free(own);
+    }
+    return path;
+}
+
+static bool uwp_xnet_hmac(const uint8_t *key, size_t klen, const uint8_t *data, size_t dlen, uint8_t out[20])
+{
+    GHmac *h = g_hmac_new(G_CHECKSUM_SHA1, key, klen);
+    gsize len = 20;
+    if (!h) {
+        return false;
+    }
+    g_hmac_update(h, data, dlen);
+    g_hmac_get_digest(h, out, &len);
+    g_hmac_unref(h);
+    return len == 20;
+}
+
+static bool uwp_xnet_3des(const uint8_t key[24], const uint8_t iv_in[8], uint8_t data[16])
+{
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_KEY_HANDLE k = NULL;
+    uint8_t iv[8], out[16];
+    ULONG got = 0;
+    bool ok = false;
+    memcpy(iv, iv_in, 8);
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_3DES_ALGORITHM, NULL, 0) == 0 &&
+        BCryptSetProperty(alg, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_CBC,
+                          sizeof(BCRYPT_CHAIN_MODE_CBC), 0) == 0 &&
+        BCryptGenerateSymmetricKey(alg, &k, NULL, 0, (PUCHAR)key, 24, 0) == 0 &&
+        BCryptEncrypt(k, data, 16, NULL, iv, 8, out, 16, &got, 0) == 0 && got == 16) {
+        memcpy(data, out, 16);
+        ok = true;
+    }
+    if (k) {
+        BCryptDestroyKey(k);
+    }
+    if (alg) {
+        BCryptCloseAlgorithmProvider(alg, 0);
+    }
+    return ok;
+}
+
+static uint8_t uwp_xnet_parity(uint8_t b)
+{
+    uint8_t m = b & 0xFE;
+    int ones = 0;
+    for (uint8_t t = m; t; t >>= 1) {
+        ones += t & 1;
+    }
+    return (ones & 1) ? m : (uint8_t)(m | 1);
+}
+
+/* the account key is kept 3DES-CBC wrapped under a key made from the hard disk key */
+static bool uwp_xnet_wrap(const uint8_t hdd[16], uint8_t key[16], const uint8_t iv[8])
+{
+    static const uint8_t m1[16] = { 0x2B, 0xB8, 0xD9, 0xEF, 0xD2, 0x04, 0x6D, 0x9D,
+                                    0x1F, 0x39, 0xB1, 0x5B, 0x46, 0x58, 0x01, 0xD7 };
+    static const uint8_t m2[16] = { 0x1E, 0x05, 0xD7, 0x3A, 0xA4, 0x20, 0x6A, 0x7B,
+                                    0xA0, 0x5B, 0xCD, 0xDF, 0xAD, 0x26, 0xD3, 0xDE };
+    uint8_t d1[20], d2[20], des[24];
+    if (!uwp_xnet_hmac(m1, 16, hdd, 16, d1) || !uwp_xnet_hmac(m2, 16, hdd, 16, d2)) {
+        return false;
+    }
+    memcpy(des, d1, 4);
+    memcpy(des + 4, d2, 20);
+    for (int i = 0; i < 24; i++) {
+        des[i] = uwp_xnet_parity(des[i]);
+    }
+    return uwp_xnet_3des(des, iv, key);
+}
+
+static uint32_t uwp_xnet_checksum(const uint8_t *b, uint32_t count)
+{
+    uint32_t eax = 0, ebx = 0;
+    for (uint32_t i = 0; i < count / 4; i++) {
+        uint64_t t = (uint64_t)eax + (uint32_t)ldl_le_p(b + i * 4);   /* ldl_le_p is signed */
+        eax = (uint32_t)t;
+        if (t >> 32) {
+            ebx++;
+        }
+    }
+    uint64_t t = (uint64_t)eax + ebx;
+    eax = (uint32_t)t;
+    if (t >> 32) {
+        eax++;
+    }
+    return eax;
+}
+
+static void uwp_xnet_sector(uint8_t *sec, const uint8_t *data, size_t len)
+{
+    memset(sec, 0, XNET_SEC);
+    stl_le_p(sec, 0x79132568);
+    stl_le_p(sec + 4, 1);
+    stl_le_p(sec + 8, 1);
+    if (data) {
+        memcpy(sec + 12, data, MIN(len, XNET_DATA));
+    }
+    stl_le_p(sec + 0x1FC, 0xAA550000);
+    stl_le_p(sec + 0x1F8, ~uwp_xnet_checksum(sec, XNET_SEC));
+}
+
+static uint32_t uwp_xnet_time(void)
+{
+    const uint64_t base = 0x01BF5C72FEFB6A60ULL;
+    uint64_t ft = ((uint64_t)time(NULL) + 11644473600ULL) * 10000000ULL;
+    if (ft < base) {
+        return 1;
+    }
+    uint64_t ticks = (ft - base) / 20000000ULL;
+    return ticks > 0xFFFFFFFFu ? 0xFFFFFFFFu : (ticks ? (uint32_t)ticks : 1);
+}
+
+/* the 108-byte stored account: HMAC (hard disk key) over the key in the clear, then the key wrapped */
+static bool uwp_xnet_rec108(uint8_t rec[120], uint64_t xuid, const char *name, const uint8_t hdd[16],
+                            const uint8_t key[16], const uint8_t iv[8], bool stamp)
+{
+    uint8_t digest[20];
+    memset(rec, 0, 120);
+    stq_le_p(rec, xuid);
+    memcpy(rec + 0x0C, name, MIN(strlen(name), 16));
+    memcpy(rec + 0x24, "xb.live", 7);
+    memcpy(rec + 0x38, "passport.net", 12);
+    memcpy(rec + 0x50, key, 16);
+    stl_le_p(rec + 0x60, stamp ? uwp_xnet_time() : 0);   /* the machine account's stays zero */
+    if (!uwp_xnet_hmac(hdd, 16, rec, 0x64, digest)) {
+        return false;
+    }
+    memcpy(rec + 0x64, digest, 8);
+    return uwp_xnet_wrap(hdd, rec + 0x50, iv);
+}
+
+static bool uwp_xnet_hex(const char *s, uint8_t *out, size_t n)
+{
+    if (!s || strlen(s) != n * 2) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        int hi = g_ascii_xdigit_value(s[2 * i]), lo = g_ascii_xdigit_value(s[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        out[i] = (uint8_t)(hi << 4 | lo);
+    }
+    return true;
+}
+
+/* XB Online's sectors 9..15 for the account Game Vault signed in with; false (and why) when it cannot be done */
+static bool uwp_xnet_build_xbl(uint8_t *secs, const char **why)
+{
+    char *path = uwp_xnet_account_path();
+    gchar *text = NULL;
+    char gamertag[17] = "", serial[13] = "";
+    uint8_t user_key[16], machine_key[16], hdd[16], ee[256];
+    uint64_t xuid = 0, machine_xuid = 0;
+    bool has_user = false, has_machine = false;
+    if (!path || !g_file_get_contents(path, &text, NULL, NULL)) {
+        g_free(path);
+        *why = "no XB Online account yet (sign in in Game Vault)";
+        return false;
+    }
+    g_free(path);
+    gchar **lines = g_strsplit(text, "\n", 0);
+    for (int i = 0; lines[i]; i++) {
+        gchar *l = g_strstrip(lines[i]);
+        if (!strncmp(l, "gamertag=", 9)) {
+            g_strlcpy(gamertag, l + 9, sizeof(gamertag));
+        } else if (!strncmp(l, "xuid=", 5)) {
+            xuid = g_ascii_strtoull(l + 5, NULL, 16);
+        } else if (!strncmp(l, "machine_xuid=", 13)) {
+            machine_xuid = g_ascii_strtoull(l + 13, NULL, 16);
+        } else if (!strncmp(l, "user_key=", 9)) {
+            has_user = uwp_xnet_hex(l + 9, user_key, 16);
+        } else if (!strncmp(l, "machine_key=", 12)) {
+            has_machine = uwp_xnet_hex(l + 12, machine_key, 16);
+        } else if (!strncmp(l, "serial=", 7)) {
+            g_strlcpy(serial, l + 7, sizeof(serial));
+        }
+    }
+    g_strfreev(lines);
+    g_free(text);
+    if (!gamertag[0] || !xuid || !has_user) {
+        *why = "the XB Online account file is incomplete";
+        return false;
+    }
+    /* the account belongs to the console it was registered for: this EEPROM's serial and hard disk key */
+    FILE *f = g_fopen(g_config.sys.files.eeprom_path, "rb");
+    size_t got = f ? fread(ee, 1, sizeof(ee), f) : 0;
+    if (f) {
+        fclose(f);
+    }
+    if (got != sizeof(ee) || !xbox_eeprom_decode(ee, sizeof(ee), hdd)) {
+        *why = "the EEPROM could not be read";
+        return false;
+    }
+    if (serial[0] && memcmp(serial, ee + 0x34, 12)) {
+        *why = "the XB Online account was made for another console (sign in again in Game Vault)";
+        return false;
+    }
+    memcpy(serial, ee + 0x34, 12);
+    serial[12] = 0;
+
+    uint8_t data[XNET_DATA], rec[120], handle[8], digest[20], seed[32];
+    size_t n = 0;
+    for (int i = 0; i < 8; i++) {
+        seed[n++] = (uint8_t)(xuid >> (8 * i));
+    }
+    for (int i = 0; gamertag[i] && n < sizeof(seed); i++) {
+        seed[n++] = (uint8_t)gamertag[i];
+    }
+    if (!uwp_xnet_hmac(hdd, 16, seed, n, digest)) {
+        *why = "a key could not be made";
+        return false;
+    }
+    memcpy(handle, digest, 8);
+    if (!handle[0] && !handle[1] && !handle[2] && !handle[3]) {
+        handle[0] = 1;
+    }
+    /* 9: the console's machine account SN.<serial> */
+    if (has_machine && machine_xuid) {
+        static const uint8_t iv[8] = { 0x7B, 0x35, 0xA8, 0xB7, 0x27, 0xED, 0x43, 0x7A };
+        char sn[16];
+        snprintf(sn, sizeof(sn), "SN.%s", serial);
+        if (!uwp_xnet_rec108(rec, machine_xuid, sn, hdd, machine_key, iv, false)) {
+            *why = "the machine account could not be made";
+            return false;
+        }
+        uwp_xnet_sector(secs + 1 * XNET_SEC, rec, 108);
+    } else {
+        memset(secs + 1 * XNET_SEC, 0, XNET_SEC);
+    }
+    /* 10: empty (no header), as on a console whose dashboard set up the account: games find the account
+     * through the index (11) and its slot (12) */
+    memset(secs + 2 * XNET_SEC, 0, XNET_SEC);
+    /* 11: the index (one slot and its handle) */
+    memset(data, 0, sizeof(data));
+    stl_le_p(data, 1);
+    memcpy(data + 4, handle, 8);
+    uwp_xnet_sector(secs + 3 * XNET_SEC, data, sizeof(data));
+    /* 12: the stored account games list; 13..15 empty */
+    if (!uwp_xnet_rec108(rec, xuid, gamertag, hdd, user_key, handle, true)) {
+        *why = "the account could not be made";
+        return false;
+    }
+    uwp_xnet_sector(secs + 4 * XNET_SEC, rec, 108);
+    memset(secs + 5 * XNET_SEC, 0, (XNET_COUNT - 5) * XNET_SEC);   /* 13..15 empty */
+    return true;
+}
+
+/* sectors 9..15 hold any account (a begin signature and some data) */
+static bool uwp_xnet_has_accounts(const uint8_t *secs)
+{
+    for (int i = 1; i < XNET_COUNT; i++) {
+        const uint8_t *s = secs + i * XNET_SEC;
+        if (ldl_le_p(s) != 0x79132568) {
+            continue;
+        }
+        for (int j = 12; j < 12 + XNET_DATA; j++) {
+            if (s[j]) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static int uwp_xnet_now(void)
+{
+    char *path = uwp_xnet_file("xnet_now.txt");
+    gchar *text = NULL;
+    int now = 1;   /* a disk from before: Insignia's (Game Vault's PLAY ONLINE sets up Insignia) */
+    if (path && g_file_get_contents(path, &text, NULL, NULL)) {
+        now = strstr(text, "xbl") ? 2 : 1;
+        g_free(text);
+    }
+    g_free(path);
+    return now;
+}
+
+/* the main loop's lock held, the Xbox not started yet (or about to be reset) */
+static void uwp_xnet_switch(void)
+{
+    if (!xemu_uwp_xnet) {
+        return;
+    }
+    int want = xemu_uwp_xnet, now = uwp_xnet_now();
+    BlockBackend *blk = blk_by_name("ide0-hd0");
+    uint8_t *cur = g_malloc(XNET_COUNT * XNET_SEC);
+    if (!blk || blk_pread(blk, XNET_LBA * XNET_SEC, XNET_COUNT * XNET_SEC, cur, 0) < 0) {
+        uwp_event("online: the hard disk's account sectors could not be read; network left as it is");
+        xemu_uwp_xnet = 0;
+        g_free(cur);
+        return;
+    }
+    char *snap_now = uwp_xnet_file(now == 2 ? "xnet_xbl.bin" : "xnet_insignia.bin");
+    char *acct = uwp_xnet_account_path(), *mark = uwp_xnet_file("xnet_now.txt");
+    GStatBuf sa, sm;
+    bool account_newer = acct && mark && g_stat(acct, &sa) == 0 &&
+                         (g_stat(mark, &sm) != 0 || sa.st_mtime >= sm.st_mtime);
+    bool write = false;
+    uint8_t *next = g_memdup2(cur, XNET_COUNT * XNET_SEC);
+    {
+        /* a first copy of the disk's accounts, never written again: the way back if anything goes wrong */
+        char *first = uwp_xnet_file("xnet_before.bin");
+        if (first && !g_file_test(first, G_FILE_TEST_EXISTS)) {
+            g_file_set_contents(first, (const char *)cur, XNET_COUNT * XNET_SEC, NULL);
+        }
+        g_free(first);
+    }
+    if (want != now && snap_now) {
+        /* keep the network being left; an empty disk never replaces a snapshot that has accounts */
+        gchar *old = NULL;
+        gsize oldlen = 0;
+        bool keep_old = g_file_get_contents(snap_now, &old, &oldlen, NULL) && oldlen == XNET_COUNT * XNET_SEC &&
+                        uwp_xnet_has_accounts((uint8_t *)old) && !uwp_xnet_has_accounts(cur);
+        g_free(old);
+        if (!keep_old) {
+            g_file_set_contents(snap_now, (const char *)cur, XNET_COUNT * XNET_SEC, NULL);
+        }
+    }
+    if (want == 1 && want != now) {
+        char *snap = uwp_xnet_file("xnet_insignia.bin");
+        gchar *saved = NULL;
+        gsize len = 0;
+        if (snap && g_file_get_contents(snap, &saved, &len, NULL) && len == XNET_COUNT * XNET_SEC) {
+            memcpy(next + XNET_SEC, saved + XNET_SEC, (XNET_COUNT - 1) * XNET_SEC);   /* byte for byte */
+            write = true;
+        }
+        g_free(saved);
+        g_free(snap);
+    } else if (want == 2 && (want != now || account_newer)) {
+        const char *why = NULL;
+        if (uwp_xnet_build_xbl(next, &why)) {
+            write = true;
+        } else {
+            uwp_event("online: XB Online not set up: %s; network left as it is", why);
+            xemu_uwp_xnet = 0;
+        }
+    }
+    if (xemu_uwp_xnet && write) {
+        if (blk_pwrite(blk, XNET_LBA * XNET_SEC, XNET_COUNT * XNET_SEC, next, 0) < 0) {
+            uwp_event("online: the account sectors could not be written; network left as it is");
+            xemu_uwp_xnet = 0;
+        } else {
+            blk_flush(blk);
+            /* what was written, in xemu's own folder: for checking from the PC */
+            char *own = SDL_GetPrefPath("xemu", "xemu");
+            char *copy = g_strdup_printf("%sxnet_written.bin", own ? own : "");
+            g_file_set_contents(copy, (const char *)next, XNET_COUNT * XNET_SEC, NULL);
+            g_free(copy);
+            SDL_free(own);
+        }
+    }
+    if (xemu_uwp_xnet && mark) {
+        g_file_set_contents(mark, uwp_xnet_name(want), -1, NULL);
+    }
+    if (xemu_uwp_xnet) {
+        uwp_event("online: %s for this game%s", want == 2 ? "XB Online (xb.live)" : "Insignia",
+                  write ? " (accounts switched)" : "");
+    }
+    g_free(snap_now);
+    g_free(acct);
+    g_free(mark);
+    g_free(next);
+    g_free(cur);
+}
+#endif
+
 static void *qemu_main(void *opaque)
 {
 #ifdef XEMU_UWP
@@ -6203,6 +6655,7 @@ static void *qemu_main(void *opaque)
     qemu_init(gArgc, gArgv);
 #ifdef XEMU_UWP
     uwp_game_cache_check();
+    uwp_xnet_switch();
 #endif
 #ifdef XEMU_UWP
     uwp_log("qemu_init done, entering main loop");

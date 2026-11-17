@@ -138,3 +138,33 @@ bool xbox_eeprom_generate(const char *file, XboxEEPROMVersion ver) {
     fclose(fd);
     return success;
 }
+
+/*
+ * Game Vault: reads the console identity back out of an EEPROM image (the reverse of the encryption above): the
+ * hard disk key from the security section, tried with each kernel family's key until the hash matches. XB Online
+ * (xb.live) registers a console by its serial, network address, hard disk key and online key.
+ */
+bool xbox_eeprom_decode(const uint8_t *image, size_t len, uint8_t hdd_key[16])
+{
+    static const XboxEEPROMVersion vers[] = { XBOX_EEPROM_VERSION_R1, XBOX_EEPROM_VERSION_R2,
+                                              XBOX_EEPROM_VERSION_R3, XBOX_EEPROM_VERSION_D };
+    const XboxEEPROM *in = (const XboxEEPROM *)image;
+    if (len < sizeof(XboxEEPROM)) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(vers) / sizeof(vers[0]); i++) {
+        SHA1Context sctx;
+        RC4Context rctx;
+        uint8_t seed[20], check[20], plain[0x1C];
+        memcpy(plain, in->confounder, sizeof(plain));
+        xbox_sha1_compute(&sctx, vers[i], (uint8_t *)in->hash, sizeof(in->hash), seed);
+        rc4_init(&rctx, seed, sizeof(seed));
+        rc4_crypt(&rctx, plain, sizeof(plain));
+        xbox_sha1_compute(&sctx, vers[i], plain, sizeof(plain), check);
+        if (!memcmp(check, in->hash, sizeof(check))) {
+            memcpy(hdd_key, plain + 8, 16);
+            return true;
+        }
+    }
+    return false;
+}
