@@ -537,6 +537,8 @@ protected:
     SettingsPopupMenu settings;
     GamesPopupMenu games;
     BrowsePopupMenu browse;
+    DisplayModePopupMenu display_mode;
+    AspectRatioPopupMenu aspect_ratio;
     bool refocus_first_item;
 
 public:
@@ -600,9 +602,28 @@ public:
             pop = true;
         }
 #endif
-        if (PopupMenuSubmenuButton("Settings", ICON_FA_GEARS)) {
+        /* the settings, in the first menu (owner 11-17: no Settings submenu) */
+        PopupMenuSlider("Volume", ICON_FA_VOLUME_HIGH, &g_config.audio.volume_limit);
+        bool fs = xemu_is_fullscreen();
+        if (PopupMenuToggle("Fullscreen", ICON_FA_WINDOW_MAXIMIZE, &fs)) {
+            xemu_toggle_fullscreen();
+        }
+        if (PopupMenuSubmenuButton("Display Mode", ICON_FA_EXPAND)) {
             nav.PushFocus();
-            nav.PushMenu(settings);
+            nav.PushMenu(display_mode);
+        }
+        if (PopupMenuSubmenuButton("Aspect Ratio", ICON_FA_EXPAND)) {
+            nav.PushFocus();
+            nav.PushMenu(aspect_ratio);
+        }
+        if (PopupMenuButton("Snapshots...", ICON_FA_CLOCK_ROTATE_LEFT)) {
+            nav.ClearMenuStack();
+            g_scene_mgr.PushScene(g_main_menu);
+            g_main_menu.ShowSnapshots();
+        }
+        if (PopupMenuButton("All settings...", ICON_FA_SLIDERS)) {
+            nav.ClearMenuStack();
+            g_scene_mgr.PushScene(g_main_menu);
         }
         if (PopupMenuButton("Reset", ICON_FA_ARROWS_ROTATE)) {
             ActionReset();
