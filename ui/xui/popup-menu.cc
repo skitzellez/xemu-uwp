@@ -618,8 +618,11 @@ public:
             nav.PushFocus();
             nav.PushMenu(games);
         }
-        if (PopupMenuButton("Xbox Dashboard", ICON_FA_EJECT)) {   /* ejects the disc: the Xbox goes to its dashboard */
+        if (PopupMenuButton("Xbox Dashboard", ICON_FA_EJECT)) {   /* no disc, and the Xbox starts again: its dashboard */
             ActionEjectDisc();
+#ifdef XEMU_UWP
+            ActionReset();   /* eject alone left the game frozen (owner 11-17) */
+#endif
             pop = true;
         }
 #ifdef XEMU_UWP
