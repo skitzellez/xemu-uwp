@@ -5098,6 +5098,113 @@ static bool uwp_want_dashboard;
  * Xbox online, 2026-10-24) */
 static bool uwp_no_stick_disk;
 
+/*
+ * xb.live presence (Game Vault 0.16.1.806+): a player signed in to XB Online in Game Vault shows on xb.live's
+ * homepage on the game they play. Game Vault is suspended while xemu runs, so xemu sends the heartbeat: the link's
+ * xbp= (xb.live session key, never logged) and xbpt= (the title id, 8 hex digits); a POST to
+ * https://xb.live/api/emulator/presence now and every 60 s while the game runs. xb.live credits play time from it.
+ * Game Vault moves the player back to "in Game Vault" when it is on the screen again. A link without them stops it.
+ */
+#include <winhttp.h>
+static GMutex uwp_xbp_lock;
+static char uwp_xbp_key[257], uwp_xbp_tid[9];
+static unsigned uwp_xbp_gen;
+static bool uwp_xbp_thread_on;
+
+static int uwp_xbp_post(const char *key, const char *tid)
+{
+    char body[96];
+    snprintf(body, sizeof(body), "{\"title_id\":\"%s\",\"online\":true,\"client\":\"game-vault\"}", tid);
+    wchar_t header[320];
+    const wchar_t *head = L"Content-Type: application/json\r\nX-Session-Key: ";
+    size_t n = wcslen(head);
+    wmemcpy(header, head, n);
+    for (const char *k = key; *k && n < 316; k++) {   /* the key is plain ASCII (checked in the link) */
+        header[n++] = (wchar_t)(unsigned char)*k;
+    }
+    header[n++] = L'\r', header[n++] = L'\n', header[n] = 0;
+    int status = 0;
+    HINTERNET s = WinHttpOpen(L"GameVault-xemu", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+                              WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET c = s ? WinHttpConnect(s, L"xb.live", INTERNET_DEFAULT_HTTPS_PORT, 0) : NULL;
+    HINTERNET r = c ? WinHttpOpenRequest(c, L"POST", L"/api/emulator/presence", NULL, WINHTTP_NO_REFERER,
+                                         WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : NULL;
+    if (r) {
+        WinHttpSetTimeouts(r, 10000, 10000, 15000, 15000);
+        if (WinHttpSendRequest(r, header, (DWORD)-1L, body, (DWORD)strlen(body), (DWORD)strlen(body), 0) &&
+            WinHttpReceiveResponse(r, NULL)) {
+            DWORD code = 0, size = sizeof(code);
+            if (WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
+                                    &code, &size, WINHTTP_NO_HEADER_INDEX)) {
+                status = (int)code;
+            }
+        }
+    }
+    if (r) WinHttpCloseHandle(r);
+    if (c) WinHttpCloseHandle(c);
+    if (s) WinHttpCloseHandle(s);
+    return status;
+}
+
+static DWORD WINAPI uwp_xbp_thread(LPVOID unused)
+{
+    unsigned sent_gen = 0;
+    int last = -1;
+    for (;;) {
+        char key[257], tid[9];
+        unsigned gen;
+        g_mutex_lock(&uwp_xbp_lock);
+        g_strlcpy(key, uwp_xbp_key, sizeof(key));
+        g_strlcpy(tid, uwp_xbp_tid, sizeof(tid));
+        gen = uwp_xbp_gen;
+        g_mutex_unlock(&uwp_xbp_lock);
+        if (key[0] && tid[0]) {
+            int st = uwp_xbp_post(key, tid);
+            if (gen != sent_gen || st != last) {
+                uwp_log("xb.live presence: playing %s (%d)", tid, st);
+            }
+            sent_gen = gen, last = st;
+            if (st == 401 || st == 403) {   /* the session ended or was refused: stop until the next link */
+                g_mutex_lock(&uwp_xbp_lock);
+                if (uwp_xbp_gen == gen) {
+                    uwp_xbp_key[0] = '\0';
+                }
+                g_mutex_unlock(&uwp_xbp_lock);
+            }
+        }
+        for (int i = 0; i < 60; i++) {   /* 60 s, or at once when a new link names another game */
+            Sleep(1000);
+            g_mutex_lock(&uwp_xbp_lock);
+            bool changed = uwp_xbp_gen != gen;
+            g_mutex_unlock(&uwp_xbp_lock);
+            if (changed) {
+                break;
+            }
+        }
+    }
+    return 0;
+}
+
+/* after a link with a disc: start, move or stop the heartbeat */
+static void uwp_xbp_set(const char *key, const char *tid)
+{
+    g_mutex_lock(&uwp_xbp_lock);
+    g_strlcpy(uwp_xbp_key, key && tid ? key : "", sizeof(uwp_xbp_key));
+    g_strlcpy(uwp_xbp_tid, key && tid ? tid : "", sizeof(uwp_xbp_tid));
+    uwp_xbp_gen++;
+    bool start = key && tid && !uwp_xbp_thread_on;
+    if (start) {
+        uwp_xbp_thread_on = true;
+    }
+    g_mutex_unlock(&uwp_xbp_lock);
+    if (start) {
+        HANDLE t = CreateThread(NULL, 0, uwp_xbp_thread, NULL, 0, NULL);
+        if (t) {
+            CloseHandle(t);
+        }
+    }
+}
+
 static char *uwp_take_activation_disc(void)
 {
     const char *hint = SDL_GetHint(UWP_ACTIVATION_HINT);
@@ -5108,6 +5215,7 @@ static char *uwp_take_activation_disc(void)
     SDL_SetHint(UWP_ACTIVATION_HINT, "");
 
     char *disc = NULL, *share_token = NULL;
+    char *xbp_key = NULL, *xbp_tid = NULL;   /* xb.live presence (see uwp_xbp_set) */
     bool fps = false;
     bool tests = uwp_test_links_allowed(), refused = false;
     char *query = strchr(uri, '?');
@@ -5421,6 +5529,29 @@ static char *uwp_take_activation_disc(void)
             }
             g_free(path);
         }
+        if (!strncmp(p, "xbp=", 4)) {
+            /* xb.live's session key: letters, digits, '-', '_' and '.' only, at most 256 characters; never logged */
+            const char *v = p + 4;
+            bool ok = strlen(v) > 0 && strlen(v) <= 256;
+            for (const char *c = v; ok && *c; c++) {
+                ok = g_ascii_isalnum(*c) || *c == '-' || *c == '_' || *c == '.';
+            }
+            if (ok) {
+                g_free(xbp_key);
+                xbp_key = g_strdup(v);
+            }
+        }
+        if (!strncmp(p, "xbpt=", 5)) {
+            const char *v = p + 5;
+            bool ok = strlen(v) == 8;
+            for (const char *c = v; ok && *c; c++) {
+                ok = g_ascii_isxdigit(*c);
+            }
+            if (ok) {
+                g_free(xbp_tid);
+                xbp_tid = g_strdup(v);
+            }
+        }
         if (!strncmp(p, "stickdisk=0", 11)) {
             uwp_no_stick_disk = true;
         }
@@ -5460,6 +5591,11 @@ static char *uwp_take_activation_disc(void)
         g_free(disc);
         disc = NULL;
     }
+    if (disc || uwp_want_dashboard) {
+        uwp_xbp_set(xbp_key, xbp_tid);   /* a link without them (another game, the dashboard) stops the heartbeat */
+    }
+    g_free(xbp_key);
+    g_free(xbp_tid);
     if (disc) {
         /* a new disc: a token from an earlier link no longer applies */
         g_free(uwp_share_token);
