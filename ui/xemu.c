@@ -5431,6 +5431,21 @@ static char *uwp_take_activation_disc(void)
                         p[1] == 'd' ? "dead zone" : "anti-dead zone", v);
             }
         }
+        if (!strncmp(p, "menukeys=", 9)) {
+            extern int xemu_uwp_menu_keys; /* ui/xemu-input.c */
+            const char *v = p + 9;
+            xemu_uwp_menu_keys = !strcmp(v, "l3r3") ? 1 : !strcmp(v, "both") ? 2 : 0;
+            uwp_log("link: xemu's menu opens with %s", xemu_uwp_menu_keys == 1 ? "L3 + R3"
+                    : xemu_uwp_menu_keys == 2 ? "View + Menu or L3 + R3" : "View + Menu");
+        }
+        if (!strncmp(p, "vol=", 4)) {
+            /* Game Vault's Xemu setup, Volume: xemu's own "Output volume limit" (also the in-game menu's Volume) */
+            int v = atoi(p + 4);
+            if (v >= 0 && v <= 100) {
+                g_config.audio.volume_limit = v / 100.0;
+                uwp_log("link: volume %d%%", v);
+            }
+        }
         if (!strncmp(p, "lshape=", 7) || !strncmp(p, "rshape=", 7)) {
             extern bool xemu_uwp_stick_axial[2]; /* ui/xemu-input.c */
             xemu_uwp_stick_axial[p[0] == 'r'] = !strcmp(p + 7, "axial");
