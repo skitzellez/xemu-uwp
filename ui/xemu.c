@@ -5239,6 +5239,26 @@ static char *uwp_take_activation_disc(void)
             extern int xemu_uwp_xnet;
             xemu_uwp_xnet = !strcmp(p + 5, "xbl") ? 2 : !strcmp(p + 5, "insignia") ? 1 : 0;
         }
+        if (!strncmp(p, "xnetip=", 7)) {
+            /* XB Online's service address: xemu answers the Xbox's Xbox Live lookups with it (no resolver) */
+            extern uint32_t xemu_uwp_xnet_answer_ip;
+            unsigned a, b, c, d;
+            char extra;
+            if (sscanf(p + 7, "%u.%u.%u.%u%c", &a, &b, &c, &d, &extra) == 4 && a < 256 && b < 256 && c < 256 && d < 256 && a) {
+                xemu_uwp_xnet_answer_ip = htonl(a << 24 | b << 16 | c << 8 | d);
+                uwp_log("link: XB Online service address %u.%u.%u.%u (answered by xemu)", a, b, c, d);
+            }
+        }
+        if (!strncmp(p, "xnetdns=", 8)) {
+            /* XB Online's resolver (an IPv4 address) from Game Vault, which reads it from its update data */
+            extern uint32_t xemu_uwp_xnet_dns_link;
+            unsigned a, b, c, d;
+            char extra;
+            if (sscanf(p + 8, "%u.%u.%u.%u%c", &a, &b, &c, &d, &extra) == 4 && a < 256 && b < 256 && c < 256 && d < 256 && a) {
+                xemu_uwp_xnet_dns_link = htonl(a << 24 | b << 16 | c << 8 | d);
+                uwp_log("link: XB Online resolver %u.%u.%u.%u", a, b, c, d);
+            }
+        }
         if (!strcmp(p, "prep=1")) {
             /* Game Vault's Xemu setup, Experimental: prepare all shaders before the game starts */
             uwp_prep_wanted = true;
@@ -6219,6 +6239,8 @@ static void uwp_poll_activation(void)
 #include "hw/xbox/eeprom_generation.h"
 
 int xemu_uwp_xnet;   /* 0 = as the disk is, 1 = Insignia, 2 = XB Online */
+uint32_t xemu_uwp_xnet_dns_link;   /* XB Online's resolver from Game Vault's link, 0 = the built-in one */
+uint32_t xemu_uwp_xnet_answer_ip;   /* XB Online's service address (link xnetip=): xemu answers Live lookups itself */
 
 #define XNET_LBA 8
 #define XNET_COUNT 8
@@ -6238,7 +6260,7 @@ uint32_t xemu_uwp_xnet_dns(void)
     if (!loaded) {
         loaded = true;
         cached[1] = inet_addr("46.101.64.175");
-        cached[2] = inet_addr("159.223.51.240");
+        cached[2] = inet_addr("152.42.145.249");   /* xb.live, 2026-11-17 (was 159.223.51.240) */
         char *own = SDL_GetPrefPath("xemu", "xemu");
         char *path = g_strdup_printf("%sxnet_dns.txt", own ? own : "");
         gchar *text = NULL;
@@ -6257,6 +6279,9 @@ uint32_t xemu_uwp_xnet_dns(void)
         }
         g_free(path);
         SDL_free(own);
+    }
+    if (xemu_uwp_xnet == 2 && xemu_uwp_xnet_dns_link) {
+        return xemu_uwp_xnet_dns_link;   /* Game Vault's link (xnetdns=): xb.live can move it without an xemu release */
     }
     return (xemu_uwp_xnet == 1 || xemu_uwp_xnet == 2) ? cached[xemu_uwp_xnet] : 0;
 }

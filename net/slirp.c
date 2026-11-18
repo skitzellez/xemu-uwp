@@ -23,6 +23,9 @@
  */
 
 #include "qemu/osdep.h"
+#ifdef XEMU_UWP
+#include <SDL3/SDL.h>
+#endif
 #include "qemu/log.h"
 #include "net/slirp.h"
 
@@ -265,6 +268,103 @@ static uint8_t *xnet_in(const uint8_t *buf, size_t size)
 }
 #endif
 
+#ifdef XEMU_UWP
+/*
+ * XB Online without a resolver: xemu answers the Xbox's Xbox Live lookups (*.xboxlive.com) itself with xb.live's
+ * service address (Game Vault's link xnetip=, 0 = ask a resolver as above). Every Xbox Live service of XB Online is
+ * on that one server, so its address is the whole answer. Returns the reply frame (to send to the Xbox) or NULL.
+ */
+extern uint32_t xemu_uwp_xnet_answer_ip;
+
+static uint8_t *xnet_answer(const uint8_t *buf, size_t size, size_t *out_len)
+{
+    size_t ihl, total;
+    if (xemu_uwp_xnet != 2 || !xemu_uwp_xnet_answer_ip || !xnet_udp(buf, size, &ihl, &total)) {
+        return NULL;
+    }
+    const uint8_t *udp = buf + 14 + ihl, *dns = udp + 8;
+    size_t dlen = total - ihl - 8;
+    if ((udp[2] << 8 | udp[3]) != 53 || !xnet_live_name(dns, dlen) || (dns[2] & 0x80)) {
+        return NULL;
+    }
+    size_t q = 12;   /* end of the first question: its name, then type and class */
+    while (q < dlen && dns[q]) {
+        q += dns[q] + 1;
+    }
+    q += 1 + 4;
+    if (q > dlen) {
+        return NULL;
+    }
+    bool type_a = dns[q - 4] == 0 && dns[q - 3] == 1;
+    size_t ans = type_a ? 16 : 0, rdns = q + ans, rlen = 14 + 20 + 8 + rdns;
+    uint8_t *r = g_malloc0(rlen);
+    memcpy(r, buf + 6, 6);          /* to the Xbox's address */
+    memcpy(r + 6, buf, 6);          /* from the address it sent to */
+    r[12] = 0x08, r[13] = 0x00;
+    uint8_t *ip = r + 14;
+    ip[0] = 0x45;
+    ip[2] = (20 + 8 + rdns) >> 8, ip[3] = (20 + 8 + rdns) & 0xFF;
+    ip[8] = 64, ip[9] = 17;
+    memcpy(ip + 12, buf + 14 + 16, 4);   /* from the DNS server the Xbox asked */
+    memcpy(ip + 16, buf + 14 + 12, 4);   /* to the Xbox */
+    uint8_t *ru = ip + 20;
+    ru[0] = 0, ru[1] = 53;
+    ru[2] = udp[0], ru[3] = udp[1];
+    ru[4] = (8 + rdns) >> 8, ru[5] = (8 + rdns) & 0xFF;
+    uint8_t *rd = ru + 8;
+    memcpy(rd, dns, q);
+    rd[2] = 0x84 | (dns[2] & 0x01);      /* an answer, authoritative, recursion as asked */
+    rd[3] = 0x80;                        /* recursion available, no error */
+    rd[4] = 0, rd[5] = 1;                /* one question */
+    rd[6] = 0, rd[7] = type_a ? 1 : 0;   /* one answer for an address question */
+    rd[8] = rd[9] = rd[10] = rd[11] = 0;
+    if (type_a) {
+        uint8_t *a = rd + q;
+        a[0] = 0xC0, a[1] = 0x0C;        /* the question's name */
+        a[2] = 0, a[3] = 1, a[4] = 0, a[5] = 1;
+        a[6] = a[7] = a[8] = 0, a[9] = 60;   /* 60 s */
+        a[10] = 0, a[11] = 4;
+        memcpy(a + 12, &xemu_uwp_xnet_answer_ip, 4);
+    }
+    xnet_fix_sums(ip, 20, 20 + 8 + rdns);
+    *out_len = rlen;
+    return r;
+}
+#endif
+
+#ifdef XEMU_UWP
+/* test trace (xnet-trace.txt in xemu's folder): Live lookups and the first packets to and from XB Online's server */
+extern void uwp_log(const char *fmt, ...);
+static int xnet_trace = -1;
+static void xnet_trace_pkt(const char *dir, const uint8_t *buf, size_t size)
+{
+    if (xnet_trace < 0) {
+        char *own = SDL_GetPrefPath("xemu", "xemu");
+        char *f = g_strdup_printf("%sxnet-trace.txt", own ? own : "");
+        xnet_trace = g_file_test(f, G_FILE_TEST_EXISTS) ? 200 : 0;
+        g_free(f);
+        SDL_free(own);
+    }
+    if (xnet_trace <= 0 || size < 34 || buf[12] != 0x08 || buf[13] != 0) {
+        return;
+    }
+    const uint8_t *ip = buf + 14;
+    size_t ihl = (ip[0] & 15) * 4;
+    uint32_t a = xemu_uwp_xnet_answer_ip ? xemu_uwp_xnet_answer_ip : xemu_uwp_xnet_dns();
+    uint32_t src, dst;
+    memcpy(&src, ip + 12, 4);
+    memcpy(&dst, ip + 16, 4);
+    bool dns = (ip[9] == 17) && size >= 14 + ihl + 4 && ((buf[14 + ihl + 2] << 8 | buf[14 + ihl + 3]) == 53 || (buf[14 + ihl] << 8 | buf[14 + ihl + 1]) == 53);
+    if (!a || (src != a && dst != a && !dns)) {
+        return;
+    }
+    xnet_trace--;
+    uwp_log("xnet %s proto %u %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u len %u", dir, ip[9], ip[12], ip[13], ip[14], ip[15],
+            size >= 14 + ihl + 4 ? (buf[14 + ihl] << 8 | buf[14 + ihl + 1]) : 0, ip[16], ip[17], ip[18], ip[19],
+            size >= 14 + ihl + 4 ? (buf[14 + ihl + 2] << 8 | buf[14 + ihl + 3]) : 0, (unsigned)size);
+}
+#endif
+
 static ssize_t net_slirp_send_packet(const void *pkt, size_t pkt_len,
                                      void *opaque)
 {
@@ -272,6 +372,7 @@ static ssize_t net_slirp_send_packet(const void *pkt, size_t pkt_len,
     uint8_t min_pkt[ETH_ZLEN];
     size_t min_pktsz = sizeof(min_pkt);
 #ifdef XEMU_UWP
+    xnet_trace_pkt("in ", pkt, pkt_len);
     g_autofree uint8_t *xnet = xnet_in(pkt, pkt_len);
     if (xnet) {
         pkt = xnet;
@@ -293,6 +394,13 @@ static ssize_t net_slirp_receive(NetClientState *nc, const uint8_t *buf, size_t 
     SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
 
 #ifdef XEMU_UWP
+    xnet_trace_pkt("out", buf, size);
+    size_t answer_len = 0;
+    g_autofree uint8_t *answer = xnet_answer(buf, size, &answer_len);
+    if (answer) {
+        qemu_send_packet(&s->nc, answer, answer_len);   /* the reply goes straight back to the Xbox */
+        return size;
+    }
     g_autofree uint8_t *xnet = xnet_out(buf, size);
     if (xnet) {
         slirp_input(s->slirp, xnet, size);
