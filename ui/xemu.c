@@ -2508,6 +2508,13 @@ static void uwp_quit(const char *why)
     qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
 }
 
+/* the popup menu's "Return to Game Vault" (ui/xui/popup-menu.cc) */
+void xemu_uwp_return_to_vault(void);
+void xemu_uwp_return_to_vault(void)
+{
+    uwp_quit("menu: Return to Game Vault");
+}
+
 /*
  * Quick save states. One per disc, kept as a snapshot inside the hard disk
  * image like xemu's own snapshots (they show up in its Snapshots window too).
@@ -5238,6 +5245,15 @@ static char *uwp_take_activation_disc(void)
             /* the Xbox Live network for this game (Insignia or XB Online); see uwp_xnet_switch */
             extern int xemu_uwp_xnet;
             xemu_uwp_xnet = !strcmp(p + 5, "xbl") ? 2 : !strcmp(p + 5, "insignia") ? 1 : 0;
+        }
+        if (!strncmp(p, "gamesdir=", 9) && p[9]) {
+            /* Game Vault's Xemu setup: the folder the menu's Games list and Load Disc start in (this session) */
+            char *dir = g_uri_unescape_string(p + 9, NULL);
+            if (dir) {
+                xemu_settings_set_string(&g_config.general.games_dir, dir);
+                uwp_log("link: games folder %s", dir);
+                g_free(dir);
+            }
         }
         if (!strncmp(p, "xnetip=", 7)) {
             /* XB Online's service address: xemu answers the Xbox's Xbox Live lookups with it (no resolver) */

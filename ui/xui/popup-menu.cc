@@ -21,6 +21,7 @@
 #include <vector>
 #include <filesystem>
 #include <map>
+#include <algorithm>
 #include "misc.hh"
 #include "actions.hh"
 #include "font-manager.hh"
@@ -382,27 +383,160 @@ public:
 
     void PopulateGameList() {
         sorted_file_names.clear();
-        std::filesystem::path directory(g_config.general.games_dir);
+        std::filesystem::path directory(g_config.general.games_dir ? g_config.general.games_dir : "");
         std::error_code ec;
-        if (std::filesystem::is_directory(directory, ec)) {
-            for (const auto &file :
-                 std::filesystem::directory_iterator(directory)) {
-                const auto &file_path = file.path();
-                if (std::filesystem::is_regular_file(file_path) &&
-                    (file_path.extension() == ".iso" ||
-                     file_path.extension() == ".xiso")) {
-                    sorted_file_names.insert(
-                        { file_path.stem().string(), file_path.string() });
+        if (!std::filesystem::is_directory(directory, ec)) {
+            return;
+        }
+        auto add = [&](const std::filesystem::path &file_path) {
+            std::error_code e;
+            if (std::filesystem::is_regular_file(file_path, e) &&
+                (file_path.extension() == ".iso" || file_path.extension() == ".xiso")) {
+                std::string label = file_path.stem().string();
+                if (label.size() > 6 && label.compare(label.size() - 5, 5, ".xiso") == 0) {
+                    label.resize(label.size() - 5);
                 }
+                sorted_file_names.insert({ label, file_path.string() });
+            }
+        };
+        /* Game Vault (Xemu setup): the folder may hold the disc images, or one folder per game */
+        for (auto it = std::filesystem::directory_iterator(directory, ec);
+             !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+            std::error_code e;
+            if (it->is_directory(e)) {
+                std::error_code e2;
+                for (auto in = std::filesystem::directory_iterator(it->path(), e2);
+                     !e2 && in != std::filesystem::directory_iterator(); in.increment(e2)) {
+                    add(in->path());
+                }
+            } else {
+                add(it->path());
             }
         }
     }
 };
 
+/*
+ * Load Disc...: a disc image picked from the drives, inside the menu (the Windows file dialog does not open on an
+ * Xbox). Starts in the games folder (Game Vault's Xemu setup) or the running disc's folder; folders, then images.
+ */
+class BrowsePopupMenu : public virtual PopupMenu {
+protected:
+    std::filesystem::path dir;
+    std::vector<std::pair<bool, std::filesystem::path>> entries;   /* folder?, path */
+    bool at_drives = false, refocus = false;
+
+    void Fill()
+    {
+        entries.clear();
+        if (at_drives) {
+            for (char d = 'C'; d <= 'Z'; d++) {
+                std::filesystem::path root(std::string(1, d) + ":/");
+                std::error_code e;
+                if (std::filesystem::is_directory(root, e)) {
+                    entries.push_back({ true, root });
+                }
+            }
+            return;
+        }
+        std::vector<std::pair<bool, std::filesystem::path>> folders, files;
+        std::error_code ec;
+        for (auto it = std::filesystem::directory_iterator(dir, ec);
+             !ec && it != std::filesystem::directory_iterator(); it.increment(ec)) {
+            std::error_code e;
+            std::string ext = it->path().extension().string();
+            for (auto &c : ext) {
+                c = (char)tolower((unsigned char)c);
+            }
+            if (it->is_directory(e)) {
+                folders.push_back({ true, it->path() });
+            } else if (ext == ".iso" || ext == ".xiso") {
+                files.push_back({ false, it->path() });
+            }
+        }
+        auto by_name = [](const auto &a, const auto &b) {
+            return a.second.filename().string() < b.second.filename().string();
+        };
+        std::sort(folders.begin(), folders.end(), by_name);
+        std::sort(files.begin(), files.end(), by_name);
+        entries = folders;
+        entries.insert(entries.end(), files.begin(), files.end());
+    }
+
+public:
+    void Show(const ImVec2 &direction) override
+    {
+        PopupMenu::Show(direction);
+        const char *games = g_config.general.games_dir;
+        const char *disc = g_config.sys.files.dvd_path;
+        std::error_code e;
+        if (games && games[0] && std::filesystem::is_directory(games, e)) {
+            dir = games;
+        } else if (disc && disc[0]) {
+            dir = std::filesystem::path(disc).parent_path();
+        }
+        at_drives = dir.empty() || !std::filesystem::is_directory(dir, e);
+        Fill();
+    }
+
+    bool DrawItems(PopupMenuItemDelegate &nav) override
+    {
+        bool pop = false;
+        if (refocus || (m_focus && !m_pop_focus)) {
+            ImGui::SetKeyboardFocusHere();
+            refocus = false;
+        }
+        if (!at_drives) {
+            std::filesystem::path up = dir.parent_path();
+            bool root = up == dir || dir.relative_path().empty();
+            if (PopupMenuButton(root ? "Drives" : ".. (up)", ICON_FA_ARROW_LEFT)) {
+                if (root) {
+                    at_drives = true;
+                } else {
+                    dir = up;
+                }
+                Fill();
+                refocus = true;
+            }
+        }
+        std::filesystem::path go;
+        for (const auto &[folder, path] : entries) {
+            std::string label = at_drives ? path.string().substr(0, 2) : path.filename().string();
+            if (PopupMenuButton(label, folder ? ICON_FA_FOLDER : ICON_FA_COMPACT_DISC)) {
+                if (folder) {
+                    go = path;
+                } else {
+                    ActionLoadDiscFile(path.string().c_str());
+                    nav.ClearMenuStack();
+                    pop = true;
+                }
+            }
+        }
+        if (!go.empty()) {
+            dir = go;
+            at_drives = false;
+            Fill();
+            refocus = true;
+        }
+        if (entries.empty()) {
+            PopupMenuButton("No disc images here", ICON_FA_CIRCLE_INFO);
+        }
+        if (m_pop_focus) {
+            nav.PopFocus();
+        }
+        return pop;
+    }
+};
+
+#ifdef XEMU_UWP
+extern "C" void xemu_uwp_return_to_vault(void);   /* ui/xemu.c */
+#endif
+
 class RootPopupMenu : public virtual PopupMenu {
 protected:
     SettingsPopupMenu settings;
     GamesPopupMenu games;
+    BrowsePopupMenu browse;
     bool refocus_first_item;
 
 public:
@@ -419,6 +553,13 @@ public:
             refocus_first_item = false;
         }
 
+#ifdef XEMU_UWP
+        /* SamuraiLegion 11-17: back to Game Vault first */
+        if (PopupMenuButton("Return to Game Vault", ICON_FA_HOUSE)) {
+            xemu_uwp_return_to_vault();
+            pop = true;
+        }
+#endif
         bool running = runstate_is_running();
         if (running) {
             if (PopupMenuButton("Pause", ICON_FA_CIRCLE_PAUSE)) {
@@ -444,19 +585,26 @@ public:
             nav.PushFocus();
             nav.PushMenu(games);
         }
-        if (PopupMenuButton("Eject Disc", ICON_FA_EJECT)) {
+        if (PopupMenuButton("Eject Disc/Return to Xbox Dashboard", ICON_FA_EJECT)) {
             ActionEjectDisc();
             pop = true;
         }
+#ifdef XEMU_UWP
+        if (PopupMenuSubmenuButton("Load Disc...", ICON_FA_COMPACT_DISC)) {   /* the drives, in the menu */
+            nav.PushFocus();
+            nav.PushMenu(browse);
+        }
+#else
         if (PopupMenuButton("Load Disc...", ICON_FA_COMPACT_DISC)) {
             ActionLoadDisc();
             pop = true;
         }
+#endif
         if (PopupMenuSubmenuButton("Settings", ICON_FA_GEARS)) {
             nav.PushFocus();
             nav.PushMenu(settings);
         }
-        if (PopupMenuButton("Restart", ICON_FA_ARROWS_ROTATE)) {
+        if (PopupMenuButton("Reset", ICON_FA_ARROWS_ROTATE)) {
             ActionReset();
             pop = true;
         }
