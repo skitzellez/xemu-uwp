@@ -27,6 +27,9 @@
 #include "data/RobotoCondensed-Regular.ttf.h"
 #include "data/font_awesome_6_1_1_solid.min.otf.h"
 #include "data/abxy.ttf.h"
+#ifdef XEMU_UWP
+#include "gv-logo-glyph.h"
+#endif
 
 FontManager g_font_mgr;
 
@@ -112,6 +115,46 @@ void FontManager::Rebuild()
         m_title_font = io.Fonts->AddFontFromMemoryTTF(
             (void *)Roboto_Medium_data, Roboto_Medium_size,
             84.0f * scale, &config, title_ranges);
+    }
+#endif
+
+#ifdef XEMU_UWP
+    {
+        /* Game Vault's logo as a character of the menu font (U+E000, GV_LOGO_GLYPH in font-manager.hh): the icon of
+         * "Return to Game Vault" in the popup menu. The atlas is built here, then the logo copied into its place. */
+        float fsz = 34.0f * scale;
+        int gsz = (int)(28.0f * scale + 0.5f);
+        int rect = io.Fonts->AddCustomRectFontGlyph(m_menu_font, 0xE000, gsz, gsz, gsz + 6.0f * scale,
+                                                    ImVec2(0, (fsz - gsz) * 0.5f));
+        io.Fonts->Build();
+        unsigned char *pixels = NULL;
+        int tw = 0, th = 0;
+        io.Fonts->GetTexDataAsRGBA32(&pixels, &tw, &th);
+        const ImFontAtlasCustomRect *r = io.Fonts->GetCustomRectByIndex(rect);
+        if (pixels && r && r->IsPacked()) {
+            const int n = gv_logo_glyph_size;
+            for (int y = 0; y < r->Height; y++) {
+                for (int x = 0; x < r->Width; x++) {
+                    /* a box filter over the logo pixels this texel covers */
+                    int sx0 = x * n / r->Width, sx1 = (x + 1) * n / r->Width;
+                    int sy0 = y * n / r->Height, sy1 = (y + 1) * n / r->Height;
+                    unsigned sum[4] = { 0, 0, 0, 0 }, cnt = 0;
+                    for (int sy = sy0; sy < (sy1 > sy0 ? sy1 : sy0 + 1); sy++) {
+                        for (int sx = sx0; sx < (sx1 > sx0 ? sx1 : sx0 + 1); sx++) {
+                            const unsigned char *s = gv_logo_glyph_rgba + 4 * (sy * n + sx);
+                            for (int c = 0; c < 4; c++) {
+                                sum[c] += s[c];
+                            }
+                            cnt++;
+                        }
+                    }
+                    unsigned char *d = pixels + 4 * ((r->Y + y) * tw + r->X + x);
+                    for (int c = 0; c < 4; c++) {
+                        d[c] = (unsigned char)(sum[c] / cnt);
+                    }
+                }
+            }
+        }
     }
 #endif
 

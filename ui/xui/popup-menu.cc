@@ -557,7 +557,7 @@ public:
 
 #ifdef XEMU_UWP
         /* SamuraiLegion 11-17: back to Game Vault first */
-        if (PopupMenuButton("Return to Game Vault", ICON_FA_HOUSE)) {
+        if (PopupMenuButton("Return to Game Vault", "\xee\x80\x80")) {   /* U+E000: Game Vault's logo (font-manager.cc) */
             xemu_uwp_return_to_vault();
             pop = true;
         }
@@ -587,7 +587,7 @@ public:
             nav.PushFocus();
             nav.PushMenu(games);
         }
-        if (PopupMenuButton("Eject Disc/Return to Xbox Dashboard", ICON_FA_EJECT)) {
+        if (PopupMenuButton("Xbox Dashboard", ICON_FA_EJECT)) {   /* ejects the disc: the Xbox goes to its dashboard */
             ActionEjectDisc();
             pop = true;
         }
