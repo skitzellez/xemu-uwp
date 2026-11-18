@@ -6265,7 +6265,16 @@ static char *uwp_xnet_file(const char *name)
 {
     const char *ee = g_config.sys.files.eeprom_path;
     char *dir = ee && ee[0] ? g_path_get_dirname(ee) : NULL;
-    char *path = dir ? g_build_filename(dir, name, NULL) : NULL;
+    /* the free BIOS has a hard disk of its own (xbox_hdd_free.qcow2): its network notes and copies are its own
+     * too (xnet_now_free.txt...), so the two disks never take each other's accounts; the account file is shared */
+    const char *hdd = g_config.sys.files.hdd_path;
+    char *own = NULL;
+    if (hdd && strstr(hdd, "_free") && g_str_has_prefix(name, "xnet_")) {
+        const char *dot = strrchr(name, '.');
+        own = g_strdup_printf("%.*s_free%s", (int)(dot ? dot - name : (ptrdiff_t)strlen(name)), name, dot ? dot : "");
+    }
+    char *path = dir ? g_build_filename(dir, own ? own : name, NULL) : NULL;
+    g_free(own);
     g_free(dir);
     return path;
 }
