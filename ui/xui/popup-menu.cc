@@ -363,6 +363,9 @@ public:
         for (const auto &[label, file_path] : sorted_file_names) {
             if (PopupMenuButton(label, ICON_FA_COMPACT_DISC)) {
                 ActionLoadDiscFile(file_path.c_str());
+#ifdef XEMU_UWP
+                ActionReset();   /* the game boots, not only the disc in the tray (owner 11-17) */
+#endif
                 nav.ClearMenuStack();
                 pop = true;
             }
@@ -383,6 +386,34 @@ public:
 
     void PopulateGameList() {
         sorted_file_names.clear();
+#ifdef XEMU_UWP
+        /* Game Vault writes the player's ORIGINAL Xbox games ("<title>\t<path>" a line) before it starts xemu:
+         * only those show, by their names, no Xbox 360 or other discs (owner 11-17) */
+        {
+            const char *ee = g_config.sys.files.eeprom_path;
+            if (ee && ee[0]) {
+                std::filesystem::path list = std::filesystem::path(ee).parent_path() / "xemu_games.txt";
+                gchar *text = NULL;
+                if (g_file_get_contents(list.string().c_str(), &text, NULL, NULL)) {
+                    gchar **lines = g_strsplit(text, "\n", 0);
+                    for (int i = 0; lines[i]; i++) {
+                        gchar *tab = strchr(lines[i], '\t');
+                        if (!tab) {
+                            continue;
+                        }
+                        *tab = 0;
+                        g_strstrip(tab + 1);
+                        if (lines[i][0] && tab[1]) {
+                            sorted_file_names.insert({ lines[i], tab + 1 });
+                        }
+                    }
+                    g_strfreev(lines);
+                    g_free(text);
+                    return;
+                }
+            }
+        }
+#endif
         std::filesystem::path directory(g_config.general.games_dir ? g_config.general.games_dir : "");
         std::error_code ec;
         if (!std::filesystem::is_directory(directory, ec)) {
