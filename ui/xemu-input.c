@@ -578,6 +578,8 @@ uint64_t xemu_uwp_held_until;
  */
 bool xemu_uwp_menu_open;
 bool xemu_uwp_rumble_off;   /* "rumble=0" in the launch link (ui/xemu.c) */
+/* what opens xemu's menu (ui/xui/main.cc): 0 View + Menu, 1 L3 + R3, 2 either; "menukeys=" in the launch link */
+int xemu_uwp_menu_keys;
 /* per stick (left, right), from Game Vault's Xemu setup: ldead= rdead= lanti= ranti= (percent) and lshape= rshape=
  * (radial, axial) in the launch link */
 int xemu_uwp_stick_dead[2], xemu_uwp_stick_anti[2];

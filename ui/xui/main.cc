@@ -667,10 +667,21 @@ void xemu_hud_update(void)
         }
 
         // Allow controllers without a guide button to also work
+#ifdef XEMU_UWP
+        // Game Vault's Xemu setup, "Menu buttons" (menukeys= in the launch link, ui/xemu.c): View + Menu
+        // (0, as before), L3 + R3 (1) or either (2). Holding View + Menu 2 s still goes back to Game Vault.
+        extern int xemu_uwp_menu_keys; /* ui/xemu-input.c */
+        bool view_menu = (buttons & CONTROLLER_BUTTON_BACK) && (buttons & CONTROLLER_BUTTON_START);
+        bool l3_r3 = (buttons & CONTROLLER_BUTTON_LSTICK) && (buttons & CONTROLLER_BUTTON_RSTICK);
+        if ((xemu_uwp_menu_keys != 1 && view_menu) || (xemu_uwp_menu_keys != 0 && l3_r3)) {
+            menu_button = true;
+        }
+#else
         if ((buttons & CONTROLLER_BUTTON_BACK) &&
             (buttons & CONTROLLER_BUTTON_START)) {
             menu_button = true;
         }
+#endif
 
         if (ImGui::IsKeyPressed(ImGuiKey_F1)) {
             g_scene_mgr.PushScene(g_main_menu);
