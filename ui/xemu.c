@@ -64,6 +64,8 @@
 #include "xemu-uwp-audio.h"
 #include <io.h>
 #include <fcntl.h>
+#include <roapi.h>      /* the xemu version switch: CoreApplication.RequestRestartAsync */
+#include <winstring.h>
 #endif
 #include "qemu/xemu-uwp.h"
 #include "system/block-backend.h"
@@ -5248,6 +5250,124 @@ static void uwp_xbp_set(const char *key, const char *tid)
     }
 }
 
+/*
+ * Which xemu plays a game (Game Vault's escape hatch, owner 11-18): a game set to "the previous xemu" sends
+ * xemuver=<version> in its link and Game Vault names that version in games\layers-xemu\next-start.txt, which the base
+ * reads when xemu starts. A link that arrives while xemu already runs another version: the link is kept in
+ * layers-xemu\relaunch-link.txt and xemu asks Windows to start it again (CoreApplication.RequestRestartAsync); the new
+ * start loads the wanted version and takes the kept link as its own (uwp_startup_disc).
+ */
+static char *uwp_last_link;          /* the last launch link, whole */
+static char uwp_link_xemuver[24];    /* its xemuver= */
+
+static char *uwp_layers_file(const char *name)
+{
+    char *sys = uwp_system_folder();   /* ...\games\xbox-system\ */
+    char *cut = sys ? strstr(sys, "xbox-system\\") : NULL;
+    if (!cut) {
+        g_free(sys);
+        return NULL;
+    }
+    *cut = 0;
+    char *path = g_strdup_printf("%slayers-xemu\\%s", sys, name);
+    g_free(sys);
+    return path;
+}
+
+/* the version this xemu runs as (the base's top_version), as ASCII */
+static bool uwp_running_version(char *out, size_t n)
+{
+    extern const struct XemuBaseApi *xemu_uwp_base;
+    if (!xemu_uwp_base || xemu_uwp_base->version < 2 || !xemu_uwp_base->top_version) {
+        return false;
+    }
+    size_t i = 0;
+    for (const wchar_t *c = xemu_uwp_base->top_version; *c && i + 1 < n; c++) {
+        out[i++] = (char)*c;
+    }
+    out[i] = 0;
+    return i > 0;
+}
+
+/* minimal Windows.ApplicationModel.Core.ICoreApplication3 (only RequestRestartAsync is called) */
+typedef struct UwpCoreApp3 UwpCoreApp3;
+typedef struct {
+    HRESULT(STDMETHODCALLTYPE *QueryInterface)(UwpCoreApp3 *, REFIID, void **);
+    ULONG(STDMETHODCALLTYPE *AddRef)(UwpCoreApp3 *);
+    ULONG(STDMETHODCALLTYPE *Release)(UwpCoreApp3 *);
+    HRESULT(STDMETHODCALLTYPE *GetIids)(UwpCoreApp3 *, ULONG *, IID **);
+    HRESULT(STDMETHODCALLTYPE *GetRuntimeClassName)(UwpCoreApp3 *, HSTRING *);
+    HRESULT(STDMETHODCALLTYPE *GetTrustLevel)(UwpCoreApp3 *, int *);
+    HRESULT(STDMETHODCALLTYPE *RequestRestartAsync)(UwpCoreApp3 *, HSTRING, IUnknown **);
+    HRESULT(STDMETHODCALLTYPE *RequestRestartForUserAsync)(UwpCoreApp3 *, IUnknown *, HSTRING, IUnknown **);
+} UwpCoreApp3Vtbl;
+struct UwpCoreApp3 {
+    const UwpCoreApp3Vtbl *lpVtbl;
+};
+static const IID kIidCoreApp3 = {0xfeec0d39, 0x598b, 0x4507, {0x8a, 0x67, 0x77, 0x26, 0x32, 0x58, 0x0a, 0x57}};
+
+/* the link wants another xemu version than this one: keep it and start again (true: the restart was asked for) */
+static bool uwp_switch_version_for_link(void)
+{
+    char mine[24];
+    if (!uwp_link_xemuver[0] || !uwp_last_link || !uwp_running_version(mine, sizeof(mine))) {
+        return false;
+    }
+    if (!strcmp(uwp_link_xemuver, "newest")) {
+        /* back to the newest only from a start on a version another game asked for (the base says "chosen") */
+        extern const struct XemuBaseApi *xemu_uwp_base;
+        if (!xemu_uwp_base->top_from || wcscmp(xemu_uwp_base->top_from, L"chosen")) {
+            return false;
+        }
+    } else if (!strcmp(mine, uwp_link_xemuver)) {
+        return false;
+    }
+    char *path = uwp_layers_file("relaunch-link.txt");
+    if (!path || !g_file_set_contents(path, uwp_last_link, -1, NULL)) {
+        g_free(path);
+        uwp_log("xemu version: the game wants %s, this is %s, but the link could not be kept", uwp_link_xemuver, mine);
+        return false;
+    }
+    g_free(path);
+    HSTRING name = NULL, args = NULL;
+    UwpCoreApp3 *app = NULL;
+    IUnknown *op = NULL;
+    static const wchar_t cls[] = L"Windows.ApplicationModel.Core.CoreApplication";
+    HRESULT hr = WindowsCreateString(cls, (UINT32)wcslen(cls), &name);
+    if (SUCCEEDED(hr)) hr = RoGetActivationFactory(name, &kIidCoreApp3, (void **)&app);
+    if (SUCCEEDED(hr)) hr = WindowsCreateString(L"", 0, &args);
+    if (SUCCEEDED(hr)) hr = app->lpVtbl->RequestRestartAsync(app, args, &op);
+    if (op) op->lpVtbl->Release(op);
+    if (app) app->lpVtbl->Release(app);
+    if (args) WindowsDeleteString(args);
+    if (name) WindowsDeleteString(name);
+    uwp_log("xemu version: the game wants %s, this is %s: %s", uwp_link_xemuver, mine,
+            SUCCEEDED(hr) ? "starting again on it" : "restart refused, it plays on this one");
+    return SUCCEEDED(hr);
+}
+
+/* a start after such a restart: the kept link (at most 2 minutes old) becomes this start's link */
+static void uwp_take_relaunch_link(void)
+{
+    char *path = uwp_layers_file("relaunch-link.txt");
+    if (!path) return;
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    gchar *link = NULL;
+    if (GetFileAttributesExA(path, GetFileExInfoStandard, &a) && g_file_get_contents(path, &link, NULL, NULL)) {
+        FILETIME now;
+        GetSystemTimeAsFileTime(&now);
+        ULONGLONG t = ((ULONGLONG)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime;
+        ULONGLONG n = ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime;
+        if (n - t < 1200000000ULL && link && link[0]) {
+            SDL_SetHint(UWP_ACTIVATION_HINT, link);
+            uwp_log("xemu version: started again for the game's link");
+        }
+    }
+    g_free(link);
+    DeleteFileA(path);
+    g_free(path);
+}
+
 static char *uwp_take_activation_disc(void)
 {
     const char *hint = SDL_GetHint(UWP_ACTIVATION_HINT);
@@ -5255,6 +5375,9 @@ static char *uwp_take_activation_disc(void)
         return NULL;
     }
     char *uri = g_strdup(hint);
+    g_free(uwp_last_link);
+    uwp_last_link = g_strdup(hint);
+    uwp_link_xemuver[0] = 0;
     SDL_SetHint(UWP_ACTIVATION_HINT, "");
 
     char *disc = NULL, *share_token = NULL;
@@ -5608,6 +5731,17 @@ static char *uwp_take_activation_disc(void)
             if (ok) {
                 g_free(xbp_tid);
                 xbp_tid = g_strdup(v);
+            }
+        }
+        if (!strncmp(p, "xemuver=", 8)) {
+            /* the xemu version the game plays with (Game Vault's escape hatch): digits and dots, or "newest" */
+            const char *v = p + 8;
+            bool ok = strlen(v) > 0 && strlen(v) < sizeof(uwp_link_xemuver);
+            for (const char *c = v; ok && *c && strcmp(v, "newest"); c++) {
+                ok = g_ascii_isdigit(*c) || *c == '.';
+            }
+            if (ok) {
+                g_strlcpy(uwp_link_xemuver, v, sizeof(uwp_link_xemuver));
             }
         }
         if (!strncmp(p, "stickdisk=0", 11)) {
@@ -6368,6 +6502,7 @@ static void uwp_fill_system_files(void)
 static void uwp_startup_disc(void)
 {
     /* the activation arrives through the window's event queue */
+    uwp_take_relaunch_link();   /* started again for another xemu version: the game's link */
     for (int i = 0; i < 200 && !SDL_GetHint(UWP_ACTIVATION_HINT); i++) {
         SDL_PumpEvents();
         SDL_Delay(10);
@@ -6398,6 +6533,10 @@ static void uwp_poll_activation(void)
 {
     char *disc = uwp_take_activation_disc();
     if (!disc) {
+        return;
+    }
+    if (uwp_switch_version_for_link()) {   /* another xemu version for this game: started again on it */
+        g_free(disc);
         return;
     }
     const char *current = g_config.sys.files.dvd_path;
