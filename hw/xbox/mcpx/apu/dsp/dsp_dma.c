@@ -100,6 +100,18 @@ static void scratch_circular_copy(
     }
 }
 
+/* uwp (Game Vault): a DMA block with a setting xemu does not know yet (upstream stops xemu with an assert: Rainbow
+ * Six 3 Black Arrow Revived at its title screen) is skipped instead: that block moves no sound, the game goes on.
+ * The first few are written to the log so they can be done properly later. */
+static void dsp_dma_skip(const char *what, uint32_t a, uint32_t b)
+{
+    static int told;
+    if (told < 8) {
+        told++;
+        fprintf(stderr, "DSP DMA: skipped a block (%s 0x%x 0x%x)\n", what, a, b);
+    }
+}
+
 static void dsp_dma_run(DSPDMAState *s)
 {
     if (!(s->control & DMA_CONTROL_RUNNING)
@@ -113,19 +125,19 @@ static void dsp_dma_run(DSPDMAState *s)
         int block_space = DSP_SPACE_X;
 
         if (addr < 0x1800) {
-            assert(addr+6 < 0x1800);
+            if (!(addr+6 < 0x1800)) { dsp_dma_skip("block address", addr, 0); s->next_block |= NODE_POINTER_EOL; s->eol = true; return; }
             block_space = DSP_SPACE_X;
             block_addr = addr;
         } else if (addr >= 0x1800 && addr < 0x2000) { //?
-            assert(addr+6 < 0x2000);
+            if (!(addr+6 < 0x2000)) { dsp_dma_skip("block address", addr, 0); s->next_block |= NODE_POINTER_EOL; s->eol = true; return; }
             block_space = DSP_SPACE_Y;
             block_addr = addr - 0x1800;
         } else if (addr >= 0x2800 && addr < 0x3800) { //?
-            assert(addr+6 < 0x3800);
+            if (!(addr+6 < 0x3800)) { dsp_dma_skip("block address", addr, 0); s->next_block |= NODE_POINTER_EOL; s->eol = true; return; }
             block_space = DSP_SPACE_P;
             block_addr = addr - 0x2800;
         } else {
-            assert(!"Dsp dma space address out of range");
+            dsp_dma_skip("block address", addr, 0); s->next_block |= NODE_POINTER_EOL; s->eol = true; return;
         }
 
         uint32_t next_block = s->mem_read(s->mem_opaque, block_space, block_addr);
@@ -154,8 +166,10 @@ static void dsp_dma_run(DSPDMAState *s)
         // uint32_t dsp_step                = (control >> 14) & 0x3FF; // FIXME
 
         /* Check for unhandled control settings */
-        assert(unk2 == 0x0);
-        assert(unk13 == false);
+        if (unk2 != 0x0 || unk13) {
+            dsp_dma_skip("control", control, buf_id);
+            continue;
+        }
 
         /* Decode count for interleaved mode */
         uint32_t channel_count = (count & 0xF) + 1;
@@ -180,9 +194,8 @@ static void dsp_dma_run(DSPDMAState *s)
             item_mask = 0x00ffffff;
             break;
         default:
-            fprintf(stderr, "Unknown dsp dma format: 0x%x\n", format);
-            assert(!"Unknown dsp dma format");
-            break;
+            dsp_dma_skip("format", format, control);
+            continue;
         }
 
         size_t scratch_addr = scratch_base + scratch_offset;
@@ -190,20 +203,21 @@ static void dsp_dma_run(DSPDMAState *s)
         int mem_space = DSP_SPACE_X;
 
         if (dsp_offset < 0x1800) {
-            assert(dsp_offset+count < 0x1800);
+            if (!(dsp_offset+count < 0x1800)) { dsp_dma_skip("dsp offset", dsp_offset, count); continue; }
             mem_space = DSP_SPACE_X;
             mem_address = dsp_offset;
         } else if (dsp_offset >= 0x1800 && dsp_offset < 0x2000) { //?
-            assert(dsp_offset+count < 0x2000);
+            if (!(dsp_offset+count < 0x2000)) { dsp_dma_skip("dsp offset", dsp_offset, count); continue; }
             mem_space = DSP_SPACE_Y;
             mem_address = dsp_offset - 0x1800;
         } else if (dsp_offset >= 0x2800 && dsp_offset < 0x3800) { //?
-            assert(dsp_offset+count < 0x3800);
+            if (!(dsp_offset+count < 0x3800)) { dsp_dma_skip("dsp offset", dsp_offset, count); continue; }
             mem_space = DSP_SPACE_P;
             mem_address = dsp_offset - 0x2800;
         } else {
             fprintf(stderr, "Attempt to access %08x\n", dsp_offset);
-            assert(!"Dsp dma offset out of range");
+            dsp_dma_skip("dsp offset", dsp_offset, count);
+            continue;
         }
 
         size_t transfer_size = count * item_size;
@@ -228,6 +242,9 @@ static void dsp_dma_run(DSPDMAState *s)
                         uint32_t v = s->mem_read(s->mem_opaque,
                             mem_space, mem_address+ch*block_count+i);
                         switch(item_size) {
+                        case 1:
+                            scratch_buf[i*channel_count + ch] = v >> 16;
+                            break;
                         case 2:
                             *(uint16_t*)(scratch_buf + i*2*channel_count + ch*2) = v >> 8;
                             break;
@@ -244,6 +261,9 @@ static void dsp_dma_run(DSPDMAState *s)
                 for (int i = 0; i < count; i++) {
                     uint32_t v = s->mem_read(s->mem_opaque, mem_space, mem_address+i);
                     switch(item_size) {
+                    case 1:
+                        scratch_buf[i] = v >> 16;
+                        break;
                     case 2:
                         *(uint16_t*)(scratch_buf + i*2) = v >> 8;
                         break;
@@ -273,12 +293,14 @@ static void dsp_dma_run(DSPDMAState *s)
                 s->scratch_rw(s->rw_opaque, scratch_buf, scratch_addr, transfer_size, 1);
                 break;
             default:
-                fprintf(stderr, "Unknown DSP DMA buffer: 0x%x\n", buf_id);
-                assert(!"Unknown dsp dma buffer");
+                dsp_dma_skip("buffer (write)", buf_id, control);
                 break;
             }
         } else {
-            assert(!dsp_interleave);
+            if (dsp_interleave) {
+                dsp_dma_skip("interleaved read", buf_id, control);
+                continue;
+            }
 
             if (buf_id == 0xe) {
                 scratch_circular_copy(s, scratch_base, &scratch_offset, scratch_size, transfer_size, scratch_buf, 0);
@@ -301,6 +323,9 @@ static void dsp_dma_run(DSPDMAState *s)
             for (int i = 0; i < count; i++) {
                 uint32_t v;
                 switch(item_size) {
+                case 1:
+                    v = (uint32_t)scratch_buf[i] << 16;
+                    break;
                 case 2:
                     v = *(uint16_t*)(scratch_buf + i*2) << 8;
                     break;
