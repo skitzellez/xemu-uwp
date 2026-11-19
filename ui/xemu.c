@@ -3617,8 +3617,34 @@ static bool uwp_sym_name(uint64_t rva, char *out, size_t n, uint64_t *off)
 }
 
 /* "xemu.exe: pgraph_gl_draw_arrays+0x1c" or "ntdll.dll: RtlFreeHeap+0x40" */
+/* the base app's table when xemu runs as a layer (XemuTopMain, below WinMain); the same layout as Game Vault's layers/base_api.h */
+struct XemuBaseApi {
+    uint32_t size, version;
+    void (*log)(const wchar_t *line);
+    const char *(*av_version_info)(void);
+    const wchar_t *local_folder;
+    uint8_t *top_base;
+    uint64_t top_size;
+    const wchar_t *top_version, *top_from;
+    void (*mark_good)(void);
+    void (*set_crash_filter)(long (*filter)(void *exception_pointers));
+};
+extern const struct XemuBaseApi *xemu_uwp_base;
 static void uwp_where(uint64_t addr, char *out, size_t n)
 {
+    /* xemu itself as a layer loaded from memory: Windows does not know that module, the base says where it is */
+    if (xemu_uwp_base && xemu_uwp_base->version >= 2 && xemu_uwp_base->top_base &&
+        addr >= (uint64_t)(uintptr_t)xemu_uwp_base->top_base &&
+        addr < (uint64_t)(uintptr_t)xemu_uwp_base->top_base + xemu_uwp_base->top_size) {
+        uint64_t rva = addr - (uint64_t)(uintptr_t)xemu_uwp_base->top_base, off = 0;
+        char name[200];
+        if (uwp_sym_name(rva, name, sizeof(name), &off)) {
+            snprintf(out, n, "XemuTop.dll: %s+0x%llx", name, (unsigned long long)off);
+        } else {
+            snprintf(out, n, "XemuTop.dll+0x%llx", (unsigned long long)rva);
+        }
+        return;
+    }
     HMODULE mod = NULL;
     char path[MAX_PATH] = "?";
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -3632,9 +3658,12 @@ static void uwp_where(uint64_t addr, char *out, size_t n)
     uint64_t off = 0;
     uint32_t off32 = 0;
     const char *exp;
-    if (mod && mod == GetModuleHandleA(NULL) && uwp_sym_name(rva, name, sizeof(name), &off)) {
+    HMODULE self = NULL;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)(uintptr_t)&uwp_where, &self);
+    if (mod && mod == self && uwp_sym_name(rva, name, sizeof(name), &off)) {
         snprintf(out, n, "%s: %s+0x%llx", file, name, (unsigned long long)off);
-    } else if (mod && mod != GetModuleHandleA(NULL) && (exp = uwp_export_name(mod, addr, &off32))) {
+    } else if (mod && mod != self && (exp = uwp_export_name(mod, addr, &off32))) {
         snprintf(out, n, "%s: %s+0x%x", file, exp, off32);
     } else {
         snprintf(out, n, "%s+0x%llx", file, (unsigned long long)rva);
@@ -4466,6 +4495,20 @@ static void uwp_session_summary_head(const char *how, bool story)
     fflush(NULL);
 }
 
+static LONG WINAPI uwp_on_crash(EXCEPTION_POINTERS *e);
+static long uwp_on_crash_from_base(void *e)
+{
+    return uwp_on_crash((EXCEPTION_POINTERS *)e);
+}
+static void uwp_set_crash_filter(void)
+{
+    extern const struct XemuBaseApi *xemu_uwp_base;
+    if (xemu_uwp_base && xemu_uwp_base->version >= 2 && xemu_uwp_base->set_crash_filter) {
+        xemu_uwp_base->set_crash_filter(uwp_on_crash_from_base);
+    } else {
+        SetUnhandledExceptionFilter(uwp_on_crash);
+    }
+}
 static LONG WINAPI uwp_on_crash(EXCEPTION_POINTERS *e)
 {
     char how[160], words[160];
@@ -6950,6 +6993,18 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmdline, int show)
     return SDL_RunApp(1, uwp_argv, xemu_uwp_main, NULL);
 }
 
+/*
+ * xemu updates itself (XemuUWP/layers, the same way as Game Vault 0.16.1.844+): the installed app is a small base
+ * that loads this program as a DLL (XemuTop.dll) - the copy in the package, or a newer signed one Game Vault
+ * downloaded - and starts it here. Its table has the same layout as Game Vault's layers/base_api.h (version 2+).
+ */
+const struct XemuBaseApi *xemu_uwp_base;
+__declspec(dllexport) int XemuTopMain(const struct XemuBaseApi *api)
+{
+    xemu_uwp_base = api;
+    return WinMain(NULL, NULL, (LPSTR)"", 1);
+}
+
 static int xemu_uwp_main(int argc, char **argv)
 #else
 int main(int argc, char **argv)
@@ -7062,7 +7117,7 @@ int main(int argc, char **argv)
      */
     signal(SIGABRT, uwp_on_abort);
     uwp_crash_guard_start();
-    SetUnhandledExceptionFilter(uwp_on_crash);
+    uwp_set_crash_filter();
     atexit(uwp_on_early_exit);
     uwp_startup_disc();
 #endif
@@ -7168,7 +7223,7 @@ int main(int argc, char **argv)
     uwp_machine_running = true;
     setvbuf(stderr, NULL, _IONBF, 0);
     signal(SIGABRT, uwp_on_abort);
-    SetUnhandledExceptionFilter(uwp_on_crash);
+    uwp_set_crash_filter();
     uwp_session_start_ms = SDL_GetTicks();
     uwp_session_start_tick = GetTickCount64();
     {
@@ -7208,6 +7263,16 @@ int main(int argc, char **argv)
             Sleep(8000);
         }
         uwp_poll_activation();
+        {
+            extern const struct XemuBaseApi *xemu_uwp_base;
+            static bool told;
+            if (!told && xemu_uwp_base && xemu_uwp_base->version >= 2 && xemu_uwp_base->mark_good &&
+                SDL_GetTicks() - uwp_session_start_ms > 45000) {
+                told = true;
+                xemu_uwp_base->mark_good();
+                uwp_log("layers: xemu %ls (%ls) marked good", xemu_uwp_base->top_version, xemu_uwp_base->top_from);
+            }
+        }
         if ((uwp_frames % 120) == 0) {
             /* the running game's own title ID, every 2 s (hw/xbox/nv2a/user.c: Dark Alliance II's flip answer,
              * also when no Game Vault tid= came with the link) */
