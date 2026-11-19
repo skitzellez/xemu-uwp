@@ -101,7 +101,8 @@ static void scratch_circular_copy(
 }
 
 /* uwp (Game Vault): a DMA block with a setting xemu does not know yet (upstream stops xemu with an assert: Rainbow
- * Six 3 Black Arrow Revived at its title screen) is skipped instead: that block moves no sound, the game goes on.
+ * Six 3 Black Arrow Revived at its title screen) ends the block list instead (its next pointer can lead into sample
+ * data, 0x808080 blocks): no sound moves for the rest of that list, the game goes on.
  * The first few are written to the log so they can be done properly later. */
 static void dsp_dma_skip(const char *what, uint32_t a, uint32_t b)
 {
@@ -168,7 +169,7 @@ static void dsp_dma_run(DSPDMAState *s)
         /* Check for unhandled control settings */
         if (unk2 != 0x0 || unk13) {
             dsp_dma_skip("control", control, buf_id);
-            continue;
+            s->next_block |= NODE_POINTER_EOL; s->eol = true; return;
         }
 
         /* Decode count for interleaved mode */
@@ -195,7 +196,7 @@ static void dsp_dma_run(DSPDMAState *s)
             break;
         default:
             dsp_dma_skip("format", format, control);
-            continue;
+            s->next_block |= NODE_POINTER_EOL; s->eol = true; return;
         }
 
         size_t scratch_addr = scratch_base + scratch_offset;
@@ -203,21 +204,21 @@ static void dsp_dma_run(DSPDMAState *s)
         int mem_space = DSP_SPACE_X;
 
         if (dsp_offset < 0x1800) {
-            if (!(dsp_offset+count < 0x1800)) { dsp_dma_skip("dsp offset", dsp_offset, count); continue; }
+            if (!(dsp_offset+count < 0x1800)) { dsp_dma_skip("dsp offset", dsp_offset, count); s->next_block |= NODE_POINTER_EOL; s->eol = true; return; }
             mem_space = DSP_SPACE_X;
             mem_address = dsp_offset;
         } else if (dsp_offset >= 0x1800 && dsp_offset < 0x2000) { //?
-            if (!(dsp_offset+count < 0x2000)) { dsp_dma_skip("dsp offset", dsp_offset, count); continue; }
+            if (!(dsp_offset+count < 0x2000)) { dsp_dma_skip("dsp offset", dsp_offset, count); s->next_block |= NODE_POINTER_EOL; s->eol = true; return; }
             mem_space = DSP_SPACE_Y;
             mem_address = dsp_offset - 0x1800;
         } else if (dsp_offset >= 0x2800 && dsp_offset < 0x3800) { //?
-            if (!(dsp_offset+count < 0x3800)) { dsp_dma_skip("dsp offset", dsp_offset, count); continue; }
+            if (!(dsp_offset+count < 0x3800)) { dsp_dma_skip("dsp offset", dsp_offset, count); s->next_block |= NODE_POINTER_EOL; s->eol = true; return; }
             mem_space = DSP_SPACE_P;
             mem_address = dsp_offset - 0x2800;
         } else {
             fprintf(stderr, "Attempt to access %08x\n", dsp_offset);
             dsp_dma_skip("dsp offset", dsp_offset, count);
-            continue;
+            s->next_block |= NODE_POINTER_EOL; s->eol = true; return;
         }
 
         size_t transfer_size = count * item_size;
@@ -299,7 +300,7 @@ static void dsp_dma_run(DSPDMAState *s)
         } else {
             if (dsp_interleave) {
                 dsp_dma_skip("interleaved read", buf_id, control);
-                continue;
+                s->next_block |= NODE_POINTER_EOL; s->eol = true; return;
             }
 
             if (buf_id == 0xe) {
