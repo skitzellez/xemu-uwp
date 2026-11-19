@@ -238,6 +238,11 @@ static void gp_fifo_rw(void *opaque, uint8_t *ptr, unsigned int index,
     //     base, end, cur, len);
 
     /* DSP hangs if current >= end; but forces current >= base */
+    if (!dir && (end <= base || cur >= end)) {
+        /* uwp (Game Vault): an input FIFO the game has not set up: silence, not a stop */
+        memset(ptr, 0, len);
+        return;
+    }
     assert(cur < end);
     if (cur < base) {
         cur = base;
@@ -302,6 +307,11 @@ static void ep_fifo_rw(void *opaque, uint8_t *ptr, unsigned int index,
     }
 
     /* DSP hangs if current >= end; but forces current >= base */
+    if (!dir && end <= base) {
+        /* uwp (Game Vault): an input FIFO the game has not set up: silence (and no division by zero below) */
+        memset(ptr, 0, len);
+        return;
+    }
     if (cur >= end) {
         cur = cur % (end - base);
     }

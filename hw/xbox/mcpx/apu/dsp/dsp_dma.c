@@ -284,9 +284,18 @@ static void dsp_dma_run(DSPDMAState *s)
                 scratch_circular_copy(s, scratch_base, &scratch_offset, scratch_size, transfer_size, scratch_buf, 0);
             } else if (buf_id == 0xf) {
                 s->scratch_rw(s->rw_opaque, scratch_buf, scratch_addr, transfer_size, 0);
+            } else if (buf_id <= 0x1) {   /* 2 input FIFOs (GP/EP_INPUT_FIFO_COUNT) */
+                /* uwp (Game Vault): a read from an input FIFO, e.g. voice chat when a game's multiplayer menu
+                 * opens (Rainbow Six 3: Black Arrow). Upstream stops xemu here ("Unhandled dsp dma buffer");
+                 * the FIFO code reads it, or gives silence when the FIFO is not set up. */
+                s->fifo_rw(s->rw_opaque, scratch_buf, buf_id, transfer_size, 0);
             } else {
-                fprintf(stderr, "Unhandled DSP DMA buffer: 0x%x\n", buf_id);
-                assert(!"Unhandled dsp dma buffer");
+                static bool told;
+                if (!told) {
+                    told = true;
+                    fprintf(stderr, "Unhandled DSP DMA buffer: 0x%x (read as silence)\n", buf_id);
+                }
+                memset(scratch_buf, 0, transfer_size);
             }
 
             for (int i = 0; i < count; i++) {
