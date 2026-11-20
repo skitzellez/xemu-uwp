@@ -360,6 +360,62 @@ static void try_patch(Patch *pt)
               pt->writes > 1 ? ", again: the game loaded that part again" : "");
 }
 
+/*
+ * Testing (finding what to patch): patches\watch.txt in the own folder lists game addresses, one per line,
+ * "0xADDRESS length [label]"; each one is logged when its bytes change. Read once per game.
+ */
+typedef struct Watch {
+    uint32_t addr;
+    int len;
+    char label[32];
+    uint8_t last[64];
+    bool seen;
+} Watch;
+static GArray *watches;
+
+static void watch_load(void)
+{
+    g_clear_pointer(&watches, g_array_unref);
+    char *path = g_strdup_printf("%spatches" G_DIR_SEPARATOR_S "watch.txt", own_dir ? own_dir : "");
+    gchar *text = NULL;
+    if (g_file_get_contents(path, &text, NULL, NULL)) {
+        watches = g_array_new(false, true, sizeof(Watch));
+        gchar **rows = g_strsplit(text, "\n", -1);
+        for (int i = 0; rows[i]; i++) {
+            Watch w = { 0 };
+            char label[32] = "";
+            if (sscanf(rows[i], "%x %d %31s", &w.addr, &w.len, label) >= 2 && w.len > 0 && w.len <= 64) {
+                g_strlcpy(w.label, label, sizeof(w.label));
+                g_array_append_val(watches, w);
+            }
+        }
+        g_strfreev(rows);
+        g_free(text);
+        patch_log("patches: watching %u places (watch.txt)", watches->len);
+    }
+    g_free(path);
+}
+
+static void watch_tick(void)
+{
+    for (guint i = 0; watches && i < watches->len; i++) {
+        Watch *w = &g_array_index(watches, Watch, i);
+        uint8_t now[64];
+        if (!guest_rw(w->addr, now, w->len, false)) {
+            continue;
+        }
+        if (!w->seen || memcmp(now, w->last, w->len)) {
+            char hex[64 * 3 + 1] = "";
+            for (int k = 0; k < w->len; k++) {
+                snprintf(hex + 3 * k, 4, "%02X ", now[k]);
+            }
+            patch_log("watch: %s 0x%08x = %s", w->label, w->addr, hex);
+            memcpy(w->last, now, w->len);
+            w->seen = true;
+        }
+    }
+}
+
 void xemu_patches_tick(void)
 {
     struct xbe *xbe = xemu_get_xbe_info();
@@ -374,7 +430,9 @@ void xemu_patches_tick(void)
         patch_timedate = timedate;
         patch_loaded = true;
         load_for(title, ldl_le_p(&xbe->cert->m_version));
+        watch_load();
     }
+    watch_tick();
     for (guint i = 0; patches && i < patches->len; i++) {
         Patch *pt = g_ptr_array_index(patches, i);
         if (pt->on) {
