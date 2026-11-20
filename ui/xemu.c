@@ -81,6 +81,7 @@
 #include <glib/gstdio.h>
 #include <math.h>
 #include <SDL3/SDL.h>
+#include "qemu/xemu-patches.h"
 
 #ifdef _WIN32
 #include "xui/win32-dxgi-present.h"
@@ -5388,6 +5389,8 @@ static char *uwp_take_activation_disc(void)
     /* each link names its own game (tid=); a link without one must not keep the game before it, or the
      * next game's pipelines are recorded into that game's list */
     uwp_title_key[0] = '\0';
+    /* and its own patches= (none in the link: each patch's default) */
+    xemu_patches_set_link_choice(NULL);
     for (char *p = query ? query + 1 : NULL; p && *p;) {
         char *end = strchr(p, '&');
         if (end) {
@@ -5511,6 +5514,13 @@ static char *uwp_take_activation_disc(void)
             if (ok) {
                 g_strlcpy(uwp_title_key, v, sizeof(uwp_title_key));
             }
+        }
+        if (!strncmp(p, "patches=", 8)) {
+            /* game patches Game Vault turns on for this game: id,id / none / all (xemu-patches.c) */
+            char *v = g_uri_unescape_string(p + 8, NULL);
+            xemu_patches_set_link_choice(v && *v ? v : NULL);
+            uwp_log("link: patches %s", v && *v ? v : "(each patch's default)");
+            g_free(v);
         }
         if (!strcmp(p, "clearcache=1")) {
             uwp_clear_cache_wanted = true;
@@ -7386,6 +7396,7 @@ int main(int argc, char **argv)
     CloseHandle(CreateThread(NULL, 0, uwp_sampler_thread, (void *)"pfifo", 0,
                              NULL));
     CloseHandle(CreateThread(NULL, 0, uwp_run_watchdog, NULL, 0, NULL));
+    xemu_patches_set_dirs(xemu_settings_get_base_path(), SDL_GetBasePath());
     uint64_t uwp_frames = 0, uwp_next_report = SDL_GetTicks() + 3000;
     uint64_t uwp_started_ms = SDL_GetTicks();
 #endif
@@ -7427,6 +7438,12 @@ int main(int argc, char **argv)
                 qatomic_set(&nv2a_uwp_xbe_title, tid);
                 uwp_log("running title %08x", tid);
             }
+        }
+        if ((uwp_frames % 30) == 15) {
+            /* game patches (xemu-patches.c): the running game's patch file, written where its bytes are found */
+            xemu_main_loop_lock();
+            xemu_patches_tick();
+            xemu_main_loop_unlock();
         }
 #ifdef CONFIG_D3D12
         if (m_use_d3d12) {
