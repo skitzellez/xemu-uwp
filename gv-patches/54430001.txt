@@ -11,7 +11,8 @@ title 54430001
 version 0x00000001
 
 [ta-settings] Time Attack uses your Difficulty and Match Point
-default on
+# off until the player turns it on in Game Vault (game details > Game patches), which sends patches=ta-settings
+default off
 # helper: difficulty setting -> the fight's difficulty (keeps every register and flag)
 0x00011101: 90 90 90 90 90 90 90 90 90 90 90 90 90 -> 50 A0 78 4D 48 00 A2 24 9D 47 00 58 C3
 # helper: Match Point setting -> rounds to win, in DL

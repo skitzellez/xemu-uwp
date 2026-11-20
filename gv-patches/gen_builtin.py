@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 
 here = Path(__file__).resolve().parent
-out = ["/* made by gv-patches/gen_builtin.py from gv-patches/*.txt: do not edit */"]
+out = ["/* made by gv-patches/gen_builtin.py from the gv-patches folder: do not edit */"]
 for f in sorted(here.glob("*.txt")):
     if not re.fullmatch(r"[0-9A-Fa-f]{8}", f.stem):
         continue
