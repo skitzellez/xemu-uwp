@@ -81,6 +81,7 @@
 #include <glib/gstdio.h>
 #include <math.h>
 #include <SDL3/SDL.h>
+#include "qemu/xemu-patches.h"
 
 #ifdef _WIN32
 #include "xui/win32-dxgi-present.h"
@@ -5388,6 +5389,8 @@ static char *uwp_take_activation_disc(void)
     /* each link names its own game (tid=); a link without one must not keep the game before it, or the
      * next game's pipelines are recorded into that game's list */
     uwp_title_key[0] = '\0';
+    /* and its own patches= (none in the link: each patch's default) */
+    xemu_patches_set_link_choice(NULL);
     for (char *p = query ? query + 1 : NULL; p && *p;) {
         char *end = strchr(p, '&');
         if (end) {
@@ -5511,6 +5514,13 @@ static char *uwp_take_activation_disc(void)
             if (ok) {
                 g_strlcpy(uwp_title_key, v, sizeof(uwp_title_key));
             }
+        }
+        if (!strncmp(p, "patches=", 8)) {
+            /* game patches Game Vault turns on for this game: id,id / none / all (xemu-patches.c) */
+            char *v = g_uri_unescape_string(p + 8, NULL);
+            xemu_patches_set_link_choice(v && *v ? v : NULL);
+            uwp_log("link: patches %s", v && *v ? v : "(each patch's default)");
+            g_free(v);
         }
         if (!strcmp(p, "clearcache=1")) {
             uwp_clear_cache_wanted = true;
@@ -6402,6 +6412,29 @@ static void uwp_fill_system_files(void)
         } else if (usb && uwp_file_exists(usb)) {
             /* a console without a disk (new, or reset) and the player's stick: the stick's disk */
             uwp_set_path(&g_config.sys.files.hdd_path, "hard disk (on the USB drive, none on the console)", usb);
+            if (uwp_test_links_allowed()) {
+                /* testing 2026-11-20: can this app write files Game Vault made on the drive, and a copy of one? */
+                typedef BOOL (WINAPI *copy_fn)(LPCWSTR, LPCWSTR, BOOL);
+                copy_fn copy = (copy_fn)xemu_uwp_kernelbase_proc("CopyFileFromAppW");
+                char *idf = g_strdup_printf("%s.id", usb), *idc = g_strdup_printf("%s.id.wtest", usb);
+                wchar_t *wi = uwp_wide_path(idf), *wc = uwp_wide_path(idc);
+                HANDLE h = xemu_uwp_create_file_w(wi, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, OPEN_EXISTING, 0);
+                uwp_log("write test: %s for writing: %s (error %lu)", idf, h != INVALID_HANDLE_VALUE ? "yes" : "no",
+                        h != INVALID_HANDLE_VALUE ? 0 : GetLastError());
+                if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+                BOOL ok = copy && copy(wi, wc, FALSE);
+                uwp_log("write test: copy made: %s (error %lu)", ok ? "yes" : "no", ok ? 0 : GetLastError());
+                h = xemu_uwp_create_file_w(wc, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, OPEN_EXISTING, 0);
+                uwp_log("write test: the copy for writing: %s (error %lu)", h != INVALID_HANDLE_VALUE ? "yes" : "no",
+                        h != INVALID_HANDLE_VALUE ? 0 : GetLastError());
+                if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+                h = xemu_uwp_create_file_w(uwp_wide_path(usb), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                         OPEN_EXISTING, 0);
+                uwp_log("write test: the disk for writing (sharing writes): %s (error %lu)",
+                        h != INVALID_HANDLE_VALUE ? "yes" : "no", h != INVALID_HANDLE_VALUE ? 0 : GetLastError());
+                if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+                g_free(idf); g_free(idc); g_free(wi); g_free(wc);
+            }
         } else {
             uwp_new_hdd(folder, own, names[0]);
         }
@@ -7386,6 +7419,7 @@ int main(int argc, char **argv)
     CloseHandle(CreateThread(NULL, 0, uwp_sampler_thread, (void *)"pfifo", 0,
                              NULL));
     CloseHandle(CreateThread(NULL, 0, uwp_run_watchdog, NULL, 0, NULL));
+    xemu_patches_set_dirs(xemu_settings_get_base_path(), SDL_GetBasePath());
     uint64_t uwp_frames = 0, uwp_next_report = SDL_GetTicks() + 3000;
     uint64_t uwp_started_ms = SDL_GetTicks();
 #endif
@@ -7427,6 +7461,28 @@ int main(int argc, char **argv)
                 qatomic_set(&nv2a_uwp_xbe_title, tid);
                 uwp_log("running title %08x", tid);
             }
+        }
+        if ((uwp_frames % 60) == 45 && uwp_test_links_allowed()) {
+            /* testing (test-links.txt there): press.txt beside the log holds a press= list (uwp_press) for the
+             * running game, read once and deleted; the controller from the PC while a game plays */
+            char *base = SDL_GetPrefPath("xemu", "xemu");
+            char *file = g_strdup_printf("%spress.txt", base ? base : "");
+            gchar *list = NULL;
+            if (g_file_get_contents(file, &list, NULL, NULL)) {
+                g_unlink(file);
+                g_strstrip(list);
+                uwp_log("remote buttons from press.txt: %s", list);
+                uwp_press(list);
+                g_free(list);
+            }
+            g_free(file);
+            SDL_free(base);
+        }
+        if ((uwp_frames % 30) == 15) {
+            /* game patches (xemu-patches.c): the running game's patch file, written where its bytes are found */
+            xemu_main_loop_lock();
+            xemu_patches_tick();
+            xemu_main_loop_unlock();
         }
 #ifdef CONFIG_D3D12
         if (m_use_d3d12) {

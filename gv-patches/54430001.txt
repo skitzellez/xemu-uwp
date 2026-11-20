@@ -1,0 +1,28 @@
+# Dead or Alive 3 (USA), title 54430001, version 1
+# Asked for by SamuraiLegion (2026-11-19): Time Attack always plays at difficulty Normal with fixed rounds, whatever
+# Options > Game Settings say. The game starts every fight with a switch on the mode (code at 0x6E250); Time Attack
+# (mode 3) writes fixed values there: difficulty 1, rounds to win 2 (single) or 1 (tag). The other modes read
+# Options > Game Settings (Difficulty at 0x484D78: 0 Easy .. 3 Very Hard; Match Point at 0x484DB6, an index into the
+# rounds table at 0x306530: 1 2 3 4 5).
+# Two short helpers go into unused padding between functions (0x11101, 0x118D2: never called, nothing points there).
+# Tested 2026-11-19 on PC xemu 0.8.139 (memory written through its debugger): Very Hard + Match Point 4 -> Time Attack
+# fight with difficulty 3 and 4 round marks a side.
+title 54430001
+version 0x00000001
+
+[ta-settings] Time Attack uses your Difficulty and Match Point
+# off until the player turns it on in Game Vault (game details > Game patches), which sends patches=ta-settings
+default off
+# helper: difficulty setting -> the fight's difficulty (keeps every register and flag)
+0x00011101: 90 90 90 90 90 90 90 90 90 90 90 90 90 -> 50 A0 78 4D 48 00 A2 24 9D 47 00 58 C3
+# helper: Match Point setting -> rounds to win, in DL
+0x000118D2: 90 90 90 90 90 90 90 90 90 90 90 90 90 90 -> 0F B6 15 B6 4D 48 00 8A 92 30 65 30 00 C3
+# Time Attack: difficulty from the setting instead of 1 (single and tag)
+0x0006E395: 88 0D 24 9D 47 00 -> E8 67 2D FA FF 90
+# Time Attack single: rounds to win from the setting instead of 2
+0x0006E3A2: 8A 15 31 65 30 00 -> E8 2B 35 FA FF 90
+
+[ta-tag-rounds] Tag Time Attack uses Match Point too (normally 1 round)
+default off
+0x000118D2: 90 90 90 90 90 90 90 90 90 90 90 90 90 90 -> 0F B6 15 B6 4D 48 00 8A 92 30 65 30 00 C3
+0x0006E419: 8A 15 30 65 30 00 -> E8 B4 34 FA FF 90

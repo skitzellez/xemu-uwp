@@ -119,12 +119,35 @@ static inline HANDLE xemu_uwp_create_file_w(LPCWSTR name, DWORD access,
             xemu_uwp_open_note(name, access & GENERIC_WRITE ? "asking the broker (write)" : "asking the broker (read)");
         }
         HANDLE h = fn(name, access, share, NULL, creation, flags, NULL);
+        DWORD err = h == INVALID_HANDLE_VALUE ? GetLastError() : 0;
         if (usb) {
-            xemu_uwp_open_note(name, h != INVALID_HANDLE_VALUE ? "broker: opened" : "broker: refused");
+            char note[64];
+            snprintf(note, sizeof note, h != INVALID_HANDLE_VALUE ? "broker: opened" : "broker: refused (error %lu)", err);
+            xemu_uwp_open_note(name, note);
+        }
+        /*
+         * A file on a USB drive refused for writing: something else had it open just then (owner console
+         * 2026-11-20: the drive's Xbox hard disk refused at xemu's start while Game Vault had just looked at it; the
+         * same open a moment later, or allowing other writers, worked). Asked again for up to 3 s, then once allowing
+         * other writers (the hard disk is xemu's alone once it plays).
+         */
+        for (int i = 0; usb && h == INVALID_HANDLE_VALUE && (access & GENERIC_WRITE) && i < 12; i++) {
+            Sleep(250);
+            bool last = i == 11;
+            h = fn(name, access, last ? (share | FILE_SHARE_WRITE) : share, NULL, creation, flags, NULL);
+            err = h == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+            if (h != INVALID_HANDLE_VALUE || last) {
+                char note[96];
+                snprintf(note, sizeof note, h != INVALID_HANDLE_VALUE ? "broker: opened on try %d%s"
+                                                                     : "broker: still refused after %d tries%s (error %lu)",
+                         i + 2, last ? ", allowing other writers" : "", err);
+                xemu_uwp_open_note(name, note);
+            }
         }
         if (h != INVALID_HANDLE_VALUE) {
             return h;
         }
+        SetLastError(err);
     }
     HANDLE h = CreateFileW(name, access, share, NULL, creation, flags, NULL);
     if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED) {
