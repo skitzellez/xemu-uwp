@@ -167,14 +167,7 @@ static void dsp_dma_run(DSPDMAState *s)
         // uint32_t dsp_step                = (control >> 14) & 0x3FF; // FIXME
 
         /* Check for unhandled control settings */
-        if (unk13) {
-            static bool told13;
-            if (!told13) {
-                told13 = true;
-                fprintf(stderr, "DSP DMA: control bit 13 set (0x%x): done as a plain transfer\n", control);
-            }
-        }
-        if (unk2 != 0x0) {
+        if (unk2 != 0x0 || unk13) {
             dsp_dma_skip("control", control, buf_id);
             s->next_block |= NODE_POINTER_EOL; s->eol = true; return;
         }
@@ -306,8 +299,8 @@ static void dsp_dma_run(DSPDMAState *s)
             }
         } else {
             if (dsp_interleave) {
-                /* uwp (Game Vault): interleaved samples in, as many as the interleaved write sends out */
-                transfer_size = block_count * item_size * channel_count;
+                dsp_dma_skip("interleaved read", buf_id, control);
+                s->next_block |= NODE_POINTER_EOL; s->eol = true; return;
             }
 
             if (buf_id == 0xe) {
@@ -326,22 +319,6 @@ static void dsp_dma_run(DSPDMAState *s)
                     fprintf(stderr, "Unhandled DSP DMA buffer: 0x%x (read as silence)\n", buf_id);
                 }
                 memset(scratch_buf, 0, transfer_size);
-            }
-
-            if (dsp_interleave) {
-                for (int i = 0; i < block_count; i++) {
-                    for (int ch = 0; ch < channel_count; ch++) {
-                        size_t at = (size_t)(i * channel_count + ch);
-                        uint32_t v;
-                        switch (item_size) {
-                        case 1: v = (uint32_t)scratch_buf[at] << 16; break;
-                        case 2: v = (uint32_t)*(uint16_t*)(scratch_buf + at * 2) << 8; break;
-                        default: v = (*(uint32_t*)(scratch_buf + at * 4)) & item_mask; break;
-                        }
-                        s->mem_write(s->mem_opaque, mem_space, mem_address + ch * block_count + i, v);
-                    }
-                }
-                count = 0;   /* done: the plain loop below has nothing left to do */
             }
 
             for (int i = 0; i < count; i++) {
