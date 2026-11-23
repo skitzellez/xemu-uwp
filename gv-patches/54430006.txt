@@ -1,8 +1,42 @@
-# made by import_ips.py from the Xbox graphical patches collections (community IPS patches for default.xbe and OgXHD's widescreen database,
-# made and tested on the North American releases; list as shipped by xbased, github.com/crazyriddler/xbased)
+# Dead or Alive 2 Ultimate (USA): DOA2.xbe on the disc (version 6) and its Xbox Live title update on the Xbox hard
+# disk (TDATA\54430006\$u\doa2.xbe, version 0x106, what the launcher starts when it is there). The disc's
+# default.xbe launcher shares the title ID; every line checks its old bytes, so nothing is written there.
+# Asked for by a Discord player (2026-11-22): unlock everything, and computer fighters in random costumes.
+# Found 2026-11-23 with PC xemu's debugger on version 6, then placed in 0x106 by matching the same code.
 title 54430006
 
-[widescreen] Widescreen 16:9
-# widescreen.dat
+[unlock-all] Every character and costume unlocked
+# 0x11E410: costumes a player may pick = min(unlocked in the profile, all of that character's); the min goes
+# 0x11E5F0: Hitomi, Tengu and Bayman are locked by profile flags; the locked branch goes
+# (tested: Kasumi 2 -> 20 costumes, COS.15 in a fight; Tengu picked and played)
 default off
-find 71 3D AA 3F -> 96 FC E2 3F
+version 0x00000006
+0x0011E483: 76 02 -> 90 90
+0x0011E62D: 74 05 -> 90 90
+
+[unlock-all] Every character and costume unlocked
+default off
+version 0x00000106
+0x00120663: 76 02 -> 90 90
+0x0012080D: 74 05 -> 90 90
+
+[cpu-costumes] Computer fighters wear random costumes
+# The computer's costume comes from 0xC6B00(char, ...) in every mode. Its first bytes jump to a helper in unused
+# int3 padding at the end of .text that returns 0x11E570(char, rdtsc % costumes(char), 0, 0).
+# (tested: Ayane CPU in a swimsuit, then her ninja outfit; Gen Fu in black; fights fine)
+default off
+version 0x00000006
+0x00344107: CC CC CC CC -> 83 C4 10 C3
+0x00344111: CC CC CC CC CC CC CC CC CC CC CC CC CC CC -> 0F B6 4C 24 04 0F B6 89 08 0F 6E 00 EB 02
+0x00344121: CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC -> 0F 31 0F B7 C0 31 D2 E3 02 F7 F1 6A 00 EB 01
+0x00344131: CC CC CC CC CC CC CC CC CC CC CC CC CC CC -> 6A 00 52 FF 74 24 10 E8 33 A4 DD FF EB C8
+0x000C6B00: 51 53 8B 5C 24 0C -> E9 0C D6 27 00 90
+
+[cpu-costumes] Computer fighters wear random costumes
+default off
+version 0x00000106
+0x00347AF7: CC CC CC CC -> 83 C4 10 C3
+0x00347B01: CC CC CC CC CC CC CC CC CC CC CC CC CC CC -> 0F B6 4C 24 04 0F B6 89 88 72 6E 00 EB 02
+0x00347B11: CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC -> 0F 31 0F B7 C0 31 D2 E3 02 F7 F1 6A 00 EB 01
+0x00347B21: CC CC CC CC CC CC CC CC CC CC CC CC CC CC -> 6A 00 52 FF 74 24 10 E8 23 8C DD FF EB C8
+0x000C8DC0: 51 53 8B 5C 24 0C -> E9 3C ED 27 00 90
