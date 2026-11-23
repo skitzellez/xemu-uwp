@@ -464,6 +464,202 @@ static void bdrv_uwp_smb_init(void)
 
 block_init(bdrv_uwp_smb_init);
 
+/* ---- a share for the folder disc (block/uwp-folder.c): list folders, read files ------------------------------ */
+/*
+ * One connection to the share of "smb://server/share/<game folder>". The caller serializes all calls (the folder
+ * disc holds its own lock). Files are opened on first read, 8 kept open; a read that fails is tried again with the
+ * connection opened afresh, for up to ~10 s, as the disc driver above does.
+ */
+#define SMB_FD_OPEN 8
+typedef struct SmbShare {
+    char *server, *share;
+    struct smb2_context *ctx;
+    uint32_t max_read;
+    struct {
+        char *path;
+        struct smb2fh *fh;
+        uint64_t used;
+    } open[SMB_FD_OPEN];
+    uint64_t tick;
+} SmbShare;
+
+static void smb_share_drop(SmbShare *h)
+{
+    for (int i = 0; i < SMB_FD_OPEN; i++) {
+        if (h->open[i].fh && h->ctx) {
+            smb2_close(h->ctx, h->open[i].fh);
+        }
+        g_free(h->open[i].path);
+        h->open[i].path = NULL;
+        h->open[i].fh = NULL;
+    }
+    if (h->ctx) {
+        smb2_disconnect_share(h->ctx);
+        smb2_destroy_context(h->ctx);
+        h->ctx = NULL;
+    }
+}
+
+static bool smb_share_connect(SmbShare *h, Error **errp)
+{
+    h->ctx = smb_connect(h->server, h->share, errp);
+    if (!h->ctx) {
+        return false;
+    }
+    h->max_read = smb2_get_max_read_size(h->ctx);
+    if (h->max_read < 65536) {
+        h->max_read = 65536;
+    }
+    return true;
+}
+
+void *xemu_uwp_smb_share_open(const char *url, char **inner, char *why, size_t why_len);
+void *xemu_uwp_smb_share_open(const char *url, char **inner, char *why, size_t why_len)
+{
+    SmbShare *h = g_new0(SmbShare, 1);
+    if (!smb_split(url, &h->server, &h->share, inner)) {
+        snprintf(why, why_len, "not a share path");
+        g_free(h);
+        return NULL;
+    }
+    Error *err = NULL;
+    if (!smb_share_connect(h, &err)) {
+        snprintf(why, why_len, "%s", error_get_pretty(err));
+        error_free(err);
+        g_free(*inner);
+        *inner = NULL;
+        g_free(h->server);
+        g_free(h->share);
+        g_free(h);
+        return NULL;
+    }
+    return h;
+}
+
+void xemu_uwp_smb_share_close(void *opaque);
+void xemu_uwp_smb_share_close(void *opaque)
+{
+    SmbShare *h = opaque;
+    if (h) {
+        smb_share_drop(h);
+        g_free(h->server);
+        g_free(h->share);
+        g_free(h);
+    }
+}
+
+/* every entry of a folder in the share ('\' separated path) to cb; false: the folder cannot be listed */
+bool xemu_uwp_smb_list(void *opaque, const char *path, void (*cb)(void *, const char *, bool, uint64_t), void *cb_opaque);
+bool xemu_uwp_smb_list(void *opaque, const char *path, void (*cb)(void *, const char *, bool, uint64_t), void *cb_opaque)
+{
+    SmbShare *h = opaque;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!h->ctx) {
+            Error *err = NULL;
+            if (!smb_share_connect(h, &err)) {
+                uwp_log("%s", error_get_pretty(err));
+                error_free(err);
+                return false;
+            }
+        }
+        struct smb2dir *dir = smb2_opendir(h->ctx, path);
+        if (dir) {
+            struct smb2dirent *e;
+            while ((e = smb2_readdir(h->ctx, dir))) {
+                if (!strcmp(e->name, ".") || !strcmp(e->name, "..")) {
+                    continue;
+                }
+                cb(cb_opaque, e->name, e->st.smb2_type == SMB2_TYPE_DIRECTORY, e->st.smb2_size);
+            }
+            smb2_closedir(h->ctx, dir);
+            return true;
+        }
+        uwp_log("network: folder %s could not be listed: %s", path, smb2_get_error(h->ctx));
+        smb_share_drop(h);   /* once more on a fresh connection */
+    }
+    return false;
+}
+
+/* len bytes of a file in the share at off; 0, or -EIO */
+int xemu_uwp_smb_pread(void *opaque, const char *path, uint64_t off, void *buf, uint32_t len);
+int xemu_uwp_smb_pread(void *opaque, const char *path, uint64_t off, void *buf, uint32_t len)
+{
+    SmbShare *h = opaque;
+    int64_t start = 0, wait_us = 250 * 1000;
+    for (int attempt = 0;; attempt++) {
+        if (attempt >= 2) {
+            if (g_get_monotonic_time() - start + wait_us > SMB_RETRY_US) {
+                break;
+            }
+            g_usleep(wait_us);
+            wait_us = MIN(wait_us * 2, 2 * G_USEC_PER_SEC);
+        }
+        if (!h->ctx) {
+            Error *err = NULL;
+            if (!smb_share_connect(h, &err)) {
+                uwp_log("%s", error_get_pretty(err));
+                error_free(err);
+                if (!start) {
+                    start = g_get_monotonic_time();
+                }
+                continue;
+            }
+            uwp_log("network: connection opened again (%s)", h->server);
+        }
+        int slot = -1, lru = 0;
+        for (int i = 0; i < SMB_FD_OPEN; i++) {
+            if (h->open[i].path && !strcmp(h->open[i].path, path)) {
+                slot = i;
+                break;
+            }
+            if (h->open[i].used < h->open[lru].used) {
+                lru = i;
+            }
+        }
+        if (slot < 0) {
+            struct smb2fh *fh = smb2_open(h->ctx, path, O_RDONLY);
+            if (!fh) {
+                uwp_log("network: %s could not be opened: %s", path, smb2_get_error(h->ctx));
+                if (!start) {
+                    start = g_get_monotonic_time();
+                }
+                smb_share_drop(h);
+                continue;
+            }
+            if (h->open[lru].fh) {
+                smb2_close(h->ctx, h->open[lru].fh);
+            }
+            g_free(h->open[lru].path);
+            h->open[lru].path = g_strdup(path);
+            h->open[lru].fh = fh;
+            slot = lru;
+        }
+        h->open[slot].used = ++h->tick;
+        uint32_t done = 0;
+        while (done < len) {
+            uint32_t n = MIN(len - done, h->max_read);
+            int got = smb2_pread(h->ctx, h->open[slot].fh, (uint8_t *)buf + done, n, off + done);
+            if (got <= 0) {
+                break;
+            }
+            done += got;
+        }
+        if (done == len) {
+            if (start) {
+                uwp_log("network: read of %s recovered after %lld ms", path, (long long)((g_get_monotonic_time() - start) / 1000));
+            }
+            return 0;
+        }
+        if (!start) {
+            start = g_get_monotonic_time();
+        }
+        uwp_log("network: read of %s failed (%s), trying again", path, h->ctx ? smb2_get_error(h->ctx) : "no connection");
+        smb_share_drop(h);
+    }
+    uwp_log("network: read of %s gave up - the game is told the disc can't be read", path);
+    return -EIO;
+}
+
 /* A few bytes of a network disc image without opening it as a drive (ui/xemu.c: where the game partition of a
    full disc dump starts) */
 bool xemu_uwp_smb_peek(const char *url, uint64_t offset, void *buf, uint32_t len)

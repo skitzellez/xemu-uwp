@@ -7620,6 +7620,24 @@ char *xemu_uwp_disc_filename(const char *path)
     if (!path || !path[0] || !strncmp(path, "json:", 5)) {
         return g_strdup(path ? path : "");
     }
+    /* an unpacked game: its folder (default.xbe in it), on a drive or a share, is shown to the Xbox as a disc (block/uwp-folder.c) */
+    {
+        extern bool xemu_uwp_folder_disc(const char *path, char **folder);
+        char *folder = NULL;
+        if (xemu_uwp_folder_disc(path, &folder)) {
+            uwp_log("disc is a game folder: %s", folder);
+            GString *j = g_string_new("json:{\"driver\":\"raw\",\"file\":{\"driver\":\"folder\",\"filename\":\"");
+            for (const char *c = folder; *c; c++) {
+                if (*c == '"' || *c == '\\') {
+                    g_string_append_c(j, '\\');
+                }
+                g_string_append_c(j, *c);
+            }
+            g_string_append(j, "\"}}");
+            g_free(folder);
+            return g_string_free(j, FALSE);
+        }
+    }
     if (g_str_has_prefix(path, "smb://")) {
         /* a disc on a PC's shared folder or a NAS (block/uwp-smb.c): the same look for a full dump's game
            partition, over the network */
@@ -7645,24 +7663,6 @@ char *xemu_uwp_disc_filename(const char *path)
         }
         g_string_append(j, "\"}}");
         return g_string_free(j, FALSE);
-    }
-    /* an unpacked game: its folder (default.xbe in it) is shown to the Xbox as a disc (block/uwp-folder.c) */
-    {
-        extern bool xemu_uwp_folder_disc(const char *path, char **folder);
-        char *folder = NULL;
-        if (xemu_uwp_folder_disc(path, &folder)) {
-            uwp_log("disc is a game folder: %s", folder);
-            GString *j = g_string_new("json:{\"driver\":\"raw\",\"file\":{\"driver\":\"folder\",\"filename\":\"");
-            for (const char *c = folder; *c; c++) {
-                if (*c == '"' || *c == '\\') {
-                    g_string_append_c(j, '\\');
-                }
-                g_string_append_c(j, *c);
-            }
-            g_string_append(j, "\"}}");
-            g_free(folder);
-            return g_string_free(j, FALSE);
-        }
     }
     /* Opened like the block layer opens it, so a FAT32 / exFAT USB drive works. */
     wchar_t *wpath = g_utf8_to_utf16(path, -1, NULL, NULL, NULL);

@@ -63,6 +63,7 @@ typedef struct FdNode {
     uint64_t size;        /* a file's size; a folder: its table's size */
     uint32_t sector;      /* first sector of the data / table */
     wchar_t *path;        /* a file's full path on the drive */
+    char *npath;          /* on a network share: its path in the share (backslash separated, UTF-8) */
     struct FdNode *kids;  /* a folder's contents, sorted as the disc wants them */
     int nkids;
     uint8_t *table;       /* a folder's table, built in memory */
@@ -92,7 +93,15 @@ typedef struct FdDisc {
     FdOpen open[FD_OPEN_SLOTS];
     uint64_t clock;
     int skipped;          /* files too big for a disc (4 GB) or with a name too long */
+    void *net;            /* a network share (block/uwp-smb.c), or NULL: the drive */
 } FdDisc;
+
+#ifdef XEMU_UWP_SMB
+void *xemu_uwp_smb_share_open(const char *url, char **inner, char *why, size_t why_len);
+void xemu_uwp_smb_share_close(void *opaque);
+bool xemu_uwp_smb_list(void *opaque, const char *path, void (*cb)(void *, const char *, bool, uint64_t), void *cb_opaque);
+int xemu_uwp_smb_pread(void *opaque, const char *path, uint64_t off, void *buf, uint32_t len);
+#endif
 
 /* ---- the drive: listing folders, opening files (through the file broker on the console) ---- */
 
@@ -173,6 +182,116 @@ static wchar_t *fd_join(const wchar_t *dir, const wchar_t *name)
     return p;
 }
 
+/* one entry found in a folder into node's list (name as UTF-16); false: the list is full */
+static bool fd_add_entry(FdDisc *d, FdNode *node, int *cap, const wchar_t *n, bool dir_entry, uint64_t size,
+                         wchar_t *wpath, char *npath)
+{
+    char name[256];
+    BOOL lossy = FALSE;
+    int len = WideCharToMultiByte(1252, 0, n, -1, name, sizeof(name), "_", &lossy);
+    if (len <= 1 || len > 256 || (!dir_entry && size > 0xFFFFFFFFull)) {
+        d->skipped++;
+        free(wpath);
+        free(npath);
+        return true;
+    }
+    if (d->files + d->folders >= FD_MAX_FILES) {
+        free(wpath);
+        free(npath);
+        return false;
+    }
+    if (node->nkids == *cap) {
+        *cap *= 2;
+        node->kids = realloc(node->kids, *cap * sizeof(FdNode));
+        memset(node->kids + node->nkids, 0, (*cap - node->nkids) * sizeof(FdNode));
+    }
+    FdNode *k = &node->kids[node->nkids++];
+    k->name_len = (uint8_t)(len - 1);
+    k->name = malloc(len);
+    memcpy(k->name, name, len);
+    k->dir = dir_entry;
+    k->path = wpath;
+    k->npath = npath;
+    if (dir_entry) {
+        d->folders++;
+    } else {
+        k->size = size;
+        d->files++;
+        d->bytes += size;
+    }
+    return true;
+}
+
+static void fd_sort_kids(FdDisc *d, FdNode *node)
+{
+    qsort(node->kids, node->nkids, sizeof(FdNode), fd_compare_q);
+    /* two names the disc cannot tell apart (only case differs): the second one is left out */
+    for (int i = 1; i < node->nkids; i++) {
+        if (!fd_compare(&node->kids[i - 1], &node->kids[i])) {
+            free(node->kids[i].name);
+            free(node->kids[i].path);
+            free(node->kids[i].npath);
+            memmove(&node->kids[i], &node->kids[i + 1], (node->nkids - i - 1) * sizeof(FdNode));
+            node->nkids--;
+            i--;
+            d->skipped++;
+        }
+    }
+}
+
+#ifdef XEMU_UWP_SMB
+typedef struct FdNetList {
+    FdDisc *d;
+    FdNode *node;
+    int cap;
+    const char *dir;
+    bool full;
+} FdNetList;
+
+static void fd_net_entry(void *opaque, const char *name, bool dir, uint64_t size)
+{
+    FdNetList *l = opaque;
+    if (l->full) {
+        return;
+    }
+    wchar_t w[512];
+    if (!MultiByteToWideChar(CP_UTF8, 0, name, -1, w, 512)) {
+        l->d->skipped++;
+        return;
+    }
+    size_t a = strlen(l->dir), b = strlen(name);
+    char *np = malloc(a + b + 2);
+    memcpy(np, l->dir, a);
+    size_t at = a;
+    if (at) {
+        np[at++] = '\\';
+    }
+    memcpy(np + at, name, b + 1);
+    if (!fd_add_entry(l->d, l->node, &l->cap, w, dir, size, NULL, np)) {
+        l->full = true;
+    }
+}
+
+static bool fd_scan_net(FdDisc *d, FdNode *node, const char *dir, int depth)
+{
+    if (depth > FD_MAX_DEPTH) {
+        return true;
+    }
+    FdNetList l = { d, node, 16, dir, false };
+    node->kids = calloc(l.cap, sizeof(FdNode));
+    if (!xemu_uwp_smb_list(d->net, dir, fd_net_entry, &l)) {
+        return depth > 0;
+    }
+    fd_sort_kids(d, node);
+    for (int i = 0; i < node->nkids; i++) {
+        if (node->kids[i].dir && !fd_scan_net(d, &node->kids[i], node->kids[i].npath, depth + 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
 static bool fd_scan(FdDisc *d, FdNode *node, const wchar_t *dir, int depth)
 {
     if (depth > FD_MAX_DEPTH) {
@@ -194,48 +313,12 @@ static bool fd_scan(FdDisc *d, FdNode *node, const wchar_t *dir, int depth)
         }
         bool dir_entry = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         uint64_t size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-        char name[256];
-        BOOL lossy = FALSE;
-        int len = WideCharToMultiByte(1252, 0, n, -1, name, sizeof(name), "_", &lossy);
-        if (len <= 1 || len > 256 || (!dir_entry && size > 0xFFFFFFFFull)) {
-            d->skipped++;
-            continue;
-        }
-        if (d->files + d->folders >= FD_MAX_FILES) {
+        if (!fd_add_entry(d, node, &cap, n, dir_entry, size, fd_join(dir, n), NULL)) {
             break;
-        }
-        if (node->nkids == cap) {
-            cap *= 2;
-            node->kids = realloc(node->kids, cap * sizeof(FdNode));
-            memset(node->kids + node->nkids, 0, (cap - node->nkids) * sizeof(FdNode));
-        }
-        FdNode *k = &node->kids[node->nkids++];
-        k->name_len = (uint8_t)(len - 1);
-        k->name = malloc(len);
-        memcpy(k->name, name, len);
-        k->dir = dir_entry;
-        k->path = fd_join(dir, n);
-        if (dir_entry) {
-            d->folders++;
-        } else {
-            k->size = size;
-            d->files++;
-            d->bytes += size;
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
-    qsort(node->kids, node->nkids, sizeof(FdNode), fd_compare_q);
-    /* two names the disc cannot tell apart (only case differs): the second one is left out */
-    for (int i = 1; i < node->nkids; i++) {
-        if (!fd_compare(&node->kids[i - 1], &node->kids[i])) {
-            free(node->kids[i].name);
-            free(node->kids[i].path);
-            memmove(&node->kids[i], &node->kids[i + 1], (node->nkids - i - 1) * sizeof(FdNode));
-            node->nkids--;
-            i--;
-            d->skipped++;
-        }
-    }
+    fd_sort_kids(d, node);
     for (int i = 0; i < node->nkids; i++) {
         if (node->kids[i].dir && !fd_scan(d, &node->kids[i], node->kids[i].path, depth + 1)) {
             return false;
@@ -407,6 +490,7 @@ static void fd_free_node(FdNode *n)
     free(n->kids);
     free(n->name);
     free(n->path);
+    free(n->npath);
     free(n->table);
 }
 
@@ -419,10 +503,16 @@ static void fd_free(FdDisc *d)
     }
     fd_free_node(&d->root);
     free(d->ext);
+#ifdef XEMU_UWP_SMB
+    if (d->net) {
+        xemu_uwp_smb_share_close(d->net);
+    }
+#endif
     memset(d, 0, sizeof(*d));
 }
 
 /* Lists the folder and lays the disc out. false: the folder could not be read (or has no default.xbe). */
+static bool fd_layout(FdDisc *d, char *why, size_t why_len);
 static bool fd_build(FdDisc *d, const wchar_t *folder, char *why, size_t why_len)
 {
     memset(d, 0, sizeof(*d));
@@ -431,6 +521,32 @@ static bool fd_build(FdDisc *d, const wchar_t *folder, char *why, size_t why_len
         snprintf(why, why_len, "the folder cannot be opened (error %lu)", GetLastError());
         return false;
     }
+    return fd_layout(d, why, why_len);
+}
+
+#ifdef XEMU_UWP_SMB
+/* the same from "smb://server/share/<folder>" */
+static bool fd_build_net(FdDisc *d, const char *url, char *why, size_t why_len)
+{
+    memset(d, 0, sizeof(*d));
+    d->root.dir = true;
+    char *inner = NULL;
+    d->net = xemu_uwp_smb_share_open(url, &inner, why, why_len);
+    if (!d->net) {
+        return false;
+    }
+    bool ok = fd_scan_net(d, &d->root, inner, 0);
+    g_free(inner);
+    if (!ok) {
+        snprintf(why, why_len, "the folder cannot be listed on the network");
+        return false;
+    }
+    return fd_layout(d, why, why_len);
+}
+#endif
+
+static bool fd_layout(FdDisc *d, char *why, size_t why_len)
+{
     bool xbe = false;
     for (int i = 0; i < d->root.nkids; i++) {
         if (!d->root.kids[i].dir && d->root.kids[i].name_len == 11 && !_strnicmp(d->root.kids[i].name, "default.xbe", 11)) {
@@ -521,6 +637,13 @@ static int fd_read(FdDisc *d, uint64_t offset, uint8_t *buf, uint64_t bytes)
             } else {
                 uint64_t real = in < e->file->size ? e->file->size - in : 0;   /* past the end: zeros */
                 uint64_t want = chunk < real ? chunk : real;
+#ifdef XEMU_UWP_SMB
+                if (want && d->net) {
+                    if (xemu_uwp_smb_pread(d->net, e->file->npath, in, buf, (uint32_t)want) < 0) {
+                        return -EIO;
+                    }
+                } else
+#endif
                 if (want) {
                     HANDLE h = fd_handle(d, e->file);
                     OVERLAPPED ov = { 0 };
@@ -553,7 +676,17 @@ typedef struct BDRVFolderState {
     char *folder;
     QemuMutex lock;
     uint64_t reads, read_bytes;
+    /* on a network share: the disc read ahead in 1 MB pieces, so a game's small reads do not each wait on the
+       network (as block/uwp-smb.c does for a disc image) */
+    struct {
+        int64_t chunk;   /* -1: empty */
+        uint64_t used;
+        uint8_t *buf;
+    } slot[16];
+    uint64_t tick;
 } BDRVFolderState;
+
+#define FD_CHUNK (1u << 20)
 
 static QemuOptsList folder_runtime_opts = {
     .name = "folder",
@@ -602,7 +735,21 @@ static int folder_open(BlockDriverState *bs, QDict *options, int flags, Error **
     }
     uint64_t t0 = g_get_monotonic_time();
     char why[160] = "";
-    bool ok = fd_build(&s->disc, w, why, sizeof(why));
+    bool ok;
+    if (g_str_has_prefix(folder, "smb://")) {
+#ifdef XEMU_UWP_SMB
+        ok = fd_build_net(&s->disc, folder, why, sizeof(why));
+        for (int i = 0; i < 16; i++) {
+            s->slot[i].chunk = -1;
+            s->slot[i].buf = g_malloc(FD_CHUNK);
+        }
+#else
+        ok = false;
+        snprintf(why, sizeof(why), "network folders are not in this build");
+#endif
+    } else {
+        ok = fd_build(&s->disc, w, why, sizeof(why));
+    }
     g_free(w);
     if (!ok) {
         uwp_log("folder disc: %s: %s", folder, why);
@@ -636,6 +783,9 @@ static void folder_close(BlockDriverState *bs)
     }
     fd_free(&s->disc);
     g_free(s->folder);
+    for (int i = 0; i < 16; i++) {
+        g_free(s->slot[i].buf);
+    }
 }
 
 typedef struct FolderRead {
@@ -647,8 +797,45 @@ typedef struct FolderRead {
 static int folder_read_worker(void *opaque)
 {
     FolderRead *r = opaque;
-    qemu_mutex_lock(&r->s->lock);
-    int ret = fd_read(&r->s->disc, r->offset, r->buf, r->bytes);
+    BDRVFolderState *s = r->s;
+    qemu_mutex_lock(&s->lock);
+    int ret = 0;
+    if (!s->disc.net) {
+        ret = fd_read(&s->disc, r->offset, r->buf, r->bytes);
+    } else {
+        uint64_t total = (uint64_t)s->disc.sectors * FD_SECTOR, pos = r->offset, end = r->offset + r->bytes;
+        while (pos < end && ret == 0) {
+            if (pos >= total) {
+                memset(r->buf + (pos - r->offset), 0, end - pos);
+                break;
+            }
+            int64_t chunk = pos / FD_CHUNK;
+            int hit = -1, old = 0;
+            for (int i = 0; i < 16; i++) {
+                if (s->slot[i].chunk == chunk) {
+                    hit = i;
+                    break;
+                }
+                if (s->slot[i].used < s->slot[old].used) {
+                    old = i;
+                }
+            }
+            uint64_t base = (uint64_t)chunk * FD_CHUNK, len = MIN((uint64_t)FD_CHUNK, total - base);
+            if (hit < 0) {
+                s->slot[old].chunk = -1;
+                ret = fd_read(&s->disc, base, s->slot[old].buf, len);
+                if (ret < 0) {
+                    break;
+                }
+                s->slot[old].chunk = chunk;
+                hit = old;
+            }
+            s->slot[hit].used = ++s->tick;
+            uint64_t n = MIN(end - pos, base + len - pos);
+            memcpy(r->buf + (pos - r->offset), s->slot[hit].buf + (pos - base), n);
+            pos += n;
+        }
+    }
     r->s->reads++;
     r->s->read_bytes += r->bytes;
     qemu_mutex_unlock(&r->s->lock);
