@@ -1,0 +1,9 @@
+# made by import_ips.py from the Xbox graphical patches collections (community IPS patches for default.xbe and OgXHD's widescreen database,
+# made and tested on the North American releases; list as shipped by xbased, github.com/crazyriddler/xbased)
+title 44430003
+
+[widescreen] Widescreen 16:9
+# widescreen.dat
+default off
+find D8 3D 08 3B 2F 00 D9 10 -> D8 7C 24 0C 90 90 D9 10
+find 68 00 00 80 3F D9 83 74 02 00 00 52 D8 0D 08 3E -> 68 00 00 40 3F D9 83 74 02 00 00 52 D8 0D 08 3E

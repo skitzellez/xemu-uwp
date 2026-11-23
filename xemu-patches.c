@@ -36,6 +36,15 @@
  * bytes to check, so its patch waits one second after the .xbe appears (the loader has copied the sections by then),
  * and it is written again when the game loads that part again (at most 20 times).
  *
+ * Patches made as find-and-replace pairs (OgXHD's widescreen database) search the game's .xbe for their bytes:
+ *
+ *   [widescreen] Widescreen 16:9
+ *   find 74 0A C7 44 24 10 -> EB 0A C7 44 24 10
+ *
+ * Each loaded section of the running .xbe is searched once, every match becomes a line with its old bytes checked
+ * (old -> new, as above), so a release the pair was not made for gets it only where its bytes are. Other .xbe files
+ * of the game (a title update on the hard disk: Halo 2 1.5) are searched too.
+ *
  * Game Vault's link chooses which patches are on: patches=<id>,<id> (only these), patches=none (none), no
  * patches= (each patch's own default).
  */
@@ -56,7 +65,8 @@
 #define patch_log(...) fprintf(stderr, __VA_ARGS__), fputc('\n', stderr)
 #endif
 
-#define MAX_LINE_BYTES 64
+#define MAX_LINE_BYTES 512 /* OgXHD's widescreen database's longest pattern is 337 bytes */
+#define MAX_FIND_LINES 4096
 
 static const struct {
     uint32_t title;
@@ -70,6 +80,7 @@ typedef struct PatchLine {
     uint32_t addr;
     uint32_t file_off; /* file lines: offset in the .xbe file; addr is found when the game's .xbe is known */
     bool from_file;
+    bool found;        /* made from a find line: holding other bytes skips this line only, not the patch */
     int len;
     uint8_t expect[MAX_LINE_BYTES];
     uint8_t value[MAX_LINE_BYTES];
@@ -85,6 +96,9 @@ typedef struct Patch {
     int writes;
     int wait;      /* checks to skip while a write is on its way */
     bool has_file;     /* has file lines (no old bytes) */
+    GArray *finds;     /* PatchLine: find lines, expect = the bytes searched for, value = their replacement */
+    uint8_t scanned[256 / 8]; /* find lines: sections of the .xbe already searched */
+    bool find_told;
     bool has_version;
     uint32_t version;  /* has_version: only this game version */
     uint32_t region;   /* nonzero: only a game with one of these certificate region bits */
@@ -112,6 +126,7 @@ static void patch_free(gpointer p)
     g_free(pt->id);
     g_free(pt->name);
     g_array_free(pt->lines, true);
+    g_array_free(pt->finds, true);
     g_free(pt);
 }
 
@@ -193,6 +208,7 @@ static bool parse_file(const char *text, const char *path, uint32_t title, uint3
             cur->default_on = true;
             cur->usable = true;
             cur->lines = g_array_new(false, true, sizeof(PatchLine));
+            cur->finds = g_array_new(false, true, sizeof(PatchLine));
             g_ptr_array_add(out, cur);
             continue;
         }
@@ -231,6 +247,25 @@ static bool parse_file(const char *text, const char *path, uint32_t title, uint3
             g_array_append_val(cur->lines, pl);
             continue;
         }
+        if (!g_ascii_strncasecmp(row, "find ", 5) && cur) {
+            PatchLine pl = { 0 };
+            char *arrow = strstr(row, "->");
+            int a = -1, b = -1;
+            if (arrow) {
+                *arrow = '\0';
+                a = parse_bytes(row + 5, pl.expect);
+                b = parse_bytes(arrow + 2, pl.value);
+            }
+            if (a <= 0 || a != b) {
+                patch_log("patches: %s line %d: needs find old bytes -> new bytes (same count, at most %d)", path,
+                          i + 1, MAX_LINE_BYTES);
+                ok = false;
+                break;
+            }
+            pl.len = a;
+            g_array_append_val(cur->finds, pl);
+            continue;
+        }
         if (!g_ascii_strncasecmp(row, "version ", 8)) {
             if ((uint32_t)g_ascii_strtoull(row + 8, NULL, 0) != version) {
                 patch_log("patches: %s is for version %s, the game is 0x%08x: not used", path, row + 8, version);
@@ -267,7 +302,7 @@ static bool parse_file(const char *text, const char *path, uint32_t title, uint3
     g_strfreev(rows);
     for (guint i = 0; ok && i < out->len; i++) {
         Patch *pt = g_ptr_array_index(out, i);
-        if (pt->lines->len == 0) {
+        if (pt->lines->len == 0 && pt->finds->len == 0) {
             patch_log("patches: %s: [%s] has no lines", path, pt->id);
             ok = false;
         }
@@ -333,7 +368,7 @@ static void check_usable(Patch *pt, struct xbe *xbe, uint32_t title, uint32_t ve
             return;
         }
     }
-    if (pt->has_file) {
+    if (pt->has_file || pt->finds->len) {
         pt->wait = 2; /* one second: the loader copies the sections after the headers */
     }
 }
@@ -430,19 +465,101 @@ static void write_lines(CPUState *cs, run_on_cpu_data data)
     g_array_free(lines, true);
 }
 
-static void try_patch(Patch *pt)
+/* find lines: each section of the .xbe not searched yet is read from the game's memory and searched; every match
+ * becomes a checked line. A section not in memory yet (loaded later by the game), or still all zeros, waits. */
+static void scan_sections(Patch *pt, struct xbe *xbe)
+{
+    uint32_t base = ldl_le_p(&xbe->header->m_base);
+    uint32_t nsec = ldl_le_p(&xbe->header->m_sections);
+    uint32_t sec_va = ldl_le_p(&xbe->header->m_section_headers_addr);
+    bool all = true;
+    for (uint32_t i = 0; i < nsec && i < 256; i++) {
+        if (pt->scanned[i / 8] & (1u << (i % 8))) {
+            continue;
+        }
+        uint64_t at = (uint64_t)sec_va - base + i * 0x38u;
+        if (sec_va < base || at + 0x38 > xbe->headers_len) {
+            break;
+        }
+        const uint8_t *sh = xbe->headers + at;
+        uint32_t va = ldl_le_p(sh + 4), len = MIN(ldl_le_p(sh + 8), ldl_le_p(sh + 16));
+        if (len == 0 || len > 64 * 1024 * 1024) {
+            pt->scanned[i / 8] |= 1u << (i % 8);
+            continue;
+        }
+        uint8_t *buf = g_malloc(len);
+        bool zero = true;
+        if (guest_rw(va, buf, len, false)) {
+            for (uint32_t k = 0; k < len && zero; k++) {
+                zero = !buf[k];
+            }
+        }
+        if (zero) { /* not readable, or not loaded yet */
+            all = false;
+            g_free(buf);
+            continue;
+        }
+        pt->scanned[i / 8] |= 1u << (i % 8);
+        int hits = 0;
+        for (guint p = 0; p < pt->finds->len; p++) {
+            const PatchLine *f = &g_array_index(pt->finds, PatchLine, p);
+            for (uint32_t o = 0; o + f->len <= len && pt->lines->len < MAX_FIND_LINES; o++) {
+                if (buf[o] != f->expect[0] || memcmp(buf + o, f->expect, f->len)) {
+                    continue;
+                }
+                PatchLine pl = *f;
+                pl.addr = va + o;
+                pl.found = true;
+                g_array_append_val(pt->lines, pl);
+                hits++;
+                o += f->len - 1;
+            }
+        }
+        g_free(buf);
+        if (hits) {
+            patch_log("patches: [%s] section %u (0x%08x): %d matches of its %u patterns", pt->id, i, va, hits,
+                      pt->finds->len);
+        }
+    }
+    if (all && !pt->find_told) {
+        pt->find_told = true;
+        patch_log("patches: [%s] all sections searched: %u matches%s", pt->id, pt->lines->len,
+                  pt->lines->len ? "" : " (made for another release of the game): not used");
+    }
+}
+
+static void try_patch(Patch *pt, struct xbe *xbe)
 {
     if (pt->wait > 0) {
         pt->wait--;
         return;
     }
+    if (pt->finds->len) {
+        scan_sections(pt, xbe);
+        if (pt->lines->len == 0) {
+            return;
+        }
+    }
     bool any_old = false;
+    GArray *copy = g_array_new(false, true, sizeof(PatchLine));
     for (guint i = 0; i < pt->lines->len; i++) {
         PatchLine *pl = &g_array_index(pt->lines, PatchLine, i);
         uint8_t now[MAX_LINE_BYTES];
         if (!guest_rw(pl->addr, now, pl->len, false)) {
+            if (pl->found) {
+                continue; /* that part of the game is not in memory now */
+            }
+            g_array_free(copy, true);
             return; /* not loaded yet */
         }
+        if (pl->found) {
+            if (!memcmp(now, pl->expect, pl->len)) {
+                any_old = true;
+                g_array_append_val(copy, *pl);
+            }
+            continue; /* the new bytes, or other bytes there now (the game changed that place): left alone */
+        }
+        g_array_append_val(copy, *pl);
         if (pl->from_file) {
             if (memcmp(now, pl->value, pl->len)) {
                 any_old = true; /* no old bytes to check: the version, region and place were checked */
@@ -459,27 +576,29 @@ static void try_patch(Patch *pt)
                 patch_log("patches: [%s] waits: 0x%08x holds %s(another version, or not loaded yet)", pt->id,
                           pl->addr, got);
             }
+            g_array_free(copy, true);
             return;
         }
     }
     if (!any_old) {
+        g_array_free(copy, true);
         return; /* all written already */
     }
-    if (pt->has_file && pt->writes >= 20) {
+    if ((pt->has_file || pt->finds->len) && pt->writes >= 20) {
         if (pt->state != 3) {
             pt->state = 3;
             patch_log("patches: [%s] the game keeps changing those bytes back: left alone", pt->id);
         }
+        g_array_free(copy, true);
         return;
     }
     /* written while the CPU is stopped between instructions: it may be running the very code */
     CPUState *cs = qemu_get_cpu(0);
-    GArray *copy = g_array_copy(pt->lines);
     async_safe_run_on_cpu(cs, write_lines, RUN_ON_CPU_HOST_PTR(copy));
     pt->state = 1;
     pt->wait = 2;
     pt->writes++;
-    patch_log("patches: [%s] %s written (%u lines%s)", pt->id, pt->name, pt->lines->len,
+    patch_log("patches: [%s] %s written (%u lines%s)", pt->id, pt->name, copy->len,
               pt->writes > 1 ? ", again: the game loaded that part again" : "");
 }
 
@@ -563,7 +682,7 @@ void xemu_patches_tick(void)
     for (guint i = 0; patches && i < patches->len; i++) {
         Patch *pt = g_ptr_array_index(patches, i);
         if (pt->on) {
-            try_patch(pt);
+            try_patch(pt, xbe);
         }
     }
 }

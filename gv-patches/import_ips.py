@@ -8,6 +8,9 @@
 tested on the North American releases). Only the IPS files (community work) are taken, never xbased's own mod.txt
 code (GPL-3, xemu is GPL-2). Each patch becomes a section of <TITLE ID>.txt with "region 1" (USA certificate),
 "version" when the folder names one, and "file 0xOFFSET -> bytes" lines (at most 32 bytes each).
+A widescreen.dat in <mods folder> (OgXHD's widescreen database, from icup321's XboxGraphicalPatches: ":<title id>"
+then pairs of lines, the bytes to find in default.xbe and their replacement) adds a "find old -> new" widescreen
+patch for each game in it that has no widescreen IPS patch; xemu searches the running .xbe for those bytes.
 Files written by an earlier run (marked below) are replaced; hand-made files are kept and get the new sections added
 only when they don't have them yet.
 """
@@ -95,9 +98,45 @@ def main():
         recs = ips_records(data)
         games.setdefault(title.upper(), []).append((k[0], k[1], k[2], ver, recs, folder + "/" + fname))
 
+    wsdb = mods / "widescreen.dat"
+    db_added = 0
+    if wsdb.exists():
+        cur, prev, db = None, None, {}
+        for row in wsdb.read_text(encoding="utf-8", errors="replace").splitlines():
+            row = row.strip()
+            if not row or row.startswith("'"):
+                continue
+            if row.startswith(":"):
+                cur, prev = row[1:].upper(), None
+                if cur == "END":
+                    break
+                db.setdefault(cur, [])
+                continue
+            if cur is None:
+                continue
+            if prev is None:
+                prev = row
+                continue
+            if re.fullmatch(r"([0-9A-Fa-f]{2})+", prev) and re.fullmatch(r"([0-9A-Fa-f]{2})+", row)                     and len(prev) == len(row) and prev != row:
+                if (prev, row) not in db[cur]:
+                    db[cur].append((prev, row))
+            else:
+                skipped.append((cur, "widescreen.dat pair not understood"))
+            prev = None
+        for title, pairs in sorted(db.items()):
+            if not pairs or not re.fullmatch(r"[0-9A-F]{8}", title):
+                continue
+            if any(k[0].startswith("widescreen") for k in games.get(title, [])):
+                skipped.append((title, "widescreen.dat: has a widescreen IPS patch already"))
+                continue
+            games.setdefault(title, []).append(("widescreen", "Widescreen 16:9",
+                                                "Draws the game in 16:9 to fill the TV, without stretching.",
+                                                "", pairs, "widescreen.dat"))
+            db_added += 1
+
     gv_rows = []
     for title, plist in sorted(games.items()):
-        out = [MARK + " from the Xbox graphical patches collections (community IPS patches for default.xbe,",
+        out = [MARK + " from the Xbox graphical patches collections (community IPS patches for default.xbe and OgXHD's widescreen database,",
                "# made and tested on the North American releases; list as shipped by xbased, github.com/crazyriddler/xbased)",
                "title " + title, ""]
         used = set()
@@ -110,6 +149,13 @@ def main():
             out.append("[%s] %s" % (pid, name))
             out.append("# " + src)
             out.append("default off")
+            if src == "widescreen.dat":  # found by its bytes: any release that has them
+                for old, new in recs:
+                    out.append("find %s -> %s" % (" ".join(old[i:i + 2].upper() for i in range(0, len(old), 2)),
+                                                  " ".join(new[i:i + 2].upper() for i in range(0, len(new), 2))))
+                out.append("")
+                gv_rows.append("%s	%s	%s	%s" % (title, pid, name, desc))
+                continue
             out.append("region 1")
             if ver:
                 out.append("version 0x%08X" % int(ver))
@@ -130,7 +176,7 @@ def main():
                             encoding="utf-8", newline="\n")
         else:
             path.write_text("\n".join(out), encoding="utf-8", newline="\n")
-    print(len(games), "games,", len(gv_rows), "patches")
+    print(len(games), "games,", len(gv_rows), "patches,", db_added, "of them from widescreen.dat")
     for r, why in skipped:
         print("skipped:", r, "-", why)
     if gv_list:

@@ -1,0 +1,15 @@
+# made by import_ips.py from the Xbox graphical patches collections (community IPS patches for default.xbe and OgXHD's widescreen database,
+# made and tested on the North American releases; list as shipped by xbased, github.com/crazyriddler/xbased)
+title 4B4E001F
+
+[widescreen] Widescreen 16:9
+# widescreen.dat
+default off
+find DB 40 54 DA 70 50 -> D9 05 1A 45 32 00
+find FF 68 00 00 80 3F 68 70 -> FF 68 00 00 40 3F 68 70
+find B8 01 00 00 00 A3 AC F8 C8 00 A3 14 F8 C8 00 C3 -> B8 00 00 00 00 A3 AC F8 C8 00 A3 14 F8 C8 00 C3
+find 50 51 6A 00 6A 00 50 51 6A 00 6A 00 E8 D4 0A 14 00 6A 01 6A 01 6A 00 6A 00 68 00 00 80 3F 68 00 00 80 3F 56 6A 00 6A 00 68 00 10 02 00 6A 00 68 5E 01 00 00 6A 00 6A 44 E8 18 0E 14 00 F3 0F 10 05 AC CA 1F 00 -> 68 00 00 D0 43 51 68 00 00 40 42 6A 00 50 51 6A 00 6A 00 E8 CD 0A 14 00 6A 01 6A 01 6A 00 6A 00 A1 AC CA 1F 00 50 50 56 6A 00 6A 00 68 00 10 02 00 6A 00 68 5E 01 00 00 6A 00 6A 44 E8 14 0E 14 00 F3 0F 5E C0
+find F3 0F 59 05 3C D4 1F 00 C6 05 4C 0D F8 00 01 F3 -> F3 0F 59 05 B8 CA 1F 00 C6 05 4C 0D F8 00 01 F3
+find F3 0F 59 05 A4 CD 1F 00 C6 05 4C 0D F8 00 01 F3 -> F3 0F 59 05 B8 CA 1F 00 C6 05 4C 0D F8 00 01 F3
+find F3 0F 59 05 28 D3 1F 00 C6 05 4C 0D F8 00 01 F3 -> F3 0F 59 05 B8 CA 1F 00 C6 05 4C 0D F8 00 01 F3
+find F3 0F 59 05 CC D4 1F 00 C6 05 4C 0D F8 00 01 F3 -> F3 0F 59 05 B8 CA 1F 00 C6 05 4C 0D F8 00 01 F3
