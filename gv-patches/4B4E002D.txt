@@ -1,0 +1,29 @@
+# made by import_ips.py from the Xbox graphical patches collections (community IPS patches for default.xbe,
+# made and tested on the North American releases; list as shipped by xbased, github.com/crazyriddler/xbased)
+title 4B4E002D
+
+[draw-distance] Draw Distance x4
+# 4B4E002D/Draw Distance x4 Patch.ips
+default off
+region 1
+file 0x00002AF7 -> 90 02 43
+file 0x00002B9B -> 6B C0 04 A3 2C C2 2F 01 C3
+
+[invert-camera] Invert Camera
+# 4B4E002D/Invert Camera Axis Patch.ips
+default off
+region 1
+file 0x002EDFA5 -> A1
+file 0x002EDFB1 -> 95
+file 0x002EDFF1 -> 83 C4 14 F3 0F 10 46 00 F3 0F 59 05 0C D3 42 00 F3 0F 11 46 00 F3 0F 10 46 04 F3 0F 59 05 0C D3
+file 0x002EE011 -> 42 00 F3 0F 11 46 04 8B 4E 0C F6 C5 40 74 11 81 E1 FF BF FF FF 89 4E 0C 8B 57 04 0B D1 89 56 0C
+file 0x002EE031 -> F6 C4 40 74 10 25 FF BF FF FF 89 46 10 8B 4F 04 0B C8 89 4E 10 5E 5F 5B C3 8B 44 24 0C 0F 57 C0
+file 0x002EE051 -> 5F F3 0F 11 00 F3 0F 11 40 04 F3 0F 11 40 08 C7 40 0C 00 00 00 00 C7 40 10 00 00 00 00 5B C3
+
+[widescreen] Widescreen 16:9
+# 4B4E002D/Widescreen 16-9.ips
+default off
+region 1
+file 0x00002D83 -> F0 D8 0A 00 F3 0F 59 05 B7 BF 3A
+file 0x0038D31D -> DF 43 57 68 00 00 08 42
+file 0x0042BBA6 -> 56

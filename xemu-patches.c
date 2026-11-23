@@ -25,6 +25,17 @@
  * it is tried again later. Checked every half second, so a part of the game loaded later, or the game started
  * again, gets the patch too.
  *
+ * Patches made as IPS files for the game's default.xbe (the widescreen / 60 fps collections) use file offsets:
+ *
+ *   [widescreen] Widescreen 16:9
+ *   version 0x00000001        (inside a patch: only this patch needs that version; others in the file still work)
+ *   region 1                  (inside a patch: only a game whose certificate has one of these region bits, 1 = USA)
+ *   file 0x0001A2B4 -> D9 05 00 10 2C 00
+ *
+ * A file line is placed with the running .xbe's own section table (file offset -> game address). It has no old
+ * bytes to check, so its patch waits one second after the .xbe appears (the loader has copied the sections by then),
+ * and it is written again when the game loads that part again (at most 20 times).
+ *
  * Game Vault's link chooses which patches are on: patches=<id>,<id> (only these), patches=none (none), no
  * patches= (each patch's own default).
  */
@@ -57,6 +68,8 @@ static const struct {
 
 typedef struct PatchLine {
     uint32_t addr;
+    uint32_t file_off; /* file lines: offset in the .xbe file; addr is found when the game's .xbe is known */
+    bool from_file;
     int len;
     uint8_t expect[MAX_LINE_BYTES];
     uint8_t value[MAX_LINE_BYTES];
@@ -71,6 +84,11 @@ typedef struct Patch {
     int state;     /* 0 not yet, 1 written, 2 told that bytes differ */
     int writes;
     int wait;      /* checks to skip while a write is on its way */
+    bool has_file;     /* has file lines (no old bytes) */
+    bool has_version;
+    uint32_t version;  /* has_version: only this game version */
+    uint32_t region;   /* nonzero: only a game with one of these certificate region bits */
+    bool usable;       /* false: wrong version / region, or a file line outside the .xbe */
 } Patch;
 
 static GPtrArray *patches;       /* Patch *, of the running game */
@@ -173,6 +191,7 @@ static bool parse_file(const char *text, const char *path, uint32_t title, uint3
             cur->id = g_strdup(g_strstrip(row + 1));
             cur->name = g_strdup(*g_strstrip(end + 1) ? g_strstrip(end + 1) : cur->id);
             cur->default_on = true;
+            cur->usable = true;
             cur->lines = g_array_new(false, true, sizeof(PatchLine));
             g_ptr_array_add(out, cur);
             continue;
@@ -182,6 +201,34 @@ static bool parse_file(const char *text, const char *path, uint32_t title, uint3
                 patch_log("patches: %s is for title %s, the game is %08x", path, row + 6, title);
                 ok = false;
             }
+            continue;
+        }
+        if (!g_ascii_strncasecmp(row, "version ", 8) && cur) {
+            cur->has_version = true;
+            cur->version = (uint32_t)g_ascii_strtoull(row + 8, NULL, 0);
+            continue;
+        }
+        if (!g_ascii_strncasecmp(row, "region ", 7) && cur) {
+            cur->region = (uint32_t)g_ascii_strtoull(row + 7, NULL, 0);
+            continue;
+        }
+        if (!g_ascii_strncasecmp(row, "file ", 5) && cur) {
+            PatchLine pl = { 0 };
+            char *arrow = strstr(row, "->");
+            char *end = NULL;
+            if (arrow) {
+                *arrow = '\0';
+                pl.file_off = (uint32_t)g_ascii_strtoull(row + 5, &end, 16);
+                pl.len = parse_bytes(arrow + 2, pl.value);
+            }
+            if (!arrow || !end || *g_strstrip(end) || pl.len <= 0) {
+                patch_log("patches: %s line %d: needs file 0xOFFSET -> new bytes", path, i + 1);
+                ok = false;
+                break;
+            }
+            pl.from_file = true;
+            cur->has_file = true;
+            g_array_append_val(cur->lines, pl);
             continue;
         }
         if (!g_ascii_strncasecmp(row, "version ", 8)) {
@@ -228,7 +275,70 @@ static bool parse_file(const char *text, const char *path, uint32_t title, uint3
     return ok;
 }
 
-static void load_for(uint32_t title, uint32_t version)
+/* file offset in the running .xbe -> game address, with its own section table; false when not in a loaded part */
+static bool file_to_addr(struct xbe *xbe, uint32_t off, int len, uint32_t *addr)
+{
+    uint32_t base = ldl_le_p(&xbe->header->m_base);
+    uint32_t nsec = ldl_le_p(&xbe->header->m_sections);
+    uint32_t sec_va = ldl_le_p(&xbe->header->m_section_headers_addr);
+    if ((uint64_t)off + len <= xbe->headers_len) {
+        *addr = base + off;
+        return true;
+    }
+    for (uint32_t i = 0; i < nsec && i < 256; i++) {
+        uint64_t at = (uint64_t)sec_va - base + i * 0x38u;
+        if (sec_va < base || at + 0x38 > xbe->headers_len) {
+            return false;
+        }
+        const uint8_t *sh = xbe->headers + at;
+        uint32_t va = ldl_le_p(sh + 4), vsize = ldl_le_p(sh + 8), raw = ldl_le_p(sh + 12), rsize = ldl_le_p(sh + 16);
+        if (off >= raw && (uint64_t)off + len <= (uint64_t)raw + MIN(rsize, vsize)) {
+            *addr = va + (off - raw);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* the first .xbe seen of each game is the disc's default.xbe: file lines are made for that one, not for other
+ * .xbe files the game starts later (they have the same title ID) */
+static uint32_t first_title, first_timedate;
+
+static void check_usable(Patch *pt, struct xbe *xbe, uint32_t title, uint32_t version)
+{
+    uint32_t region = ldl_le_p(&xbe->cert->m_game_region);
+    if (pt->has_file && ldl_le_p(&xbe->header->m_timedate) != first_timedate) {
+        pt->usable = false;
+        patch_log("patches: %08x [%s] is made for default.xbe, this is another .xbe of the game: not used", title,
+                  pt->id);
+        return;
+    }
+    if (pt->has_version && pt->version != version) {
+        pt->usable = false;
+        patch_log("patches: %08x [%s] is for version 0x%08x, the game is 0x%08x: not used", title, pt->id,
+                  pt->version, version);
+        return;
+    }
+    if (pt->region && !(pt->region & region)) {
+        pt->usable = false;
+        patch_log("patches: %08x [%s] is for region %x, the game is %x: not used", title, pt->id, pt->region, region);
+        return;
+    }
+    for (guint i = 0; i < pt->lines->len; i++) {
+        PatchLine *pl = &g_array_index(pt->lines, PatchLine, i);
+        if (pl->from_file && !file_to_addr(xbe, pl->file_off, pl->len, &pl->addr)) {
+            pt->usable = false;
+            patch_log("patches: %08x [%s] file offset 0x%x is outside this .xbe's code and data: not used", title,
+                      pt->id, pl->file_off);
+            return;
+        }
+    }
+    if (pt->has_file) {
+        pt->wait = 2; /* one second: the loader copies the sections after the headers */
+    }
+}
+
+static void load_for(uint32_t title, uint32_t version, struct xbe *xbe)
 {
     g_clear_pointer(&patches, g_ptr_array_unref);
     patches = g_ptr_array_new_with_free_func(patch_free);
@@ -256,6 +366,8 @@ static void load_for(uint32_t title, uint32_t version)
             for (guint i = 0; i < patches->len; i++) {
                 Patch *pt = g_ptr_array_index(patches, i);
                 pt->on = link_turns_on(pt);
+                check_usable(pt, xbe, title, version);
+                pt->on = pt->on && pt->usable;
                 patch_log("patches: %08x [%s] %s: %s (%u lines, from %s)", title, pt->id, pt->name,
                           pt->on ? "on" : "off", pt->lines->len, path == own ? "own folder" : path == shipped ? "xemu folder" : "built in");
             }
@@ -331,7 +443,11 @@ static void try_patch(Patch *pt)
         if (!guest_rw(pl->addr, now, pl->len, false)) {
             return; /* not loaded yet */
         }
-        if (!memcmp(now, pl->expect, pl->len)) {
+        if (pl->from_file) {
+            if (memcmp(now, pl->value, pl->len)) {
+                any_old = true; /* no old bytes to check: the version, region and place were checked */
+            }
+        } else if (!memcmp(now, pl->expect, pl->len)) {
             any_old = true;
         } else if (memcmp(now, pl->value, pl->len)) {
             if (pt->state != 2) {
@@ -348,6 +464,13 @@ static void try_patch(Patch *pt)
     }
     if (!any_old) {
         return; /* all written already */
+    }
+    if (pt->has_file && pt->writes >= 20) {
+        if (pt->state != 3) {
+            pt->state = 3;
+            patch_log("patches: [%s] the game keeps changing those bytes back: left alone", pt->id);
+        }
+        return;
     }
     /* written while the CPU is stopped between instructions: it may be running the very code */
     CPUState *cs = qemu_get_cpu(0);
@@ -426,10 +549,14 @@ void xemu_patches_tick(void)
     uint32_t title = ldl_le_p(&xbe->cert->m_titleid);
     uint32_t timedate = ldl_le_p(&xbe->header->m_timedate);
     if (!patch_loaded || title != patch_title || timedate != patch_timedate) {
+        if (title != first_title) {
+            first_title = title;
+            first_timedate = timedate;
+        }
         patch_title = title;
         patch_timedate = timedate;
         patch_loaded = true;
-        load_for(title, ldl_le_p(&xbe->cert->m_version));
+        load_for(title, ldl_le_p(&xbe->cert->m_version), xbe);
         watch_load();
     }
     watch_tick();

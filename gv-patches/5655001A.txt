@@ -1,0 +1,22 @@
+# made by import_ips.py from the Xbox graphical patches collections (community IPS patches for default.xbe,
+# made and tested on the North American releases; list as shipped by xbased, github.com/crazyriddler/xbased)
+title 5655001A
+
+[high-lod] High Detail Models
+# 5655001A/Force High LOD Patch.ips
+default off
+region 1
+file 0x0002E8CF -> 7E
+
+[widescreen] Widescreen 16:9
+# 5655001A/Widescreen 16-9.ips
+default off
+region 1
+file 0x0004E163 -> 70
+file 0x0004E18E -> 70
+file 0x000948C4 -> 70
+file 0x000BD11D -> 39 8E E3
+file 0x000BF4FD -> BA
+file 0x000BF5A9 -> BA
+file 0x000BF64F -> BA
+file 0x000C2956 -> 39 8E E3

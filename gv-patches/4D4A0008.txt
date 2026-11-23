@@ -1,0 +1,13 @@
+# made by import_ips.py from the Xbox graphical patches collections (community IPS patches for default.xbe,
+# made and tested on the North American releases; list as shipped by xbased, github.com/crazyriddler/xbased)
+title 4D4A0008
+
+[widescreen] Widescreen 16:9
+# 4D4A0008/Widescreen 16-9.ips
+default off
+region 1
+file 0x0004307C -> D9 E8 D9 1D 98 2B 2C 00 D9 E8 D9 1D 24 97 2C 00 D9 E8 D9 1D F4 22 2C 00 89 15 9C 2B 2C 00 89 15
+file 0x0004309C -> 28 97 2C 00 89 15 F8 22 2C 00 89 15 A0 2B 2C 00 89 15 2C 97 2C 00 89 15 FC 22 2C 00 89 15 68 9F
+file 0x000430BC -> 2C 00 89 15 6C 9F 2C 00 C7 05 70 9F 2C 00 01 00 00 00 90 90
+file 0x0005067B -> 22 22 22 40
+file 0x00051BD7 -> 22 22 22 C0
