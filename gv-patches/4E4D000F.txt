@@ -1,0 +1,9 @@
+# made by import_ips.py from the Xbox graphical patches collections (community IPS patches for default.xbe,
+# made and tested on the North American releases; list as shipped by xbased, github.com/crazyriddler/xbased)
+title 4E4D000F
+
+[480p] 480p
+# 4E4D000F/480p.ips
+default off
+region 1
+file 0x00088F61 -> 50 8B 47 30 50 8B 47 2C 51 8B 4F 04 90 6A 00 90

@@ -1,0 +1,9 @@
+# made by import_ips.py from the Xbox graphical patches collections (community IPS patches for default.xbe,
+# made and tested on the North American releases; list as shipped by xbased, github.com/crazyriddler/xbased)
+title 4541002E
+
+[60fps] 60 FPS
+# 4541002E/60 FPS.ips
+default off
+region 1
+file 0x002297DF -> 01 00 00 00

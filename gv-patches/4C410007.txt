@@ -1,0 +1,17 @@
+# made by import_ips.py from the Xbox graphical patches collections (community IPS patches for default.xbe,
+# made and tested on the North American releases; list as shipped by xbased, github.com/crazyriddler/xbased)
+title 4C410007
+
+[60fps] 60 FPS
+# 4C410007/60 FPS.ips
+default off
+region 1
+file 0x0008A629 -> 90 90
+file 0x0030E625 -> 6C
+
+[widescreen] Widescreen 16:9
+# 4C410007/Widescreen 16-9.ips
+default off
+region 1
+file 0x00313AEE -> B4 71
+file 0x005EFCBC -> B8 1E F5
