@@ -103,6 +103,10 @@ endif
 block_ss.add(when: libaio, if_true: files('linux-aio.c'))
 block_ss.add(when: linux_io_uring, if_true: files('io_uring.c'))
 
+# xemu for Xbox Dev Mode: an unpacked game's folder as a disc (uwp-folder.c, built only with XEMU_UWP)
+if host_os == 'windows'
+  block_ss.add(files('uwp-folder.c'))
+endif
 # xemu for Xbox Dev Mode: Xbox games straight from a PC's shared folder or a NAS (uwp-smb.c), through the smb2.dll
 # Game Vault ships (libsmb2 6.2, LGPL-2.1); deps/libsmb2-xemu holds its headers and a MinGW import library
 uwp_smb2_dir = meson.project_source_root() / '..' / 'deps' / 'libsmb2-xemu'

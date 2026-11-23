@@ -2536,7 +2536,18 @@ static char *uwp_state_name(void)
             base = c + 1;
         }
     }
+    /* an unpacked game (block/uwp-folder.c) is named by its folder, not "default.xbe" */
+    char *folder_name = NULL;
+    if (base != disc && !g_ascii_strcasecmp(base, "default.xbe")) {
+        const char *end = base - 1, *start = end;
+        while (start > disc && start[-1] != '/' && start[-1] != '\\') {
+            start--;
+        }
+        folder_name = g_strndup(start, end - start);
+        base = folder_name;
+    }
     char *name = g_strdup_printf("quick %s", base[0] ? base : "no disc");
+    g_free(folder_name);
     if (strlen(name) > 120) {
         name[120] = '\0';
     }
@@ -7634,6 +7645,24 @@ char *xemu_uwp_disc_filename(const char *path)
         }
         g_string_append(j, "\"}}");
         return g_string_free(j, FALSE);
+    }
+    /* an unpacked game: its folder (default.xbe in it) is shown to the Xbox as a disc (block/uwp-folder.c) */
+    {
+        extern bool xemu_uwp_folder_disc(const char *path, char **folder);
+        char *folder = NULL;
+        if (xemu_uwp_folder_disc(path, &folder)) {
+            uwp_log("disc is a game folder: %s", folder);
+            GString *j = g_string_new("json:{\"driver\":\"raw\",\"file\":{\"driver\":\"folder\",\"filename\":\"");
+            for (const char *c = folder; *c; c++) {
+                if (*c == '"' || *c == '\\') {
+                    g_string_append_c(j, '\\');
+                }
+                g_string_append_c(j, *c);
+            }
+            g_string_append(j, "\"}}");
+            g_free(folder);
+            return g_string_free(j, FALSE);
+        }
     }
     /* Opened like the block layer opens it, so a FAT32 / exFAT USB drive works. */
     wchar_t *wpath = g_utf8_to_utf16(path, -1, NULL, NULL, NULL);
