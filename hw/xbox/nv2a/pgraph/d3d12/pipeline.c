@@ -11327,6 +11327,376 @@ static void precompile_job_finished(PGRAPHD3D12State *r, uint32_t run,
 }
 
 /*
+ * Game Vault shader sharing (cdn.gamevault.fyi). A title's pipeline list is
+ * the same on every console, so players share it: at title start the list
+ * other players' xemu recorded is fetched (at most every 12 hours) and its
+ * new records are appended to ours before the list loads, so the precompile
+ * builds them too. While the title runs, the records this console recorded
+ * itself (never the fetched ones, listed in gvshare.got) are sent, 45 s
+ * after the start and then every 5 minutes when the list grew. The server
+ * publishes a record once two consoles sent it. shader-share-off.txt in the
+ * xemu data folder turns both off.
+ */
+#include <winhttp.h>
+#include <zlib.h>
+#if __has_include("gv_share_key.h")
+#include "gv_share_key.h"
+#endif
+#ifndef GV_SHARE_KEY
+#define GV_SHARE_KEY ""
+#endif
+
+#define GVSHARE_HOST L"cdn.gamevault.fyi"
+#define GVSHARE_FETCH_EVERY_S (12 * 60 * 60)
+#define GVSHARE_FIRST_SEND_S 45
+#define GVSHARE_SEND_EVERY_S (5 * 60)
+#define GVSHARE_MAX_DOWNLOAD (32 * 1024 * 1024)
+
+typedef struct GvShareSend {
+    PGRAPHD3D12State *r;
+    uint32_t title_id;
+    unsigned int serial;
+    char *dir;
+} GvShareSend;
+
+static bool gvshare_has(GHashTable *set, uint64_t hash)
+{
+    return g_hash_table_contains(set, &hash);
+}
+
+static bool gvshare_enabled(PGRAPHD3D12State *r)
+{
+    g_autofree char *off = NULL;
+
+    if (r->shader_cache_dir == NULL) {
+        return false;
+    }
+    off = g_strdup_printf("%s/../shader-share-off.txt", r->shader_cache_dir);
+    return !g_file_test(off, G_FILE_TEST_EXISTS);
+}
+
+/* One HTTPS request; returns the HTTP status (0 = no answer). */
+static int gvshare_request(const wchar_t *verb, const wchar_t *path,
+                           const void *body, DWORD body_size,
+                           const wchar_t *headers, GByteArray *out,
+                           int timeout_ms)
+{
+    HINTERNET s, c = NULL, q = NULL;
+    DWORD status = 0, len = sizeof(status);
+
+    s = WinHttpOpen(L"GameVault-xemu/1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (s != NULL) {
+        DWORD decompress = WINHTTP_DECOMPRESSION_FLAG_ALL;
+
+        WinHttpSetOption(s, WINHTTP_OPTION_DECOMPRESSION, &decompress,
+                         sizeof(decompress));
+        WinHttpSetTimeouts(s, timeout_ms, timeout_ms, timeout_ms, timeout_ms);
+        c = WinHttpConnect(s, GVSHARE_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    }
+    if (c != NULL) {
+        q = WinHttpOpenRequest(c, verb, path, NULL, WINHTTP_NO_REFERER,
+                               WINHTTP_DEFAULT_ACCEPT_TYPES,
+                               WINHTTP_FLAG_SECURE);
+    }
+    if (q != NULL &&
+        WinHttpSendRequest(q, headers ? headers : WINHTTP_NO_ADDITIONAL_HEADERS,
+                           headers ? (DWORD)-1L : 0, (LPVOID)body, body_size,
+                           body_size, 0) &&
+        WinHttpReceiveResponse(q, NULL) &&
+        WinHttpQueryHeaders(q, WINHTTP_QUERY_STATUS_CODE |
+                                   WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &len,
+                            WINHTTP_NO_HEADER_INDEX) &&
+        status == 200 && out != NULL) {
+        uint8_t buf[65536];
+        DWORD got = 0;
+
+        while (WinHttpReadData(q, buf, sizeof(buf), &got) && got > 0) {
+            if (out->len + got > GVSHARE_MAX_DOWNLOAD) {
+                status = 0;
+                break;
+            }
+            g_byte_array_append(out, buf, got);
+        }
+    }
+    if (q) WinHttpCloseHandle(q);
+    if (c) WinHttpCloseHandle(c);
+    if (s) WinHttpCloseHandle(s);
+    return (int)status;
+}
+
+static GHashTable *gvshare_read_got(const char *dir)
+{
+    g_autofree char *path = g_strdup_printf("%s/gvshare.got", dir);
+    g_autofree gchar *data = NULL;
+    gsize size = 0;
+    GHashTable *got = new_hash_set();
+
+    if (g_file_get_contents(path, &data, &size, NULL)) {
+        for (gsize i = 0; i + 8 <= size; i += 8) {
+            uint64_t h;
+
+            memcpy(&h, data + i, 8);
+            hash_set_add(got, h);
+        }
+    }
+    return got;
+}
+
+/*
+ * On the list loader worker, before the list is read: appends the shared
+ * records this list lacks. The shared file has the list's own format.
+ */
+static void gvshare_fetch(PGRAPHD3D12State *r, const char *dir,
+                          const char *path,
+                          const PipelineListHeader *expected)
+{
+    g_autofree char *stamp = g_strdup_printf("%s/gvshare.stamp", dir);
+    g_autofree char *got_path = g_strdup_printf("%s/gvshare.got", dir);
+    g_autofree wchar_t *url = NULL;
+    g_autoptr(GByteArray) body = g_byte_array_new();
+    GHashTable *have = NULL;
+    GHashTable *got = NULL;
+    GStatBuf st;
+    PipelineListHeader header;
+    FILE *file = NULL;
+    FILE *got_file = NULL;
+    unsigned int records = 0, added = 0;
+    gint64 start = g_get_monotonic_time();
+    int status;
+
+    if (expected->title_id == 0 || !gvshare_enabled(r)) {
+        return;
+    }
+    if (g_stat(stamp, &st) == 0 &&
+        time(NULL) - st.st_mtime < GVSHARE_FETCH_EVERY_S) {
+        return;
+    }
+    g_file_set_contents(stamp, "", 0, NULL);
+    url = g_new0(wchar_t, 128);
+    swprintf(url, 128, L"/xemu/pipelines/XPSK-%u-%u-%u/%08X.bin",
+             expected->key_version, expected->key_size, expected->flags,
+             expected->title_id);
+    status = gvshare_request(L"GET", url, NULL, 0, NULL, body, 3000);
+    if (status != 200 || body->len < sizeof(header) ||
+        memcmp(body->data, expected, sizeof(header)) != 0) {
+        uwp_log("Shader sharing: %08x: nothing shared yet (%d, %lld ms)",
+                expected->title_id, status,
+                (long long)(g_get_monotonic_time() - start) / 1000);
+        return;
+    }
+
+    /* The records our list already has. */
+    have = new_hash_set();
+    file = g_fopen(path, "rb");
+    if (file != NULL && fread(&header, sizeof(header), 1, file) == 1 &&
+        memcmp(&header, expected, sizeof(header)) == 0) {
+        PGRAPHD3D12PipelineKey key;
+        uint64_t check;
+
+        while (records < PIPELINE_LIST_MAX &&
+               fread(&key, sizeof(key), 1, file) == 1 &&
+               fread(&check, sizeof(check), 1, file) == 1 &&
+               check == pipeline_list_check(&key)) {
+            hash_set_add(have, check);
+            records++;
+        }
+        fclose(file);
+        /* (a damaged tail is cut off by the loader; append after the
+         * good records) */
+        file = g_fopen(path, "r+b");
+        if (file != NULL &&
+            fseek(file, sizeof(header) + records * PIPELINE_LIST_RECORD_SIZE,
+                  SEEK_SET) != 0) {
+            fclose(file);
+            file = NULL;
+        }
+        if (file != NULL &&
+            _chsize_s(_fileno(file), sizeof(header) +
+                                         records * PIPELINE_LIST_RECORD_SIZE) != 0) {
+            fclose(file);
+            file = NULL;
+        }
+    } else {
+        if (file != NULL) {
+            fclose(file);
+        }
+        file = g_fopen(path, "wb");
+        if (file != NULL && fwrite(expected, sizeof(*expected), 1, file) != 1) {
+            fclose(file);
+            file = NULL;
+        }
+    }
+    if (file == NULL) {
+        g_hash_table_destroy(have);
+        return;
+    }
+    got = gvshare_read_got(dir);
+    got_file = g_fopen(got_path, "ab");
+    for (guint pos = sizeof(header);
+         pos + PIPELINE_LIST_RECORD_SIZE <= body->len &&
+         records < PIPELINE_LIST_MAX;
+         pos += PIPELINE_LIST_RECORD_SIZE) {
+        PGRAPHD3D12PipelineKey key;
+        uint64_t check;
+
+        memcpy(&key, body->data + pos, sizeof(key));
+        memcpy(&check, body->data + pos + sizeof(key), sizeof(check));
+        if (check != pipeline_list_check(&key)) {
+            break;
+        }
+        if (!gvshare_has(got, check) && got_file != NULL) {
+            fwrite(&check, sizeof(check), 1, got_file);
+            hash_set_add(got, check);
+        }
+        if (gvshare_has(have, check)) {
+            continue;
+        }
+        if (fwrite(&key, sizeof(key), 1, file) != 1 ||
+            fwrite(&check, sizeof(check), 1, file) != 1) {
+            break;
+        }
+        hash_set_add(have, check);
+        records++;
+        added++;
+    }
+    fclose(file);
+    if (got_file != NULL) {
+        fclose(got_file);
+    }
+    g_hash_table_destroy(have);
+    g_hash_table_destroy(got);
+    uwp_log("Shader sharing: %08x: %u shared setups added, %u in the list "
+            "(%u KB, %lld ms)",
+            expected->title_id, added, records, body->len / 1024,
+            (long long)(g_get_monotonic_time() - start) / 1000);
+}
+
+/* Our own records of the title's list, zlib-packed, for sending. */
+static GByteArray *gvshare_own_records(const char *dir, unsigned int *count)
+{
+    g_autofree char *path = g_strdup_printf("%s/pipelines.bin", dir);
+    GHashTable *got = gvshare_read_got(dir);
+    GByteArray *raw = g_byte_array_new();
+    GByteArray *packed = NULL;
+    PipelineListHeader header;
+    FILE *file = g_fopen(path, "rb");
+    unsigned int own = 0;
+
+    *count = 0;
+    if (file != NULL && fread(&header, sizeof(header), 1, file) == 1 &&
+        header.magic == PIPELINE_LIST_MAGIC &&
+        header.key_size == sizeof(PGRAPHD3D12PipelineKey)) {
+        PGRAPHD3D12PipelineKey key;
+        uint64_t check;
+        unsigned int n = 0;
+
+        g_byte_array_append(raw, (const guint8 *)&header, sizeof(header));
+        while (n < PIPELINE_LIST_MAX &&
+               fread(&key, sizeof(key), 1, file) == 1 &&
+               fread(&check, sizeof(check), 1, file) == 1 &&
+               check == pipeline_list_check(&key)) {
+            n++;
+            if (gvshare_has(got, check)) {
+                continue;
+            }
+            g_byte_array_append(raw, (const guint8 *)&key, sizeof(key));
+            g_byte_array_append(raw, (const guint8 *)&check, sizeof(check));
+            own++;
+        }
+    }
+    if (file != NULL) {
+        fclose(file);
+    }
+    g_hash_table_destroy(got);
+    if (own > 0) {
+        uLongf size = compressBound(raw->len);
+
+        packed = g_byte_array_sized_new(size);
+        g_byte_array_set_size(packed, size);
+        if (compress2(packed->data, &size, raw->data, raw->len, 6) == Z_OK) {
+            g_byte_array_set_size(packed, size);
+            *count = own;
+        } else {
+            g_byte_array_free(packed, TRUE);
+            packed = NULL;
+        }
+    }
+    g_byte_array_free(raw, TRUE);
+    return packed;
+}
+
+static gpointer gvshare_send_thread(gpointer opaque)
+{
+    GvShareSend *job = opaque;
+    unsigned int sent = 0;
+    gint64 next = g_get_monotonic_time() + GVSHARE_FIRST_SEND_S * G_USEC_PER_SEC;
+
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    while (qatomic_read(&job->r->gvshare_serial) == job->serial) {
+        unsigned int count = 0;
+        GByteArray *body;
+
+        g_usleep(2 * G_USEC_PER_SEC);
+        if (g_get_monotonic_time() < next) {
+            continue;
+        }
+        next = g_get_monotonic_time() + GVSHARE_SEND_EVERY_S * G_USEC_PER_SEC;
+        body = gvshare_own_records(job->dir, &count);
+        if (body != NULL && count > sent) {
+            wchar_t url[96];
+            g_autofree char *head = g_strdup_printf(
+                "X-GV-Key: %s\r\nX-GV-Zlib: 1\r\n"
+                "Content-Type: application/octet-stream\r\n",
+                GV_SHARE_KEY);
+            g_autofree gunichar2 *whead = g_utf8_to_utf16(head, -1, NULL,
+                                                          NULL, NULL);
+            int status;
+
+            swprintf(url, 96, L"/api/xemu/v1/upload?tid=%08X", job->title_id);
+            status = gvshare_request(L"POST", url, body->data, body->len,
+                                     (const wchar_t *)whead, NULL, 15000);
+            uwp_log("Shader sharing: %08x: sent %u setups (%u KB): %d",
+                    job->title_id, count, body->len / 1024, status);
+            if (status == 200) {
+                sent = count;
+            }
+        }
+        if (body != NULL) {
+            g_byte_array_free(body, TRUE);
+        }
+    }
+    g_free(job->dir);
+    g_free(job);
+    return NULL;
+}
+
+/* At a title switch: a sender for the new title (the old one stops). */
+static void gvshare_start_sending(PGRAPHD3D12State *r, uint32_t title_id)
+{
+    GvShareSend *job;
+    GThread *thread;
+
+    qatomic_inc(&r->gvshare_serial);
+    if (title_id == 0 || !gvshare_enabled(r) || GV_SHARE_KEY[0] == '\0') {
+        return;
+    }
+    job = g_new0(GvShareSend, 1);
+    job->r = r;
+    job->title_id = title_id;
+    job->serial = qatomic_read(&r->gvshare_serial);
+    job->dir = g_strdup_printf("%s/%08x", r->shader_cache_dir, title_id);
+    thread = g_thread_try_new("gvshare", gvshare_send_thread, job, NULL);
+    if (thread != NULL) {
+        g_thread_unref(thread);
+    } else {
+        g_free(job->dir);
+        g_free(job);
+    }
+}
+
+/*
  * Key version 4 lists lack texture_signs[]; their keys are the version 5
  * keys with those bytes left out, so they are rewritten with no signed
  * channels instead of being dropped (players keep their recorded pipelines).
@@ -11440,6 +11810,7 @@ static void load_pipeline_list(PGRAPHD3D12State *r,
     fallback_unique = g_hash_table_new(fallback_key_hash, fallback_key_equal);
     g_mkdir_with_parents(dir, 0755);
     upgrade_pipeline_list_v4(path, &expected);
+    gvshare_fetch(r, dir, path, &expected);
     file = g_fopen(path, "r+b");
     if (file != NULL &&
         (fread(&header, sizeof(header), 1, file) != 1 ||
@@ -12905,6 +13276,7 @@ static void switch_shader_title(PGRAPHD3D12State *r, uint32_t title_id,
         r->pso_list = list;
         r->pso_list_flush_us = g_get_monotonic_time();
     }
+    gvshare_start_sending(r, cache ? title_id : 0);
 
     qemu_mutex_lock(&r->pso_mutex);
     purge_queued_psos(r, true);

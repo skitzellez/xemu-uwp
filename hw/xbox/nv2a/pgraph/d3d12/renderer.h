@@ -873,6 +873,7 @@ typedef struct PGRAPHD3D12State {
     PGRAPHD3D12PipelineList *pso_list;
     GHashTable *pso_recorded;
     uint32_t pso_list_serial;
+    unsigned int gvshare_serial;    /* the running shader-sharing sender stops when it changes */
     int64_t pso_list_flush_us;
     uint64_t pso_total_prewarmed;
     uint64_t pso_prewarm_failed;

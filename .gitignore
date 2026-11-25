@@ -26,3 +26,4 @@ build.log
 /macos-libs/
 /macos-pkgs/
 /xemu.iconset/
+hw/xbox/nv2a/pgraph/d3d12/gv_share_key.h
