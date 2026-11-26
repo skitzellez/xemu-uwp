@@ -8,6 +8,11 @@
  *   2. the patches folder next to xemu's log and settings (LocalState\xemu\xemu\patches; testing, own patches).
  * A file in 2 replaces the file of the same name in 1; with neither, the patches built into xemu
  * (gv-patches folder, which arrive with xemu's own updates) are used.
+ * Game Vault fixes (11-25): Game Vault's server keeps one file with patches for any game
+ * (cdn.gamevault.fyi/fixes/xemu/patches.txt; "=== <TITLE ID>" starts each game's patch file). xemu fetches it in the
+ * background at start, at most every 6 hours, and keeps it as gvfixes.txt in the folder of 2 (used offline). A game
+ * in it uses the server's file instead of 1 and the built-in ones; a file of the player's own (2) still wins.
+ * fixes-off.txt in that folder: the server's file is not fetched or used.
  *
  *   # comment
  *   title 54430003            (optional: the title ID this file is for; the file name already says it)
@@ -57,6 +62,11 @@
 #include "system/hw_accel.h"
 #include "cpu.h"
 #include "exec/target_page.h"
+#include <glib/gstdio.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <winhttp.h>
+#endif
 
 #ifdef XEMU_UWP
 #include "qemu/xemu-uwp.h"
@@ -112,12 +122,179 @@ static bool patch_loaded;
 static char *link_choice;        /* patches= from the link; NULL: each patch's default */
 static char *own_dir, *shipped_dir; /* both end with a separator */
 
+/* ---- Game Vault fixes from the server ---- */
+#define FIXES_HOST L"cdn.gamevault.fyi"
+#define FIXES_PATH L"/fixes/xemu/patches.txt"
+#define FIXES_MAX (4 * 1024 * 1024)
+static GMutex fixes_lock;
+static GHashTable *fixes;   /* title (GUINT_TO_POINTER) -> patch file text; under fixes_lock */
+
+static char *fixes_path(const char *name)
+{
+    return g_strdup_printf("%spatches" G_DIR_SEPARATOR_S "%s", own_dir ? own_dir : "", name);
+}
+
+/* "=== 54430001" starts each game's patch file */
+static GHashTable *fixes_parse(const char *text)
+{
+    GHashTable *t = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
+    const char *p = text;
+    uint32_t title = 0;
+    GString *cur = NULL;
+    while (p && *p) {
+        const char *e = strchr(p, '\n');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n >= 12 && !strncmp(p, "=== ", 4)) {
+            if (cur && title) {
+                g_hash_table_replace(t, GUINT_TO_POINTER(title), g_string_free(cur, false));
+            } else if (cur) {
+                g_string_free(cur, true);
+            }
+            char id[9] = {0};
+            memcpy(id, p + 4, 8);
+            title = (uint32_t)strtoul(id, NULL, 16);
+            cur = g_string_new(NULL);
+        } else if (cur) {
+            g_string_append_len(cur, p, n);
+            g_string_append_c(cur, '\n');
+        }
+        p = e ? e + 1 : NULL;
+    }
+    if (cur && title) {
+        g_hash_table_replace(t, GUINT_TO_POINTER(title), g_string_free(cur, false));
+    } else if (cur) {
+        g_string_free(cur, true);
+    }
+    return t;
+}
+
+static void fixes_take(const char *text, const char *from)
+{
+    GHashTable *t = fixes_parse(text);
+    patch_log("patches: Game Vault fixes for %u game(s) (%s)", g_hash_table_size(t), from);
+    g_mutex_lock(&fixes_lock);
+    g_clear_pointer(&fixes, g_hash_table_unref);
+    fixes = t;
+    g_mutex_unlock(&fixes_lock);
+}
+
+#ifdef _WIN32
+static GByteArray *fixes_download(void)
+{
+    HINTERNET s = WinHttpOpen(L"GameVault-xemu/1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+                              WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET c = NULL, q = NULL;
+    GByteArray *out = NULL;
+    DWORD status = 0, len = sizeof(status);
+    if (s) {
+        DWORD decompress = WINHTTP_DECOMPRESSION_FLAG_ALL;
+        WinHttpSetOption(s, WINHTTP_OPTION_DECOMPRESSION, &decompress, sizeof(decompress));
+        WinHttpSetTimeouts(s, 10000, 10000, 10000, 10000);
+        c = WinHttpConnect(s, FIXES_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    }
+    if (c) {
+        q = WinHttpOpenRequest(c, L"GET", FIXES_PATH, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                               WINHTTP_FLAG_SECURE);
+    }
+    if (q && WinHttpSendRequest(q, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0) && WinHttpReceiveResponse(q, NULL) &&
+        WinHttpQueryHeaders(q, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
+                            &status, &len, WINHTTP_NO_HEADER_INDEX) &&
+        status == 200) {
+        uint8_t buf[16384];
+        DWORD got = 0;
+        out = g_byte_array_new();
+        while (WinHttpReadData(q, buf, sizeof(buf), &got) && got > 0) {
+            if (out->len + got > FIXES_MAX) {
+                g_byte_array_unref(out);
+                out = NULL;
+                break;
+            }
+            g_byte_array_append(out, buf, got);
+        }
+    }
+    if (q) {
+        WinHttpCloseHandle(q);
+    }
+    if (c) {
+        WinHttpCloseHandle(c);
+    }
+    if (s) {
+        WinHttpCloseHandle(s);
+    }
+    if (!out) {
+        patch_log("patches: Game Vault fixes not fetched (status %lu), the kept list stays", (unsigned long)status);
+    }
+    return out;
+}
+
+static gpointer fixes_thread(gpointer unused)
+{
+    g_autofree char *path = fixes_path("gvfixes.txt");
+    GByteArray *got = fixes_download();
+    if (got) {
+        g_autofree char *tmp = fixes_path("gvfixes.txt.new");
+        g_autofree char *dir = g_strdup_printf("%spatches", own_dir ? own_dir : "");
+        g_byte_array_append(got, (const uint8_t *)"", 1);   /* ends the text */
+        g_mkdir_with_parents(dir, 0755);
+        if (g_file_set_contents(tmp, (const char *)got->data, got->len - 1, NULL)) {
+            g_remove(path);
+            g_rename(tmp, path);
+        }
+        fixes_take((const char *)got->data, "from the server");
+        g_byte_array_unref(got);
+    }
+    return NULL;
+}
+#endif
+
+static void fixes_start(void)
+{
+    g_autofree char *off = fixes_path("fixes-off.txt");
+    g_autofree char *path = fixes_path("gvfixes.txt");
+    g_autofree gchar *kept = NULL;
+    GStatBuf st;
+    bool fresh = false;
+    if (g_file_test(off, G_FILE_TEST_EXISTS)) {
+        patch_log("patches: Game Vault fixes off (fixes-off.txt)");
+        return;
+    }
+    if (g_file_get_contents(path, &kept, NULL, NULL)) {
+        fixes_take(kept, "kept list");
+        if (g_stat(path, &st) == 0) {
+            gint64 age = g_get_real_time() / G_USEC_PER_SEC - (gint64)st.st_mtime;
+            fresh = age >= 0 && age < 6 * 3600;
+        }
+    }
+#ifdef _WIN32
+    if (!fresh) {
+        g_thread_unref(g_thread_new("gvfixes", fixes_thread, NULL));
+    }
+#endif
+}
+
+/* the server's patch file for this game, or NULL (g_free it) */
+static char *fixes_for(uint32_t title)
+{
+    char *text = NULL;
+    g_mutex_lock(&fixes_lock);
+    if (fixes) {
+        text = g_strdup(g_hash_table_lookup(fixes, GUINT_TO_POINTER(title)));
+    }
+    g_mutex_unlock(&fixes_lock);
+    return text;
+}
+
 void xemu_patches_set_dirs(const char *own, const char *shipped)
 {
+    static bool started;
     g_free(own_dir);
     g_free(shipped_dir);
     own_dir = g_strdup(own ? own : "");
     shipped_dir = g_strdup(shipped ? shipped : "");
+    if (!started) {
+        started = true;
+        fixes_start();
+    }
 }
 
 static void patch_free(gpointer p)
@@ -384,7 +561,10 @@ static void load_for(uint32_t title, uint32_t version, struct xbe *xbe)
     char *shipped = g_strdup_printf("%spatches" G_DIR_SEPARATOR_S "%s", shipped_dir ? shipped_dir : "", name);
     const char *path = g_file_test(own, G_FILE_TEST_EXISTS) ? own : shipped;
     gchar *text = NULL;
-    if (!g_file_get_contents(path, &text, NULL, NULL)) {
+    if (path != own && (text = fixes_for(title)) != NULL) {
+        path = "Game Vault fixes";   /* the server's file for this game, over the shipped and built-in ones */
+    }
+    if (!text && !g_file_get_contents(path, &text, NULL, NULL)) {
         /* built in (gv-patches folder): these arrive with xemu's own updates */
         for (size_t i = 0; i < G_N_ELEMENTS(builtin_patches); i++) {
             if (builtin_patches[i].title == title) {
@@ -404,7 +584,7 @@ static void load_for(uint32_t title, uint32_t version, struct xbe *xbe)
                 check_usable(pt, xbe, title, version);
                 pt->on = pt->on && pt->usable;
                 patch_log("patches: %08x [%s] %s: %s (%u lines, from %s)", title, pt->id, pt->name,
-                          pt->on ? "on" : "off", pt->lines->len, path == own ? "own folder" : path == shipped ? "xemu folder" : "built in");
+                          pt->on ? "on" : "off", pt->lines->len, path == own ? "own folder" : path == shipped ? "xemu folder" : path);
             }
         } else {
             g_ptr_array_unref(list);
